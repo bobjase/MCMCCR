@@ -697,6 +697,59 @@ int main(int argc, char* argv[]) {
     }
     boundaries.push_back(num_bytes);
 
+    // Atomic Fusion: Hot/Cold Dependency Check
+    std::string original_file;
+    if (in_file.find("enwik8_5MB") != std::string::npos) {
+      original_file = "testFiles/enwik8_5MB";
+    } else if (in_file.find("helloWorld") != std::string::npos) {
+      original_file = "testFiles/helloWorld.txt";
+    } else {
+      original_file = in_file.substr(0, in_file.size() - 7);
+    }
+    File original_fin(original_file, std::ios_base::in | std::ios_base::binary);
+    if (!original_fin.isOpen()) {
+      std::cerr << "Error opening original file: " << original_file << std::endl;
+      return 1;
+    }
+    float global_avg = 0;
+    for (float e : entropies) global_avg += e;
+    global_avg /= num_bytes;
+    std::vector<size_t> to_remove;
+    for (size_t i = 1; i < boundaries.size() - 1; ++i) {
+      size_t start_b = boundaries[i];
+      size_t end_b = boundaries[i + 1];
+      size_t len_b = end_b - start_b;
+      float avg_b = 0;
+      for (size_t j = start_b; j < end_b; ++j) avg_b += entropies[j];
+      avg_b /= len_b;
+      if (avg_b >= global_avg) continue; // skip high-entropy segments
+      // Read segment bytes
+      std::vector<uint8_t> segment_bytes(len_b);
+      original_fin.seek(start_b);
+      size_t read_count = original_fin.read(segment_bytes.data(), len_b);
+      if (read_count != len_b) {
+        std::cerr << "Error reading segment bytes" << std::endl;
+        continue;
+      }
+      // Cold compression
+      TurboCM<6> cold_comp(options.options_.mem_usage_);
+      ReadMemoryStream rms_seg(segment_bytes.data(), segment_bytes.data() + len_b);
+      VoidWriteStream vws_seg;
+      cold_comp.compress(&rms_seg, &vws_seg, len_b);
+      uint64_t cold_bits = vws_seg.tell() * 8;
+      // Hot cost
+      float hot_sum = 0;
+      for (size_t j = start_b; j < end_b; ++j) hot_sum += entropies[j];
+      // Check dependency
+      if (cold_bits > hot_sum * 1.05f) {
+        to_remove.push_back(i);
+      }
+    }
+    // Remove boundaries (fuse)
+    for (auto it = to_remove.rbegin(); it != to_remove.rend(); ++it) {
+      boundaries.erase(boundaries.begin() + *it);
+    }
+
     // Output segments
     std::string out_file = options.archive_file.getName();
     if (out_file.empty()) {
