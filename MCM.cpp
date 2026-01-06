@@ -81,6 +81,8 @@ public:
     kModeList,
     // Observer mode for entropy profiling
     kModeObserver,
+    // Segment mode for entropy-based segmentation
+    kModeSegment,
   };
   Mode mode = kModeUnknown;
   bool opt_mode = false;
@@ -106,6 +108,7 @@ public:
       << "10 and 11 are only supported on 64 bits" << std::endl
       << "-test tests the file after compression is done" << std::endl
       << "-observer generates entropy profile instead of compressing" << std::endl
+      << "-segment performs entropy-based segmentation on .entropy file" << std::endl
       // << "-b <mb> specifies block size in MB" << std::endl
       // << "-t <threads> the number of threads to use (decompression requires the same number of threads" << std::endl
       << "Examples:" << std::endl
@@ -128,6 +131,7 @@ public:
       else if (arg == "-opt") parsed_mode = kModeOpt;
       else if (arg == "-stest") parsed_mode = kModeSingleTest;
       else if (arg == "-observer") parsed_mode = kModeObserver;
+      else if (arg == "-segment") parsed_mode = kModeSegment;
       else if (arg == "c") parsed_mode = kModeCompress;
       else if (arg == "l") parsed_mode = kModeList;
       else if (arg == "d") parsed_mode = kModeDecompress;
@@ -240,7 +244,7 @@ public:
     }
     const bool single_file_mode =
       mode == kModeCompress || mode == kModeDecompress || mode == kModeSingleTest ||
-      mode == kModeMemTest || mode == kModeOpt || kModeList || mode == kModeObserver;
+      mode == kModeMemTest || mode == kModeOpt || kModeList || mode == kModeObserver || mode == kModeSegment;
     if (single_file_mode && i < argc) {
       std::string in_file, out_file;
       // Read in file and outfile.
@@ -257,7 +261,7 @@ public:
       if (mode == kModeMemTest) {
         // No out file for memtest.
         files.push_back(FileInfo(trimDir(in_file)));
-      } else if (mode == kModeCompress || mode == kModeSingleTest || mode == kModeOpt || mode == kModeObserver) {
+      } else if (mode == kModeCompress || mode == kModeSingleTest || mode == kModeOpt || mode == kModeObserver || mode == kModeSegment) {
         archive_file = FileInfo(trimDir(out_file));
         files.push_back(FileInfo(trimDir(in_file)));
       } else {
@@ -640,6 +644,79 @@ int main(int argc, char* argv[]) {
     ofs.write(reinterpret_cast<const char*>(compressor.entropies.data()), num_bytes * sizeof(float));
     ofs.close();
     std::cout << "Wrote " << num_bytes << " entropy values and stock size " << stock_size << " to " << out_file << std::endl;
+    break;
+  }
+  case Options::kModeSegment: {
+    printHeader();
+    std::cout << "Running Segmentation Mode" << std::endl;
+    // Read .entropy file
+    std::vector<FileInfo> files = options.files;
+    std::string in_file = files[0].getName();
+    std::ifstream ifs(in_file, std::ios::binary);
+    if (!ifs) {
+      std::cerr << "Error opening entropy file: " << in_file << std::endl;
+      return 1;
+    }
+    uint64_t num_bytes;
+    ifs.read(reinterpret_cast<char*>(&num_bytes), sizeof(num_bytes));
+    uint64_t stock_size;
+    ifs.read(reinterpret_cast<char*>(&stock_size), sizeof(stock_size));
+    std::vector<float> entropies(num_bytes);
+    ifs.read(reinterpret_cast<char*>(entropies.data()), num_bytes * sizeof(float));
+    ifs.close();
+    std::cout << "Read " << num_bytes << " entropy values, stock size " << stock_size << std::endl;
+
+    // Smoothing: moving average
+    const size_t window = 256;
+    std::vector<float> smoothed(num_bytes);
+    for (size_t i = 0; i < num_bytes; ++i) {
+      float sum = 0;
+      size_t count = 0;
+      for (size_t j = (i > window/2 ? i - window/2 : 0); j < std::min(i + window/2 + 1, num_bytes); ++j) {
+        sum += entropies[j];
+        ++count;
+      }
+      smoothed[i] = sum / count;
+    }
+
+    // Gradient
+    std::vector<float> gradient(num_bytes, 0);
+    for (size_t i = 1; i < num_bytes; ++i) {
+      gradient[i] = smoothed[i] - smoothed[i-1];
+    }
+
+    // Boundary detection
+    const float threshold = 0.1f;
+    const size_t min_segment = 4096; // 4KB
+    std::vector<size_t> boundaries;
+    boundaries.push_back(0);
+    for (size_t i = 1; i < num_bytes; ++i) {
+      if (std::abs(gradient[i]) > threshold && i - boundaries.back() >= min_segment) {
+        boundaries.push_back(i);
+      }
+    }
+    boundaries.push_back(num_bytes);
+
+    // Output segments
+    std::string out_file = options.archive_file.getName();
+    if (out_file.empty()) {
+      out_file = in_file + ".segments";
+    }
+    std::ofstream ofs(out_file, std::ios::binary);
+    if (!ofs) {
+      std::cerr << "Error opening output file: " << out_file << std::endl;
+      return 1;
+    }
+    uint64_t num_segments = boundaries.size() - 1;
+    ofs.write(reinterpret_cast<const char*>(&num_segments), sizeof(num_segments));
+    for (size_t i = 0; i < num_segments; ++i) {
+      uint64_t start = boundaries[i];
+      uint64_t length = boundaries[i+1] - boundaries[i];
+      ofs.write(reinterpret_cast<const char*>(&start), sizeof(start));
+      ofs.write(reinterpret_cast<const char*>(&length), sizeof(length));
+    }
+    ofs.close();
+    std::cout << "Wrote " << num_segments << " segments to " << out_file << std::endl;
     break;
   }
   }
