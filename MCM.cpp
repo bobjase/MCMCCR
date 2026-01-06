@@ -697,6 +697,28 @@ int main(int argc, char* argv[]) {
     }
     boundaries.push_back(num_bytes);
 
+    // Refine boundaries: for each boundary, look back 512 bytes for the inflection point
+    const size_t lookback = 512;
+    std::vector<size_t> refined_boundaries;
+    refined_boundaries.push_back(0);
+    for (size_t k = 1; k < boundaries.size() - 1; ++k) {
+      size_t i = boundaries[k];
+      size_t start = (i > lookback) ? i - lookback : 0;
+      float max_grad = 0;
+      size_t best_j = i;
+      for (size_t j = start; j < i; ++j) {
+        if (std::abs(gradient[j]) > max_grad) {
+          max_grad = std::abs(gradient[j]);
+          best_j = j;
+        }
+      }
+      if (best_j - refined_boundaries.back() >= min_segment) {
+        refined_boundaries.push_back(best_j);
+      }
+    }
+    refined_boundaries.push_back(num_bytes);
+    boundaries = refined_boundaries;
+
     // Atomic Fusion: Hot/Cold Dependency Check
     std::string original_file;
     if (in_file.find("enwik8_5MB") != std::string::npos) {
