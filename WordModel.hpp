@@ -64,6 +64,7 @@ public:
   WordModel() {}
 
   void Init(const ReorderMap<uint8_t, 256>& reorder) {
+    return;
     uint32_t index = 0;
     for (auto& t : transform) t = transform_table_size;
     for (uint32_t i = 'a'; i <= 'z'; ++i) {
@@ -91,50 +92,50 @@ public:
     // trans(92) = index++;
 
 #if 0
-    trans('À') = trans('à') = index++;
-    trans('Á') = trans('á') = index++;
-    trans('Â') = trans('â') = index++;
-    trans('Ã') = trans('ã') = index++;
-    trans('Ä') = trans('ä') = index++;
-    trans('Å') = trans('å') = index++;
-    trans('Æ') = trans('æ') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
 
-    trans('Ç') = trans('ç') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
 
-    trans('È') = trans('è') = index++;
-    trans('É') = trans('é') = index++;
-    trans('Ê') = trans('ê') = index++;
-    trans('Ë') = trans('ë') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
 
-    trans('Ì') = trans('ì') = index++;
-    trans('Í') = trans('í') = index++;
-    trans('Î') = trans('î') = index++;
-    trans('Ï') = trans('ï') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
 
-    trans('È') = trans('è') = index++;
-    trans('É') = trans('é') = index++;
-    trans('Ê') = trans('ê') = index++;
-    trans('Ë') = trans('ë') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
 
-    trans('Ð') = index++;
-    trans('ð') = index++;
-    trans('Ñ') = trans('ñ') = index++;
+    trans('ï¿½') = index++;
+    trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
 
-    trans('Ò') = trans('ò') = index++;
-    trans('Ó') = trans('ó') = index++;
-    trans('Ô') = trans('ô') = index++;
-    trans('Ö') = trans('ö') = index++;
-    trans('Õ') = trans('õ') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
 
-    trans('Ò') = trans('ò') = index++;
-    trans('Ó') = trans('ó') = index++;
-    trans('Ô') = trans('ô') = index++;
-    trans('Ö') = trans('ö') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
 
-    trans('Ù') = trans('ù') = index++;
-    trans('Ú') = trans('ú') = index++;
-    trans('Û') = trans('û') = index++;
-    trans('Ü') = trans('ü') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
+    trans('ï¿½') = trans('ï¿½') = index++;
 #endif
     for (size_t i = 128; i < 256; ++i) {
       if (transform[reorder[i]] == transform_table_size) {
@@ -212,6 +213,8 @@ class DictXMLModel : public WordModel {
   // 40 82 6
 public:
   void Init(const ReorderMap<uint8_t, 256>& reorder) {
+      return;
+  
     last_char_ = 0;
     dict_remain_ = 0;
     escape_ = reorder[0x3];
@@ -261,6 +264,8 @@ private:
 class XMLWordModel : public WordModel {
 public:
   void init(const ReorderMap<uint8_t, 256>& reorder) {
+      return;
+  
     for (auto& c : stack_) c = 0;
     stack_pos_ = 0;
     last_symbol_ = 0;

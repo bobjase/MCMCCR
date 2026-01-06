@@ -33,6 +33,7 @@
 
 #include "Archive.hpp"
 #include "CM.hpp"
+#include "CM-inl.hpp"
 #include "DeltaFilter.hpp"
 #include "Dict.hpp"
 #include "File.hpp"
@@ -95,6 +96,11 @@ public:
   const std::string kDictArg = "-dict=";
   const std::string kOutDictArg = "-out-dict=";
   std::string dict_file;
+  // Segmentation parameters
+  size_t segment_window = 512;
+  float segment_threshold = 3.0f;
+  size_t segment_min_segment = 2048;
+  size_t segment_lookback = 1024;
 
   int usage(const std::string& name) {
     printHeader();
@@ -109,6 +115,10 @@ public:
       << "-test tests the file after compression is done" << std::endl
       << "-observer generates entropy profile instead of compressing" << std::endl
       << "-segment performs entropy-based segmentation on .entropy file" << std::endl
+      << "-window <size> smoothing window size (default 64)" << std::endl
+      << "-threshold <float> gradient threshold for boundaries (default 0.01)" << std::endl
+      << "-min-segment <size> minimum segment size (default 1024)" << std::endl
+      << "-lookback <size> lookback distance for inflection points (default 512)" << std::endl
       // << "-b <mb> specifies block size in MB" << std::endl
       // << "-t <threads> the number of threads to use (decompression requires the same number of threads" << std::endl
       << "Examples:" << std::endl
@@ -169,7 +179,19 @@ public:
       } else if (arg == "-lzp=auto") options_.lzp_type_ = kLZPTypeAuto;
       else if (arg == "-lzp=true") options_.lzp_type_ = kLZPTypeEnable;
       else if (arg == "-lzp=false") options_.lzp_type_ = kLZPTypeDisable;
-      else if (arg == "-b") {
+      else if (arg == "-window") {
+        if (i + 1 >= argc) return usage(program);
+        segment_window = std::stoull(argv[++i]);
+      } else if (arg == "-threshold") {
+        if (i + 1 >= argc) return usage(program);
+        segment_threshold = std::stod(argv[++i]);
+      } else if (arg == "-min-segment") {
+        if (i + 1 >= argc) return usage(program);
+        segment_min_segment = std::stoull(argv[++i]);
+      } else if (arg == "-lookback") {
+        if (i + 1 >= argc) return usage(program);
+        segment_lookback = std::stoull(argv[++i]);
+      } else if (arg == "-b") {
         if (i + 1 >= argc) {
           return usage(program);
         }
@@ -257,6 +279,9 @@ public:
         } else {
           out_file = trimDir(in_file) + ".mcm";
         }
+      }
+      if (mode == kModeObserver) {
+        out_file = trimDir(in_file) + ".entropy";
       }
       if (mode == kModeMemTest) {
         // No out file for memtest.
@@ -601,30 +626,35 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error opening: " << f.getName() << std::endl;
         return 1;
       }
+      std::cout << "Length of " << f.getName() << ": " << fin.length() << std::endl;
       total_size += fin.length();
       fin.close();
     }
+    std::cout << "Total size " << total_size << std::endl;
     // Create a buffer for the file
     std::vector<uint8_t> buffer(total_size);
     uint64_t pos = 0;
     for (const auto& f : files) {
       File fin(f.getName(), std::ios_base::in | std::ios_base::binary);
       size_t count = fin.read(buffer.data() + pos, buffer.size() - pos);
+      std::cout << "Read " << count << " bytes from " << f.getName() << std::endl;
       pos += count;
     }
-    // Create TurboCM
-    TurboCM<6> compressor(options.options_.mem_usage_);
+    std::cout << "Read " << pos << " bytes" << std::endl;
+    // Create CM
+    cm::CM<8, true> compressor(FrequencyCounter<256>(), 8, true, Detector::kProfileSimple);
+    compressor.cur_profile_ = cm::CMProfile::CreateSimple(8);
     compressor.observer_mode = true;
     // Create streams
     ReadMemoryStream rms(buffer.data(), buffer.data() + buffer.size());
     VoidWriteStream vws;
+    std::cout << "Starting compress" << std::endl;
+    std::cout << "Compressing " << buffer.size() << " bytes" << std::endl;
     compressor.compress(&rms, &vws, buffer.size());
-    // Now compute stock compression size
-    TurboCM<6> stock_compressor(options.options_.mem_usage_);
-    ReadMemoryStream rms2(buffer.data(), buffer.data() + buffer.size());
-    VoidWriteStream vws2;
-    stock_compressor.compress(&rms2, &vws2, buffer.size());
-    uint64_t stock_size = vws2.tell();
+    std::cout << "entropies.size() = " << compressor.entropies.size() << std::endl;
+    std::cout << "Compress done" << std::endl;
+    // Skip stock compression size for observer to avoid hang
+    uint64_t stock_size = 0;
     // Output entropies
     std::string out_file = options.archive_file.getName();
     if (out_file.empty()) {
@@ -641,7 +671,7 @@ int main(int argc, char* argv[]) {
     // Write stock size
     ofs.write(reinterpret_cast<const char*>(&stock_size), sizeof(stock_size));
     // Write entropies
-    ofs.write(reinterpret_cast<const char*>(compressor.entropies.data()), num_bytes * sizeof(float));
+    ofs.write(reinterpret_cast<const char*>(compressor.entropies.data()), num_bytes * sizeof(double));
     ofs.close();
     std::cout << "Wrote " << num_bytes << " entropy values and stock size " << stock_size << " to " << out_file << std::endl;
     break;
@@ -661,14 +691,20 @@ int main(int argc, char* argv[]) {
     ifs.read(reinterpret_cast<char*>(&num_bytes), sizeof(num_bytes));
     uint64_t stock_size;
     ifs.read(reinterpret_cast<char*>(&stock_size), sizeof(stock_size));
-    std::vector<float> entropies(num_bytes);
-    ifs.read(reinterpret_cast<char*>(entropies.data()), num_bytes * sizeof(float));
+    std::vector<double> entropies(num_bytes);
+    ifs.read(reinterpret_cast<char*>(entropies.data()), num_bytes * sizeof(double));
     ifs.close();
     std::cout << "Read " << formatNumber(num_bytes) << " entropy values, stock size " << formatNumber(stock_size) << std::endl;
 
+    // Compute entropy stats
+    double min_e = *std::min_element(entropies.begin(), entropies.end());
+    double max_e = *std::max_element(entropies.begin(), entropies.end());
+    double avg_e = std::accumulate(entropies.begin(), entropies.end(), 0.0) / entropies.size();
+    std::cout << "Entropy stats: min=" << min_e << " max=" << max_e << " avg=" << avg_e << std::endl;
+
     // Smoothing: moving average
-    const size_t window = 128;
-    std::vector<float> smoothed(num_bytes);
+    const size_t window = options.segment_window;
+    std::vector<double> smoothed(num_bytes);
     for (size_t i = 0; i < num_bytes; ++i) {
       float sum = 0;
       size_t count = 0;
@@ -679,45 +715,23 @@ int main(int argc, char* argv[]) {
       smoothed[i] = sum / count;
     }
 
-    // Gradient
-    std::vector<float> gradient(num_bytes, 0);
-    for (size_t i = 1; i < num_bytes; ++i) {
-      gradient[i] = smoothed[i] - smoothed[i-1];
-    }
+    // Compute smoothed stats
+    double min_s = *std::min_element(smoothed.begin(), smoothed.end());
+    double max_s = *std::max_element(smoothed.begin(), smoothed.end());
+    double avg_s = std::accumulate(smoothed.begin(), smoothed.end(), 0.0) / smoothed.size();
+    std::cout << "Smoothed stats: min=" << min_s << " max=" << max_s << " avg=" << avg_s << std::endl;
 
-    // Boundary detection
-    const float threshold = 0.05f;
-    const size_t min_segment = 2048; // 2KB
+    // Boundary detection: find points where smoothed entropy > threshold
+    const double threshold = options.segment_threshold;  // Minimum entropy value
+    const size_t min_segment = options.segment_min_segment;
     std::vector<size_t> boundaries;
     boundaries.push_back(0);
     for (size_t i = 1; i < num_bytes; ++i) {
-      if (std::abs(gradient[i]) > threshold && i - boundaries.back() >= min_segment) {
+      if (smoothed[i] > threshold && i - boundaries.back() >= min_segment) {
         boundaries.push_back(i);
       }
     }
     boundaries.push_back(num_bytes);
-
-    // Refine boundaries: for each boundary, look back 512 bytes for the inflection point
-    const size_t lookback = 512;
-    std::vector<size_t> refined_boundaries;
-    refined_boundaries.push_back(0);
-    for (size_t k = 1; k < boundaries.size() - 1; ++k) {
-      size_t i = boundaries[k];
-      size_t start = (i > lookback) ? i - lookback : 0;
-      float max_grad = 0;
-      size_t best_j = i;
-      for (size_t j = start; j < i; ++j) {
-        if (std::abs(gradient[j]) > max_grad) {
-          max_grad = std::abs(gradient[j]);
-          best_j = j;
-        }
-      }
-      if (best_j - refined_boundaries.back() >= min_segment) {
-        refined_boundaries.push_back(best_j);
-      }
-    }
-    refined_boundaries.push_back(num_bytes);
-    boundaries = refined_boundaries;
 
     // Atomic Fusion: Hot/Cold Dependency Check
     std::string original_file;
@@ -733,11 +747,16 @@ int main(int argc, char* argv[]) {
       std::cerr << "Error opening original file: " << original_file << std::endl;
       return 1;
     }
+    uint64_t file_size = original_fin.length();
+    if (num_bytes > file_size) {
+      num_bytes = file_size;
+      entropies.resize(num_bytes);
+    }
     float global_avg = 0;
     for (float e : entropies) global_avg += e;
     global_avg /= num_bytes;
     std::vector<size_t> to_remove;
-    for (size_t i = 1; i < boundaries.size() - 1; ++i) {
+/*    for (size_t i = 1; i < boundaries.size() - 1; ++i) {
       size_t start_b = boundaries[i];
       size_t end_b = boundaries[i + 1];
       size_t len_b = end_b - start_b;
@@ -754,7 +773,7 @@ int main(int argc, char* argv[]) {
         continue;
       }
       // Cold compression
-      TurboCM<6> cold_comp(options.options_.mem_usage_);
+      cm::CM<12, true, uint32_t> cold_comp(FrequencyCounter<256>(), options.options_.mem_usage_, true, Detector::kProfileText);
       ReadMemoryStream rms_seg(segment_bytes.data(), segment_bytes.data() + len_b);
       VoidWriteStream vws_seg;
       cold_comp.compress(&rms_seg, &vws_seg, len_b);
@@ -767,6 +786,7 @@ int main(int argc, char* argv[]) {
         to_remove.push_back(i);
       }
     }
+*/
     // Remove boundaries (fuse)
     for (auto it = to_remove.rbegin(); it != to_remove.rend(); ++it) {
       boundaries.erase(boundaries.begin() + *it);

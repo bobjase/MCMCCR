@@ -369,7 +369,10 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
     detector.init();
   }
   init();
+  std::cout << "Starting compress with max_count = " << max_count << std::endl;
+  std::cout << "observer_mode = " << observer_mode << std::endl;
   ent = Range7();
+  byte_index = 0;
   if (use_huffman) {
     const clock_t start = clock();
     size_t freqs[256] = { 1 };
@@ -380,8 +383,9 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
     huff.build(tree);
     std::cout << "Building huffman tree took: " << clock() - start << " MS" << std::endl;
   }
+  size_t processed = 0;
   for (;max_count > 0; --max_count) {
-    uint32_t c;
+    int c;
     if (!force_profile_) {
       Detector::Profile new_profile;
       c = detector.get(new_profile);
@@ -391,8 +395,13 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
         SetDataProfile(data_profile);
       }
     } else {
+      processed++;
+      if (processed % 100000 == 0) std::cout << "Processed " << processed << " bytes, remaining max_count = " << max_count << std::endl;
       c = sin.get();
-      if (c == EOF) break;
+      if (c == EOF) {
+        std::cout << "EOF at processed = " << processed << std::endl;
+        break;
+      }
     }
     c = reorder_[c];
     dcheck(c != EOF);
@@ -400,6 +409,8 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
     update(c);
   }
   ent.flush(sout);
+  std::cout << "Final max_count = " << max_count << std::endl;
+  std::cout << "processed " << processed << " bytes" << std::endl;
 
   {
     uint64_t total = 0, less64 = 0;

@@ -267,6 +267,7 @@ public:
     static const bool kVerbose = true;
   public:
     void Generate(Builder& builder, CodeWordSet* words, size_t min_occurrences, size_t num_1 = 32, size_t num_2 = 32, size_t num_code_words = 128) {
+      return;
       auto start_time = clock();
       auto* cw = words->GetCodeWords();
       cw->clear();
@@ -459,6 +460,7 @@ public:
                       uint8_t num3,
                       FrequencyCounter<256>* fc,
                       size_t num_codes = kCodeWordStart) {
+                        return;
       // Create the dict array.
       WriteVectorStream wvs(&dict_buffer_);
       // Save space for dict size.
@@ -544,6 +546,7 @@ public:
                   bool encode,
                   FrequencyCounter<256>* fc = nullptr,
                   size_t num_codes = kCodeWordStart) {
+        return;
       const size_t code_word_start = 256 - num_codes;
       const size_t end1 = code_word_start + num1;
       const size_t end2 = end1 + num2;
@@ -900,6 +903,7 @@ private:
   };
 
   void buildDict() {
+    return;
     dict_pos_ = 0;
     if (verbose_) std::cout << std::endl;
     auto stream_pos = stream_->tell();

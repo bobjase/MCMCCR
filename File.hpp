@@ -26,6 +26,7 @@
 
 #include <cassert>
 #include <fstream>
+#include <io.h>
 #include <mutex>
 #include <stdio.h>
 #include <sstream>
@@ -117,6 +118,7 @@ protected:
   std::mutex lock;
   uint64_t offset = 0; // Current offset in the file.
   FILE* handle = nullptr;
+  std::string file_name_;
 public:
   virtual ~File() {
     close();
@@ -124,6 +126,7 @@ public:
 
   File() {}
   File(const std::string& file_name, std::ios_base::open_mode mode = std::ios_base::in | std::ios_base::binary) {
+    file_name_ = file_name;
     open(file_name, mode);
   }
 
@@ -273,10 +276,7 @@ public:
 
   ALWAYS_INLINE uint64_t length() {
     std::unique_lock<std::mutex> mu(lock);
-    seek(0, SEEK_END);
-    uint64_t length = tell();
-    seek(0, SEEK_SET);
-    return length;
+    return _filelength(_fileno(handle));
   }
 };
 

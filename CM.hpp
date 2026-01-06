@@ -248,10 +248,16 @@ namespace cm {
     typedef fastBitModel<int, kShift, 9, 30> StationaryModel;
     typedef fastBitModel<int, kShift, 9, 30> HPStationaryModel;
 
+    std::vector<double> entropies;
+    bool observer_mode = false;
+    size_t process_count = 0;
+    double current_entropy = 0;
+    size_t byte_index = 0;
+
     // Word model
     // XMLWordModel word_model_;
     // WordModel word_model_;
-    DictXMLModel word_model_;
+    WordModel word_model_;
     size_t word_model_ctx_map_[WordModel::kMaxLen + 1];
 
     // Bracket model
@@ -699,6 +705,12 @@ namespace cm {
 				} else {
 					ent.encode(stream, bit, p, kShift);
 				}
+				if (observer_mode) {
+					double p_scaled = (double)p / (double)(1 << kShift);
+					double prob = (bit == 1) ? p_scaled : (1.0 - p_scaled);
+					if (prob < 1e-9) prob = 1e-9;
+					current_entropy += -log2(prob);
+				}
         if (bits == 1) {
           // ++ctx_count_[cur_ctx];  // Only for last context.
         }
@@ -884,9 +896,12 @@ namespace cm {
 
     template <const bool decode, typename TStream>
     size_t processByte(TStream& stream, uint32_t c = 0) {
+      process_count++;
+      byte_index++;
       size_t base_contexts[kInputs] = {};
       auto* ctx_ptr = base_contexts;
 
+      // Get current buffer position and previous bytes
       const size_t bpos = buffer_.Pos();
       const size_t blast = bpos - 1; // Last seen char
       const size_t
@@ -918,7 +933,8 @@ namespace cm {
           ++other_count_;
           ++miss_count_[std::min(kMaxMiss - 1, miss_len_ / 32)];
         }
-        if (miss_len_ >= cur_profile_.MissFastPath()) {
+        // Check if we can use fast path for long miss sequences, but skip in observer mode to avoid corruption
+        if (miss_len_ >= cur_profile_.MissFastPath() && !observer_mode) {
           if (kStatistics) ++fast_bytes_;
 
           uint32_t mm_hash = h;
@@ -926,7 +942,6 @@ namespace cm {
             mm_hash = HashFunc(buffer_[bpos - order], mm_hash);
           }
           match_model_.setHash(mm_hash);
-
           if (false) {
             if (decode) {
               c = ent.DecodeDirectBits(stream, 8);
@@ -951,8 +966,6 @@ namespace cm {
               size_t cur = idx0;
               cur = (cur << 4) | idx1;
               cur = (cur << 4) | idx2;
-              // if (opt_var_ == 0) cur = (cur << 8) | (base_ctx + ctx);
-              // else if (opt_var_ == 1) cur = (cur << 8) | idx2;
               auto* pr = &fast_mix_[cur];
               auto p = pr->getP();
               p += p == 0;
@@ -965,6 +978,12 @@ namespace cm {
                 bit = ch >> 31;
                 ent.encode(stream, bit, p, kShift);
                 ch <<= 1;
+              }
+              if (observer_mode) {
+                double p_scaled = (double)p / (double)(1 << kShift);
+                double prob = (bit == 1) ? p_scaled : (1.0 - p_scaled);
+                if (prob < 1e-9) prob = 1e-9;
+                current_entropy += -log2(prob);
               }
               pr->update(bit, 10);
               *st0 = state_trans_[*st0][bit];
@@ -987,7 +1006,6 @@ namespace cm {
               c = ctx & 0xFF;
             }
           }
-          return c;
         }
       }
 
@@ -1019,7 +1037,6 @@ namespace cm {
           size_t bit = decode ? 0 : expected_char == c;
           sse_ctx_ = 256 * (1 + expected_char);
           bit = ProcessBits<decode, kBitTypeLZP, 1u>(stream, bit, base_contexts, expected_char ^ 256);
-          // CalcMixerBase(false);
           if (kStatistics) {
             const uint64_t after_pos = kStatistics ? stream.tell() : 0;
             (bit ? lzp_bit_match_bytes_ : lzp_bit_miss_bytes_) += after_pos - cur_pos;
@@ -1027,6 +1044,10 @@ namespace cm {
             ++(bit ? match_hits_ : match_miss_)[mm_len + cur_profile_.MatchModelOrder() - 4];
           }
           if (bit) {
+            if (observer_mode) {
+              entropies.push_back(current_entropy);
+              current_entropy = 0;
+            }
             return expected_char;
           }
         }
@@ -1035,7 +1056,6 @@ namespace cm {
         match_model_.resetMatch();
         return c;
       }
-      // Non match, do normal encoding.
       size_t n = (sse_ctx_ != 0) ?
         ProcessBits<decode, kBitTypeNormalSSE, kBitsPerByte>(stream, c, base_contexts, 0) :
 				ProcessBits<decode, kBitTypeNormal, kBitsPerByte>(stream, c, base_contexts, 0);
@@ -1044,6 +1064,18 @@ namespace cm {
       }
       if (kStatistics) {
         (sse_ctx_ != 0 ? lzp_miss_bytes_ : normal_bytes_) += stream.tell() - cur_pos;
+      }
+
+      if (observer_mode) {
+        entropies.push_back(current_entropy);
+        current_entropy = 0;
+        if (entropies.size() > byte_index + 100) {
+          std::cout << "Entropies size " << entropies.size() << " exceeds byte_index " << byte_index << " by more than 100" << std::endl;
+          std::exit(1);
+        }
+      }
+      if (byte_index % 10000 == 0) {
+        std::cout << "byte index: " << byte_index << ", entropies size: " << entropies.size() << std::endl;
       }
 
       return c;
