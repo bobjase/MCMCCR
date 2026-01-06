@@ -167,7 +167,7 @@ static inline uint32_t stat_mode(const char *fname) {
 }
 
 void FileInfo::CreateDir(const std::string& name) {
-  mkdir(name.c_str(), 0777);
+  mkdir(name.c_str());
 }
 
 FileInfo::FileInfo(const std::string& name, const std::string* prefix)

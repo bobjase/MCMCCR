@@ -31,7 +31,7 @@ class UTF8Decoder {
   // Accumulator word.
   uint32_t extra;
   uint32_t acc;
-  bool error;
+  mutable bool error;
 public:
   UTF8Decoder() {
     init();

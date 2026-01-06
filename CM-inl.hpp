@@ -126,7 +126,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
     if (kInputs > idx++) binary_profile_.EnableModel(kModelSparse3);
     if (kInputs > idx++) binary_profile_.EnableModel(kModelSparse4);
     if (kInputs > idx++) binary_profile_.EnableModel(kModelOrder0);
-    if (kInputs > idx++) binary_profile_.EnableModel(static_cast<ModelType>(opts_[0]));
+    // if (kInputs > idx++) binary_profile_.EnableModel(static_cast<ModelType>(opts_[0]));
     // binary_profile_ = CMProfile();
     binary_profile_.SetMatchModelOrder(binary_mm_order);
     binary_profile_.SetMinLZPLen(lzp_enabled_ ? 0 : kMaxMatch + 1);
@@ -260,7 +260,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
   uint8_t text_mask[] = { 15,0,0,2,15,0,8,3,2,12,13,1,3,0,7,9,12,0,0,0,0,0,0,2,0,6,0,0,9,0,0,0,12,7,14,9,7,11,4,11,10,4,9,14,9,8,7,6,5,5,5,5,5,5,5,5,5,5,14,9,2,15,13,4,2,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,2,4,4,4,4,4,4,5,4,4,3,3,10,1,3,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,4,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, };
   uint8_t text_mask2[] = { 4,2,0,7,2,0,13,0,0,5,4,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,11,2,10,8,5,6,3,9,14,7,7,3,1,5,15,10,0,0,0,0,0,0,0,0,0,0,1,13,13,8,7,7,14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,15,6,12,14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,12,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, };
   reorder_.Copy(text_reorder_);
-  if (true) {
+  if(0) {
     std::ofstream of("of.txt");
     for (size_t i = 0; i < 256; ++i) of << (size_t)reorder_.Backward(i) << ",";
     of << std::endl;

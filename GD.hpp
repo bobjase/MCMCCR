@@ -56,7 +56,7 @@ public:
   template <typename Error, typename Predictor, typename Input>
   Error Cost(const Predictor& predictor, const Input* inputs, Input actual) const {
     const Error delta = predictor.Predict(inputs) - actual;
-    return std::log2f(Input(1.0) + std::abs(delta) * Input(32726.0));
+    return log2f(Input(1.0) + std::abs(delta) * Input(32726.0));
   }
 
   template <typename Error, typename Delta, typename Input>
@@ -70,7 +70,7 @@ class LinearPredictor {
 public:
   template <typename Input>
   Acc Cost(const Input* inputs, Acc actual) const {
-    return f_.Cost<Acc>(*this, inputs, actual);
+    return f_.template Cost<Acc>(*this, inputs, actual);
  }
 
   template <typename Input>

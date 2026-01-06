@@ -808,7 +808,7 @@ namespace cm {
         *(ctx_ptr++) = HashLookup(IntervalHash(hash) + interval_add, true);
       }
       if (cur.ModelEnabled(kModelInterval2, enabled)) {
-        *(ctx_ptr++) = HashLookup(hashify(interval_model2_ & interval2_mask_) + (22 * 123456781 + 1), true);
+        *(ctx_ptr++) = HashLookup(hashify(interval_model2_ & interval2_mask_) + (22 * 123456781ULL + 1), true);
       }
       if (cur.ModelEnabled(kModelBracket, enabled)) {
         auto hash = bracket_.GetHash();
@@ -822,7 +822,7 @@ namespace cm {
       static const size_t kCount = 1 << 16;
       int64_t total[kCount];
       std::fill_n(total, kCount, -1);
-      return DPOptimalLeaves(cost, total, 0, 64);
+      return OptimalByteStates(cost, total, 0, 64);
     }
 
     int NextNibbleLeaf(int node, size_t next) {
@@ -911,7 +911,7 @@ namespace cm {
         }
       }
 
-      uint32_t h = HashFunc((last_bytes_ & 0xFFFF) * 3, 0x4ec457c1 * 19);
+      uint32_t h = HashFunc((last_bytes_ & 0xFFFF) * 3, 0x4ec457c1ULL * 19);
       if (mm_len == 0) {
         ++miss_len_;
         if (kStatistics) {
