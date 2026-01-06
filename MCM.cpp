@@ -79,6 +79,8 @@ public:
     kModeDecompress,
     // List & other
     kModeList,
+    // Observer mode for entropy profiling
+    kModeObserver,
   };
   Mode mode = kModeUnknown;
   bool opt_mode = false;
@@ -103,6 +105,7 @@ public:
       << "0 .. 11 specifies memory with 32mb .. 5gb per thread (default " << CompressionOptions::kDefaultMemUsage << ")" << std::endl
       << "10 and 11 are only supported on 64 bits" << std::endl
       << "-test tests the file after compression is done" << std::endl
+      << "-observer generates entropy profile instead of compressing" << std::endl
       // << "-b <mb> specifies block size in MB" << std::endl
       // << "-t <threads> the number of threads to use (decompression requires the same number of threads" << std::endl
       << "Examples:" << std::endl
@@ -124,6 +127,7 @@ public:
       else if (arg == "-memtest") parsed_mode = kModeMemTest;
       else if (arg == "-opt") parsed_mode = kModeOpt;
       else if (arg == "-stest") parsed_mode = kModeSingleTest;
+      else if (arg == "-observer") parsed_mode = kModeObserver;
       else if (arg == "c") parsed_mode = kModeCompress;
       else if (arg == "l") parsed_mode = kModeList;
       else if (arg == "d") parsed_mode = kModeDecompress;
@@ -236,7 +240,7 @@ public:
     }
     const bool single_file_mode =
       mode == kModeCompress || mode == kModeDecompress || mode == kModeSingleTest ||
-      mode == kModeMemTest || mode == kModeOpt || kModeList;
+      mode == kModeMemTest || mode == kModeOpt || kModeList || mode == kModeObserver;
     if (single_file_mode && i < argc) {
       std::string in_file, out_file;
       // Read in file and outfile.
@@ -253,7 +257,7 @@ public:
       if (mode == kModeMemTest) {
         // No out file for memtest.
         files.push_back(FileInfo(trimDir(in_file)));
-      } else if (mode == kModeCompress || mode == kModeSingleTest || mode == kModeOpt) {
+      } else if (mode == kModeCompress || mode == kModeSingleTest || mode == kModeOpt || mode == kModeObserver) {
         archive_file = FileInfo(trimDir(out_file));
         files.push_back(FileInfo(trimDir(in_file)));
       } else {
@@ -579,6 +583,63 @@ int main(int argc, char* argv[]) {
   case Options::kModeExtractAll: {
     // Extract all the files in the archive.
     // archive.ExtractAll();
+    break;
+  }
+  case Options::kModeObserver: {
+    printHeader();
+    std::cout << "Running in Observer Mode" << std::endl;
+    // Read the input file
+    std::vector<FileInfo> files = options.files;
+    uint64_t total_size = 0;
+    for (const auto& f : files) {
+      File fin;
+      if (fin.open(f.getName(), std::ios_base::in | std::ios_base::binary)) {
+        std::cerr << "Error opening: " << f.getName() << std::endl;
+        return 1;
+      }
+      total_size += fin.length();
+      fin.close();
+    }
+    // Create a buffer for the file
+    std::vector<uint8_t> buffer(total_size);
+    uint64_t pos = 0;
+    for (const auto& f : files) {
+      File fin(f.getName(), std::ios_base::in | std::ios_base::binary);
+      size_t count = fin.read(buffer.data() + pos, buffer.size() - pos);
+      pos += count;
+    }
+    // Create TurboCM
+    TurboCM<6> compressor(options.options_.mem_usage_);
+    compressor.observer_mode = true;
+    // Create streams
+    ReadMemoryStream rms(buffer.data(), buffer.data() + buffer.size());
+    VoidWriteStream vws;
+    compressor.compress(&rms, &vws, buffer.size());
+    // Now compute stock compression size
+    TurboCM<6> stock_compressor(options.options_.mem_usage_);
+    ReadMemoryStream rms2(buffer.data(), buffer.data() + buffer.size());
+    VoidWriteStream vws2;
+    stock_compressor.compress(&rms2, &vws2, buffer.size());
+    uint64_t stock_size = vws2.tell();
+    // Output entropies
+    std::string out_file = options.archive_file.getName();
+    if (out_file.empty()) {
+      out_file = files[0].getName() + ".entropy";
+    }
+    std::ofstream ofs(out_file, std::ios::binary);
+    if (!ofs) {
+      std::cerr << "Error opening output file: " << out_file << std::endl;
+      return 1;
+    }
+    // Write total bytes
+    uint64_t num_bytes = compressor.entropies.size();
+    ofs.write(reinterpret_cast<const char*>(&num_bytes), sizeof(num_bytes));
+    // Write stock size
+    ofs.write(reinterpret_cast<const char*>(&stock_size), sizeof(stock_size));
+    // Write entropies
+    ofs.write(reinterpret_cast<const char*>(compressor.entropies.data()), num_bytes * sizeof(float));
+    ofs.close();
+    std::cout << "Wrote " << num_bytes << " entropy values and stock size " << stock_size << " to " << out_file << std::endl;
     break;
   }
   }

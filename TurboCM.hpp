@@ -97,6 +97,10 @@ public:
   // Optimization variable.
   uint32_t opt_var = 0;
 
+  // Observer mode
+  bool observer_mode = false;
+  std::vector<float> entropies;
+
   // Mixer
   typedef Mixer<int, 4> CMMixer;
   MixerArray<CMMixer> mix1_, mix2_;
@@ -277,6 +281,7 @@ public:
     }
     uint32_t len = word_model.getLength();
     int ctx = 1;
+    float current_entropy = 0.0f;
     do {
       uint8_t
         *no_alias s0 = nullptr, *no_alias s1 = nullptr, *no_alias s2 = nullptr, *no_alias s3 = nullptr,
@@ -350,7 +355,11 @@ public:
       } else {
         bit = code >> (sizeof(uint32_t) * 8 - 1);
         code <<= 1;
-        ent.encode(stream, bit, p, shift);
+        if (observer_mode) {
+          current_entropy += -log2(static_cast<double>(p) / (1 << shift));
+        } else {
+          ent.encode(stream, bit, p, shift);
+        }
       }
       ctx = ctx * 2 + bit;
 
@@ -391,6 +400,9 @@ public:
         ent.Normalize(stream);
       }
     } while ((ctx & 0x100) == 0);
+    if (observer_mode && !kDecode) {
+      entropies.push_back(current_entropy);
+    }
     return ctx ^ 256;
   }
 
@@ -410,15 +422,19 @@ public:
       int c = sin.get();
       if (c == EOF) break;
       processByte<false>(sout, c);
-      if (c == kEOFChar) {
-        ent.encodeBit(sout, 0);
+      if (!observer_mode) {
+        if (c == kEOFChar) {
+          ent.encodeBit(sout, 0);
+        }
       }
       update(c);
       --max_count;
     }
     processByte<false>(sout, kEOFChar);
-    ent.encodeBit(sout, 1);
-    ent.flush(sout);
+    if (!observer_mode) {
+      ent.encodeBit(sout, 1);
+      ent.flush(sout);
+    }
   }
 
   void decompress(Stream* in_stream, Stream* out_stream, uint64_t max_count) {
