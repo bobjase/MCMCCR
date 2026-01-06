@@ -664,10 +664,10 @@ int main(int argc, char* argv[]) {
     std::vector<float> entropies(num_bytes);
     ifs.read(reinterpret_cast<char*>(entropies.data()), num_bytes * sizeof(float));
     ifs.close();
-    std::cout << "Read " << num_bytes << " entropy values, stock size " << stock_size << std::endl;
+    std::cout << "Read " << formatNumber(num_bytes) << " entropy values, stock size " << formatNumber(stock_size) << std::endl;
 
     // Smoothing: moving average
-    const size_t window = 256;
+    const size_t window = 128;
     std::vector<float> smoothed(num_bytes);
     for (size_t i = 0; i < num_bytes; ++i) {
       float sum = 0;
@@ -686,8 +686,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Boundary detection
-    const float threshold = 0.1f;
-    const size_t min_segment = 4096; // 4KB
+    const float threshold = 0.05f;
+    const size_t min_segment = 2048; // 2KB
     std::vector<size_t> boundaries;
     boundaries.push_back(0);
     for (size_t i = 1; i < num_bytes; ++i) {
@@ -755,21 +755,20 @@ int main(int argc, char* argv[]) {
     if (out_file.empty()) {
       out_file = in_file + ".segments";
     }
-    std::ofstream ofs(out_file, std::ios::binary);
+    std::ofstream ofs(out_file);
     if (!ofs) {
       std::cerr << "Error opening output file: " << out_file << std::endl;
       return 1;
     }
     uint64_t num_segments = boundaries.size() - 1;
-    ofs.write(reinterpret_cast<const char*>(&num_segments), sizeof(num_segments));
+    ofs << num_segments << std::endl;
     for (size_t i = 0; i < num_segments; ++i) {
       uint64_t start = boundaries[i];
       uint64_t length = boundaries[i+1] - boundaries[i];
-      ofs.write(reinterpret_cast<const char*>(&start), sizeof(start));
-      ofs.write(reinterpret_cast<const char*>(&length), sizeof(length));
+      ofs << start << " " << length << std::endl;
     }
     ofs.close();
-    std::cout << "Wrote " << num_segments << " segments to " << out_file << std::endl;
+    std::cout << "Wrote " << formatNumber(num_segments) << " segments to " << out_file << std::endl;
     break;
   }
   }
