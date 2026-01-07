@@ -42,6 +42,7 @@ public:
   ALWAYS_INLINE size_t Pos() const { return pos_; }
   ALWAYS_INLINE size_t Mask() const { return mask_; }
   ALWAYS_INLINE T* Data() { return data_; }
+  ALWAYS_INLINE const T* Data() const { return data_; }
   size_t Prev(size_t pos, size_t count) const {
     // Relies on integer underflow behavior. Works since pow 2 size.
     return (pos - count) & mask_;
@@ -57,6 +58,9 @@ public:
   }
   virtual void Restart() {
     pos_ = 0;
+  }
+  void SetPos(size_t pos) {
+    pos_ = pos;
   }
   ALWAYS_INLINE void Push(T val) {
     data_[pos_++ & mask_] = val;

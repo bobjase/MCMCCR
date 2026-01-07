@@ -24,6 +24,32 @@
 #include <chrono>
 #include <ctime>
 #include <fstream>
+#include <windows.h>
+#include <deque>
+#include <vector>
+#include <io.h>
+#include <fcntl.h>
+
+// --- Helper: Binary I/O ---
+template <typename T>
+void WriteBinary(const std::string& filename, const std::vector<T>& vec) {
+    FILE* f = fopen(filename.c_str(), "wb");
+    uint64_t size = vec.size();
+    fwrite(&size, sizeof(uint64_t), 1, f);
+    if (size > 0) fwrite(vec.data(), sizeof(T), size, f);
+    fclose(f);
+}
+
+template <typename T>
+std::vector<T> ReadBinary(const std::string& filename) {
+    FILE* f = fopen(filename.c_str(), "rb");
+    uint64_t size = 0;
+    fread(&size, sizeof(uint64_t), 1, f);
+    std::vector<T> vec(size);
+    if (size > 0) fread(vec.data(), sizeof(T), size, f);
+    fclose(f);
+    return vec;
+}
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -163,6 +189,8 @@ public:
     kModeFingerprint,
     // Oracle mode for testing candidate pairs compression
     kModeOracle,
+    // Oracle child mode for multiprocess oracle
+    kModeOracleChild,
     // PathCover mode for graph construction and reordering
     kModePathCover,
   };
@@ -226,6 +254,7 @@ public:
       else if (arg == "-segment") parsed_mode = kModeSegment;
       else if (arg == "-fingerprint") parsed_mode = kModeFingerprint;
       else if (arg == "-oracle") parsed_mode = kModeOracle;
+      else if (arg == "-oracle-child") parsed_mode = kModeOracleChild;
       else if (arg == "-pathcover") parsed_mode = kModePathCover;
       else if (arg == "c") parsed_mode = kModeCompress;
       else if (arg == "l") parsed_mode = kModeList;
@@ -379,7 +408,7 @@ public:
         files.push_back(FileInfo(trimDir(out_file)));
       }
     }
-    if (mode != kModeMemTest &&
+    if (mode != kModeMemTest && mode != kModeOracleChild && mode != kModeOracle &&
       (archive_file.getName().empty() || (files.empty() && mode != kModeList))) {
       std::cerr << "Error, input or output files missing" << std::endl;
       usage(program);
@@ -390,6 +419,270 @@ public:
 };
 
 extern void RunBenchmarks();
+
+// --- Oracle Child Process Function ---
+int OracleChildMain() {
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    try {
+        // Read file_data from stdin
+        uint64_t file_size;
+        if (fread(&file_size, sizeof(uint64_t), 1, stdin) != 1) {
+            std::cerr << "Failed to read file_size" << std::endl;
+            return 1;
+        }
+        std::vector<uint8_t> file_data(file_size);
+        if (file_size > 0 && fread(file_data.data(), sizeof(uint8_t), file_size, stdin) != file_size) {
+            std::cerr << "Failed to read file_data" << std::endl;
+            return 1;
+        }
+
+        // Read valid_segments
+        uint64_t num_segments;
+        if (fread(&num_segments, sizeof(uint64_t), 1, stdin) != 1) {
+            std::cerr << "Failed to read num_segments" << std::endl;
+            return 1;
+        }
+        std::vector<std::pair<size_t, size_t>> valid_segments(num_segments);
+        for (auto& seg : valid_segments) {
+            if (fread(&seg.first, sizeof(size_t), 1, stdin) != 1 ||
+                fread(&seg.second, sizeof(size_t), 1, stdin) != 1) {
+                std::cerr << "Failed to read segment" << std::endl;
+                return 1;
+            }
+        }
+
+        // Read pred_id
+        size_t pred_id;
+        if (fread(&pred_id, sizeof(size_t), 1, stdin) != 1) {
+            std::cerr << "Failed to read pred_id" << std::endl;
+            return 1;
+        }
+
+        // Read succ_list
+        uint64_t num_succ;
+        if (fread(&num_succ, sizeof(uint64_t), 1, stdin) != 1) {
+            std::cerr << "Failed to read num_succ" << std::endl;
+            return 1;
+        }
+        std::vector<size_t> succ_list(num_succ);
+        if (num_succ > 0 && fread(succ_list.data(), sizeof(size_t), num_succ, stdin) != num_succ) {
+            std::cerr << "Failed to read succ_list" << std::endl;
+            return 1;
+        }
+
+        // Process the pred
+        std::map<size_t, std::vector<std::pair<size_t, double>>> succ_costs;
+
+        // Get pred data
+        size_t start_pred = valid_segments[pred_id].first;
+        size_t len_pred = valid_segments[pred_id].second;
+        std::vector<uint8_t> data_pred(file_data.begin() + start_pred, file_data.begin() + start_pred + len_pred);
+
+        // For each succ
+        for (size_t succ : succ_list) {
+            // Create CM
+            cm::CM<6, false> cm(FrequencyCounter<256>(), 4, true, Detector::kProfileText);
+            cm.observer_mode = true;
+
+            // Compress full pred
+            MemoryReadStream in_pred(data_pred);
+            VoidWriteStream out_pred;
+            cm.compress(&in_pred, &out_pred, data_pred.size());
+
+            // Get succ data
+            size_t start_succ = valid_segments[succ].first;
+            size_t len_succ = valid_segments[succ].second;
+            std::vector<uint8_t> data_succ(file_data.begin() + start_succ, file_data.begin() + start_succ + len_succ);
+            size_t head_len = std::min((size_t)10240, data_succ.size());
+            std::vector<uint8_t> head_succ(data_succ.begin(), data_succ.begin() + head_len);
+
+            // Record entropy start
+            size_t entropy_start = cm.entropies.size();
+
+            // Compress head
+            MemoryReadStream in_head(head_succ);
+            VoidWriteStream out_head;
+            cm.compress(&in_head, &out_head, head_succ.size());
+
+            // Measure cost
+            double transition_cost = 0.0;
+            for (size_t k = entropy_start; k < cm.entropies.size(); ++k) {
+                transition_cost += cm.entropies[k];
+            }
+
+            succ_costs[succ].emplace_back(pred_id, transition_cost);
+        }
+
+        // Write results to stdout
+        // First, number of succ with costs
+        uint64_t num_results = succ_costs.size();
+        fwrite(&num_results, sizeof(uint64_t), 1, stdout);
+        for (const auto& succ_pair : succ_costs) {
+            size_t succ = succ_pair.first;
+            const auto& costs = succ_pair.second;
+            fwrite(&succ, sizeof(size_t), 1, stdout);
+            uint64_t num_costs = costs.size();
+            fwrite(&num_costs, sizeof(uint64_t), 1, stdout);
+            for (const auto& cost_pair : costs) {
+                fwrite(&cost_pair.first, sizeof(size_t), 1, stdout);
+                fwrite(&cost_pair.second, sizeof(double), 1, stdout);
+            }
+        }
+        fflush(stdout);
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "OracleChildMain exception: " << e.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "OracleChildMain unknown exception" << std::endl;
+        return 1;
+    }
+}
+
+int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& file_data, const std::vector<std::pair<size_t, size_t>>& valid_segments, const std::map<size_t, std::vector<size_t>>& pred_to_succ, std::vector<std::vector<std::pair<size_t, double>>>& pred_costs) {
+    // Detect number of CPUs
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    size_t num_cpus = sysinfo.dwNumberOfProcessors;
+    const size_t window_size = std::max<size_t>(1, num_cpus - 2);  // Use up to numCPUs-2, min 1
+    std::cout << "Detected " << num_cpus << " CPUs, using window size " << window_size << std::endl;
+    std::vector<std::pair<size_t, std::vector<size_t>>> pred_list(pred_to_succ.begin(), pred_to_succ.end());
+    std::vector<HANDLE> processes;
+    std::vector<HANDLE> child_stdout_reads;
+    size_t pred_index = 0;
+
+    while (pred_index < pred_list.size() || !processes.empty()) {
+        // Launch new processes up to window size
+        while (processes.size() < window_size && pred_index < pred_list.size()) {
+            const auto& pair = pred_list[pred_index];
+            size_t pred = pair.first;
+            const std::vector<size_t>& succ_list = pair.second;
+
+            // Create pipes for child's stdin
+            HANDLE hChildStdinRead, hChildStdinWrite;
+            SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+            if (!CreatePipe(&hChildStdinRead, &hChildStdinWrite, &sa, 0)) {
+                std::cerr << "Failed to create stdin pipe for pred " << pred << std::endl;
+                return 1;
+            }
+            SetHandleInformation(hChildStdinRead, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);  // Child reads
+            SetHandleInformation(hChildStdinWrite, HANDLE_FLAG_INHERIT, 0);  // Parent writes, don't inherit
+
+            // Create pipes for child's stdout
+            HANDLE hChildStdoutRead, hChildStdoutWrite;
+            if (!CreatePipe(&hChildStdoutRead, &hChildStdoutWrite, &sa, 0)) {
+                std::cerr << "Failed to create stdout pipe for pred " << pred << std::endl;
+                CloseHandle(hChildStdinRead);
+                CloseHandle(hChildStdinWrite);
+                return 1;
+            }
+            SetHandleInformation(hChildStdoutRead, HANDLE_FLAG_INHERIT, 0);  // Parent reads, don't inherit
+            SetHandleInformation(hChildStdoutWrite, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);  // Child writes
+
+            // Create process
+            STARTUPINFO si = {sizeof(STARTUPINFO)};
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdInput = hChildStdinRead;
+            si.hStdOutput = hChildStdoutWrite;
+            si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+            PROCESS_INFORMATION pi;
+            std::string cmd = "mcm.exe -oracle-child";
+            if (!CreateProcess(NULL, const_cast<char*>(cmd.c_str()), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+                std::cerr << "Failed to create process for pred " << pred << std::endl;
+                CloseHandle(hChildStdinRead);
+                CloseHandle(hChildStdinWrite);
+                CloseHandle(hChildStdoutRead);
+                CloseHandle(hChildStdoutWrite);
+                return 1;
+            }
+
+            // Set priority to IDLE
+            SetPriorityClass(pi.hProcess, IDLE_PRIORITY_CLASS);
+
+            // Close handles not needed in parent
+            CloseHandle(hChildStdinRead);
+            CloseHandle(hChildStdoutWrite);
+
+            // Write data to child's stdin
+            DWORD written;
+            uint64_t file_size = file_data.size();
+            WriteFile(hChildStdinWrite, &file_size, sizeof(uint64_t), &written, NULL);
+            WriteFile(hChildStdinWrite, file_data.data(), file_data.size(), &written, NULL);
+
+            uint64_t num_seg = valid_segments.size();
+            WriteFile(hChildStdinWrite, &num_seg, sizeof(uint64_t), &written, NULL);
+            for (const auto& seg : valid_segments) {
+                WriteFile(hChildStdinWrite, &seg.first, sizeof(size_t), &written, NULL);
+                WriteFile(hChildStdinWrite, &seg.second, sizeof(size_t), &written, NULL);
+            }
+
+            WriteFile(hChildStdinWrite, &pred, sizeof(size_t), &written, NULL);
+
+            uint64_t num_succ = succ_list.size();
+            WriteFile(hChildStdinWrite, &num_succ, sizeof(uint64_t), &written, NULL);
+            if (num_succ > 0) WriteFile(hChildStdinWrite, succ_list.data(), num_succ * sizeof(size_t), &written, NULL);
+
+            // Close stdin write handle
+            CloseHandle(hChildStdinWrite);
+
+            processes.push_back(pi.hProcess);
+            child_stdout_reads.push_back(hChildStdoutRead);
+
+            std::cout << "Launched process for pred = " << pred << std::endl;
+            ++pred_index;
+        }
+
+        // Wait for one process to complete
+        if (!processes.empty()) {
+            DWORD wait_result = WaitForMultipleObjects(processes.size(), processes.data(), FALSE, INFINITE);
+            if (wait_result >= WAIT_OBJECT_0 && wait_result < WAIT_OBJECT_0 + processes.size()) {
+                size_t completed_index = wait_result - WAIT_OBJECT_0;
+                HANDLE completed_process = processes[completed_index];
+                HANDLE completed_stdout = child_stdout_reads[completed_index];
+
+                // Get exit code
+                DWORD exit_code;
+                GetExitCodeProcess(completed_process, &exit_code);
+                if (exit_code != 0) {
+                    std::cerr << "Child process failed with exit code " << exit_code << std::endl;
+                    return 1;
+                }
+
+                // Read results from stdout
+                uint64_t num_results;
+                DWORD read_bytes;
+                ReadFile(completed_stdout, &num_results, sizeof(uint64_t), &read_bytes, NULL);
+                for (uint64_t i = 0; i < num_results; ++i) {
+                    size_t succ;
+                    ReadFile(completed_stdout, &succ, sizeof(size_t), &read_bytes, NULL);
+                    uint64_t num_costs;
+                    ReadFile(completed_stdout, &num_costs, sizeof(uint64_t), &read_bytes, NULL);
+                    for (uint64_t j = 0; j < num_costs; ++j) {
+                        size_t pred_read;
+                        double cost;
+                        ReadFile(completed_stdout, &pred_read, sizeof(size_t), &read_bytes, NULL);
+                        ReadFile(completed_stdout, &cost, sizeof(double), &read_bytes, NULL);
+                        pred_costs[pred_read].emplace_back(succ, cost);
+                    }
+                }
+
+                // Close handles
+                CloseHandle(completed_process);
+                CloseHandle(completed_stdout);
+
+                // Remove from vectors
+                processes.erase(processes.begin() + completed_index);
+                child_stdout_reads.erase(child_stdout_reads.begin() + completed_index);
+            }
+        }
+    }
+
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
   if (!kReleaseBuild) {
     RunAllTests();
@@ -401,6 +694,8 @@ int main(int argc, char* argv[]) {
     return ret;
   }
   switch (options.mode) {
+  case Options::kModeOracleChild:
+    return OracleChildMain();
   case Options::kModeMemTest: {
     constexpr size_t kCompIterations = kIsDebugBuild ? 1 : 1;
     constexpr size_t kDecompIterations = kIsDebugBuild ? 1 : 25;
@@ -999,6 +1294,7 @@ int main(int argc, char* argv[]) {
   case Options::kModeOracle: {
     printHeader();
     std::cout << "Running Oracle Mode" << std::endl;
+    auto start_time = std::chrono::high_resolution_clock::now();
     if (argc != 3) {
       std::cerr << "Usage: mcm -oracle <candidates_file>" << std::endl;
       return 1;
@@ -1079,74 +1375,29 @@ int main(int argc, char* argv[]) {
         pred_to_succ[pred].push_back(succ);
       }
     }
-    // TEMP: limit to 4 pred for testing
-    // std::map<size_t, std::vector<size_t>> limited_pred_to_succ;
-    // size_t count = 0;
-    // for (const auto& p : pred_to_succ) {
-    //   if (count >= 4) break;
-    //   limited_pred_to_succ.insert(p);
-    //   ++count;
-    // }
-    auto& limited_pred_to_succ = pred_to_succ;
     std::cout << "pred_to_succ size: " << pred_to_succ.size() << std::endl << std::flush;
 
+    // TEMP: limit to 127 pred for testing
+    std::map<size_t, std::vector<size_t>> limited_pred_to_succ;
+    size_t count = 0;
+    for (const auto& p : pred_to_succ) {
+      if (count >= 127) break;
+      limited_pred_to_succ.insert(p);
+      ++count;
+    }
+
     // For each pred, compress pred once, take snapshot, then evaluate all succ that have pred as candidate
-    std::vector<std::vector<std::pair<size_t, double>>> costs(num_segments);  // for each succ, list of (pred, cost)
+    std::vector<std::vector<std::pair<size_t, double>>> pred_costs(num_segments);  // for each pred, list of (succ, cost)
     std::cout << "Number of pred to process: " << limited_pred_to_succ.size() << std::endl << std::flush;
-    std::vector<std::pair<size_t, std::vector<size_t>>> pred_list(limited_pred_to_succ.begin(), limited_pred_to_succ.end());
-    // #pragma omp parallel for  // Disabled for now due to exception handling issues in OpenMP
-    for (int i = 0; i < static_cast<int>(pred_list.size()); ++i) {
-      const auto& pair = pred_list[i];
-      size_t pred = pair.first;
-      const std::vector<size_t>& succ_list = pair.second;
-      // #pragma omp critical(progress)
-      std::cout << "Processing pred = " << pred << std::endl << std::flush;
-      size_t start_pred = valid_segments[pred].first;
-      size_t len_pred = valid_segments[pred].second;
-      std::vector<uint8_t> data_pred(file_data.begin() + start_pred, file_data.begin() + start_pred + len_pred);
 
-      // For each succ that has pred as candidate
-      for (size_t succ : succ_list) {
-        cm::CM<6, false> cm(FrequencyCounter<256>(), 6, true, Detector::kProfileText);
-        cm.observer_mode = true;
-        // Compress full pred
-        MemoryReadStream in_pred(data_pred);
-        VoidWriteStream out_pred;
-        cm.compress(&in_pred, &out_pred, data_pred.size());
-        // Record entropy start
-        size_t entropy_start = cm.entropies.size();
-        // Compress head of succ
-        size_t start_succ = valid_segments[succ].first;
-        size_t len_succ = valid_segments[succ].second;
-        std::vector<uint8_t> data_succ(file_data.begin() + start_succ, file_data.begin() + start_succ + len_succ);
-        size_t head_len = std::min((size_t)10240, data_succ.size());
-        std::vector<uint8_t> head_succ(data_succ.begin(), data_succ.begin() + head_len);
-        MemoryReadStream in_head(head_succ);
-        VoidWriteStream out_head;
-        cm.compress(&in_head, &out_head, head_succ.size());
-        // Measure cost
-        double transition_cost = 0.0;
-        for (size_t k = entropy_start; k < cm.entropies.size(); ++k) {
-          transition_cost += cm.entropies[k];
-        }
-        costs[succ].push_back({pred, transition_cost});
-      }
+    // Use multi-process approach
+    int ret = run_oracle_multiprocess(argv[0], file_data, valid_segments, limited_pred_to_succ, pred_costs);
+    if (ret != 0) {
+      std::cerr << "Multi-process oracle failed" << std::endl;
+      return ret;
     }
+
     std::cout << "Finished processing all pred" << std::endl << std::flush;
-
-    // For each succ, find best pred
-    std::vector<size_t> best_pred(num_segments, std::numeric_limits<size_t>::max());
-    std::vector<double> best_cost(num_segments, 1e100);
-    for (size_t succ = 0; succ < num_segments; ++succ) {
-      for (const auto& p : costs[succ]) {
-        size_t pred = p.first;
-        double cost = p.second;
-        if (cost < best_cost[succ]) {
-          best_cost[succ] = cost;
-          best_pred[succ] = pred;
-        }
-      }
-    }
 
     // Output .oracle file
     std::cout << "Starting to write oracle file" << std::endl << std::flush;
@@ -1156,11 +1407,22 @@ int main(int argc, char* argv[]) {
       std::cerr << "Error opening output file: " << out_file << std::endl;
       return 1;
     }
-    for (size_t succ = 0; succ < num_segments; ++succ) {
-      ofs << succ << ":" << best_pred[succ] << "," << best_cost[succ] << std::endl;
+    // Output per pred: pred : succ1,cost1 ; succ2,cost2 ; ...
+    for (size_t pred = 0; pred < num_segments; ++pred) {
+      if (!pred_costs[pred].empty()) {
+        ofs << pred << ":";
+        for (size_t i = 0; i < pred_costs[pred].size(); ++i) {
+          if (i > 0) ofs << ";";
+          ofs << pred_costs[pred][i].first << "," << pred_costs[pred][i].second;
+        }
+        ofs << std::endl;
+      }
     }
     ofs.close();
     std::cout << "Wrote oracle results to " << out_file << std::endl << std::flush;
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    std::cout << "Oracle processing completed in " << elapsed.count() << " seconds" << std::endl;
     break;
   }
   case Options::kModePathCover: {

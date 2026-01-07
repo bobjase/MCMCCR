@@ -356,6 +356,8 @@ namespace cm {
       size_t byte_index_snapshot;
       double current_entropy_snapshot;
       std::vector<double> entropies_snapshot;
+      size_t buffer_pos_snapshot;
+      std::vector<uint8_t> buffer_content_snapshot;
     };
 
     StateSnapshot takeSnapshot() const {
@@ -377,6 +379,8 @@ namespace cm {
       snap.byte_index_snapshot = byte_index;
       snap.current_entropy_snapshot = current_entropy;
       snap.entropies_snapshot = entropies;
+      snap.buffer_pos_snapshot = buffer_.Pos();
+      snap.buffer_content_snapshot.assign(buffer_.Data(), buffer_.Data() + buffer_.Mask() + 1);
       return snap;
     }
 
@@ -397,6 +401,9 @@ namespace cm {
       byte_index = snap.byte_index_snapshot;
       current_entropy = snap.current_entropy_snapshot;
       entropies = snap.entropies_snapshot;
+      buffer_.SetPos(snap.buffer_pos_snapshot);
+      std::copy(snap.buffer_content_snapshot.begin(), snap.buffer_content_snapshot.end(), buffer_.Data());
+      memset(hash_table_, 0, hash_alloc_size_);
     }
 
     // If force profile is true then we dont use a detector.
