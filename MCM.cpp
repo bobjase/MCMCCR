@@ -25,6 +25,7 @@
 #include <ctime>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <stdio.h>
 #include <string.h>
 #include <string>
@@ -160,6 +161,8 @@ public:
     kModeFingerprint,
     // Oracle mode for testing candidate pairs compression
     kModeOracle,
+    // PathCover mode for graph construction and reordering
+    kModePathCover,
   };
   Mode mode = kModeUnknown;
   bool opt_mode = false;
@@ -221,6 +224,7 @@ public:
       else if (arg == "-segment") parsed_mode = kModeSegment;
       else if (arg == "-fingerprint") parsed_mode = kModeFingerprint;
       else if (arg == "-oracle") parsed_mode = kModeOracle;
+      else if (arg == "-pathcover") parsed_mode = kModePathCover;
       else if (arg == "c") parsed_mode = kModeCompress;
       else if (arg == "l") parsed_mode = kModeList;
       else if (arg == "d") parsed_mode = kModeDecompress;
@@ -989,6 +993,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Wrote candidate lists for " << num_valid << " segments to " << out_file << std::endl;
     break;
   }
+  {
   case Options::kModeOracle: {
     printHeader();
     std::cout << "Running Oracle Mode" << std::endl;
@@ -1066,7 +1071,7 @@ int main(int argc, char* argv[]) {
     }
 
     // For each i, for each j in candidates[i], compress j, snapshot, then compress head_i, measure entropy cost
-    std::vector<size_t> best_j(num_segments, SIZE_MAX);
+    std::vector<size_t> best_j(num_segments, std::numeric_limits<size_t>::max());
     std::vector<double> best_cost(num_segments, 1e100);
     // #pragma omp parallel for
     for (size_t i = 0; i < num_segments; ++i) {
@@ -1075,7 +1080,7 @@ int main(int argc, char* argv[]) {
       std::vector<uint8_t> data_i(file_data.begin() + start_i, file_data.begin() + start_i + len_i);
       size_t head_len = std::min((size_t)10240, data_i.size());
       std::vector<uint8_t> head_i(data_i.begin(), data_i.begin() + head_len);
-      size_t local_best_j = SIZE_MAX;
+      size_t local_best_j = std::numeric_limits<size_t>::max();
       double local_best_cost = 1e100;
       for (size_t j : candidates[i]) {
         cm::CM<6, false> cm(FrequencyCounter<256>(), 6, true, Detector::kProfileText);
@@ -1117,6 +1122,216 @@ int main(int argc, char* argv[]) {
     ofs.close();
     std::cout << "Wrote oracle results to " << out_file << std::endl;
     break;
+  }
+  case Options::kModePathCover: {
+    printHeader();
+    std::cout << "Running PathCover Mode" << std::endl;
+    if (argc != 3) {
+      std::cerr << "Usage: mcm -pathcover <oracle_file>" << std::endl;
+      return 1;
+    }
+    std::string in_file = argv[2];
+    std::cout << "in_file: " << in_file << std::endl;
+    // Read segments file
+    std::string segments_file = in_file.substr(0, in_file.find(".candidates"));
+    std::cout << "segments_file: " << segments_file << std::endl;
+    std::ifstream seg_ifs(segments_file);
+    if (!seg_ifs) {
+      std::cerr << "Error opening segments file: " << segments_file << std::endl;
+      return 1;
+    }
+    size_t num_seg;
+    seg_ifs >> num_seg;
+    std::vector<std::pair<size_t, size_t>> segments(num_seg);
+    for (size_t i = 0; i < num_seg; ++i) {
+      seg_ifs >> segments[i].first >> segments[i].second;
+    }
+    seg_ifs.close();
+    size_t num_segments = num_seg;
+    std::cout << "Read " << num_segments << " segments from segments file" << std::endl;
+
+    // Read oracle
+    std::vector<size_t> best_j(num_segments, std::numeric_limits<size_t>::max());
+    std::vector<double> costs(num_segments, 1e100);
+    std::ifstream oracle_ifs(in_file);
+    if (!oracle_ifs) {
+      std::cerr << "Error opening oracle file: " << in_file << std::endl;
+      return 1;
+    }
+    std::string line;
+    while (std::getline(oracle_ifs, line)) {
+      std::istringstream iss(line);
+      std::string token;
+      std::getline(iss, token, ':');
+      size_t i = std::stoul(token);
+      if (i >= num_segments) continue;
+      std::getline(iss, token, ',');
+      best_j[i] = std::stoul(token);
+      std::getline(iss, token);
+      costs[i] = std::stod(token);
+    }
+    oracle_ifs.close();
+    std::cout << "Read oracle data" << std::endl;
+
+    // Load original file
+    std::string original_file = segments_file.substr(0, segments_file.find_last_of('.')); // remove .segments
+    std::cout << "original_file: " << original_file << std::endl;
+    File fin;
+    if (fin.open(original_file, std::ios_base::in | std::ios_base::binary)) {
+      std::cerr << "Error opening original file: " << original_file << std::endl;
+      return 1;
+    }
+    size_t file_size = fin.length();
+    std::vector<uint8_t> file_data(file_size);
+    fin.read(&file_data[0], file_size);
+    fin.close();
+
+    // Collect edges
+    struct Edge {
+      size_t from, to;
+      double benefit;
+    };
+    std::vector<Edge> edges;
+    for (size_t i = 0; i < num_segments; ++i) {
+      if (best_j[i] != std::numeric_limits<size_t>::max()) {
+        edges.push_back({i, best_j[i], -costs[i]});
+      }
+    }
+    // Sort edges by benefit descending
+    std::sort(edges.begin(), edges.end(), [](const Edge& a, const Edge& b) {
+      return a.benefit > b.benefit;
+    });
+
+    // Initialize chains
+    std::vector<std::vector<size_t>> chains(num_segments);
+    std::vector<size_t> chain_of(num_segments);
+    for (size_t i = 0; i < num_segments; ++i) {
+      chains[i] = {i};
+      chain_of[i] = i;
+    }
+
+    // Greedy linking
+    for (const auto& edge : edges) {
+      size_t from_chain = chain_of[edge.from];
+      size_t to_chain = chain_of[edge.to];
+      if (from_chain != to_chain && chains[from_chain].back() == edge.from && chains[to_chain].front() == edge.to) {
+        // Merge: append to_chain to from_chain
+        chains[from_chain].insert(chains[from_chain].end(), chains[to_chain].begin(), chains[to_chain].end());
+        for (size_t seg : chains[to_chain]) {
+          chain_of[seg] = from_chain;
+        }
+        chains[to_chain].clear();
+      }
+    }
+
+    // Collect valid chains and orphans
+    std::vector<std::vector<size_t>> valid_chains;
+    std::vector<size_t> orphans;
+    for (size_t i = 0; i < num_segments; ++i) {
+      if (!chains[i].empty()) {
+        if (chains[i].size() > 1) {
+          valid_chains.push_back(chains[i]);
+        } else {
+          orphans.push_back(chains[i][0]);
+        }
+      }
+    }
+
+    // Compute densities for chains
+    struct ChainInfo {
+      std::vector<size_t> segments;
+      double density;
+    };
+    std::vector<ChainInfo> chain_infos;
+    for (const auto& chain : valid_chains) {
+      double total_benefit = 0.0;
+      size_t total_bytes = 0;
+      for (size_t seg : chain) {
+        total_bytes += segments[seg].second;
+        // Benefit from edges: for each transition in chain
+        if (seg < chain.size() - 1) {
+          size_t next = chain[seg + 1];
+          // Find the edge benefit
+          for (const auto& e : edges) {
+            if (e.from == seg && e.to == next) {
+              total_benefit += e.benefit;
+              break;
+            }
+          }
+        }
+      }
+      double density = total_benefit / total_bytes;
+      chain_infos.push_back({chain, density});
+    }
+    // Sort chains by density descending
+    std::sort(chain_infos.begin(), chain_infos.end(), [](const ChainInfo& a, const ChainInfo& b) {
+      return a.density > b.density;
+    });
+
+    // For orphans, sort by id (simple clustering)
+    std::sort(orphans.begin(), orphans.end());
+
+    // Build reordered segment list
+    std::vector<size_t> reordered_segments;
+    for (const auto& ci : chain_infos) {
+      reordered_segments.insert(reordered_segments.end(), ci.segments.begin(), ci.segments.end());
+    }
+    reordered_segments.insert(reordered_segments.end(), orphans.begin(), orphans.end());
+
+    // Generate reordered file
+    std::string reordered_file = original_file + ".reordered";
+    std::ofstream rofs(reordered_file, std::ios::binary);
+    if (!rofs) {
+      std::cerr << "Error opening reordered file: " << reordered_file << std::endl;
+      return 1;
+    }
+    for (size_t seg : reordered_segments) {
+      size_t start = segments[seg].first;
+      size_t len = segments[seg].second;
+      rofs.write(reinterpret_cast<const char*>(&file_data[start]), len);
+    }
+    rofs.close();
+    std::cout << "Wrote reordered file to " << reordered_file << std::endl;
+
+    // Generate segment table (lengths in reordered order)
+    std::string segment_table_file = reordered_file + ".segments";
+    std::ofstream stofs(segment_table_file);
+    if (!stofs) {
+      std::cerr << "Error opening segment table file: " << segment_table_file << std::endl;
+      return 1;
+    }
+    for (size_t seg : reordered_segments) {
+      stofs << segments[seg].second << std::endl;
+    }
+    stofs.close();
+    std::cout << "Wrote segment table to " << segment_table_file << std::endl;
+
+    // Generate RLE-move index (segment ids in reordered order, RLE-encoded)
+    std::string index_file = reordered_file + ".index";
+    std::ofstream iofs(index_file);
+    if (!iofs) {
+      std::cerr << "Error opening index file: " << index_file << std::endl;
+      return 1;
+    }
+    if (!reordered_segments.empty()) {
+      size_t current = reordered_segments[0];
+      size_t count = 1;
+      for (size_t i = 1; i < reordered_segments.size(); ++i) {
+        if (reordered_segments[i] == current) {
+          count++;
+        } else {
+          iofs << current << "," << count << std::endl;
+          current = reordered_segments[i];
+          count = 1;
+        }
+      }
+      iofs << current << "," << count << std::endl;
+    }
+    iofs.close();
+    std::cout << "Wrote RLE index to " << index_file << std::endl;
+
+    break;
+  }
   }
   }
   return 0;
