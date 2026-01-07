@@ -1079,15 +1079,28 @@ int main(int argc, char* argv[]) {
         pred_to_succ[pred].push_back(succ);
       }
     }
+    // TEMP: limit to 4 pred for testing
+    // std::map<size_t, std::vector<size_t>> limited_pred_to_succ;
+    // size_t count = 0;
+    // for (const auto& p : pred_to_succ) {
+    //   if (count >= 4) break;
+    //   limited_pred_to_succ.insert(p);
+    //   ++count;
+    // }
+    auto& limited_pred_to_succ = pred_to_succ;
     std::cout << "pred_to_succ size: " << pred_to_succ.size() << std::endl << std::flush;
 
     // For each pred, compress pred once, take snapshot, then evaluate all succ that have pred as candidate
     std::vector<std::vector<std::pair<size_t, double>>> costs(num_segments);  // for each succ, list of (pred, cost)
-    std::cout << "Number of pred to process: " << pred_to_succ.size() << std::endl << std::flush;
+    std::cout << "Number of pred to process: " << limited_pred_to_succ.size() << std::endl << std::flush;
+    std::vector<std::pair<size_t, std::vector<size_t>>> pred_list(limited_pred_to_succ.begin(), limited_pred_to_succ.end());
     try {
-    for (const auto& pair : pred_to_succ) {
+    // #pragma omp parallel for  // Disabled for now due to exception handling issues in OpenMP
+    for (int i = 0; i < static_cast<int>(pred_list.size()); ++i) {
+      const auto& pair = pred_list[i];
       size_t pred = pair.first;
       const std::vector<size_t>& succ_list = pair.second;
+      // #pragma omp critical(progress)
       std::cout << "Processing pred = " << pred << std::endl << std::flush;
       size_t start_pred = valid_segments[pred].first;
       size_t len_pred = valid_segments[pred].second;
