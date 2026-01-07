@@ -31,6 +31,8 @@
 #include <sstream>
 #include <thread>
 
+#include <omp.h>
+
 #include "Archive.hpp"
 #include "CM.hpp"
 #include "CM-inl.hpp"
@@ -44,7 +46,77 @@
 #include "TurboCM.hpp"
 #include "X86Binary.hpp"
 
+class MemoryReadStream : public Stream {
+  const std::vector<uint8_t>& data;
+  size_t pos;
+public:
+  MemoryReadStream(const std::vector<uint8_t>& d) : data(d), pos(0) {}
+  int get() override {
+    if (pos >= data.size()) return EOF;
+    return data[pos++];
+  }
+  void put(int) override {} // no-op
+  size_t read(uint8_t* buf, size_t n) override {
+    size_t to_read = std::min(n, data.size() - pos);
+    if (to_read > 0) {
+      memcpy(buf, &data[pos], to_read);
+      pos += to_read;
+    }
+    return to_read;
+  }
+  void write(const uint8_t*, size_t) override {} // no-op
+  void seek(uint64_t p) override { pos = p; }
+  uint64_t tell() const override { return pos; }
+};
+
 static constexpr bool kReleaseBuild = false;
+
+struct MarkovMatrix {
+  float transitions[8][8];
+};
+
+// Byte class mapping: 0-Null/Control, 1-Whitespace, 2-Digits, 3-Lowercase, 4-Uppercase, 5-Punctuation, 6-High-Bit, 7-Other
+uint8_t get_byte_class(uint8_t byte) {
+  if (byte <= 0x1F || byte == 0x7F) return 0; // Null/Control
+  if (byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r') return 1; // Whitespace
+  if (byte >= '0' && byte <= '9') return 2; // Digits
+  if (byte >= 'a' && byte <= 'z') return 3; // Lowercase
+  if (byte >= 'A' && byte <= 'Z') return 4; // Uppercase
+  if ((byte >= 0x21 && byte <= 0x2F) || (byte >= 0x3A && byte <= 0x40) || (byte >= 0x5B && byte <= 0x60) || (byte >= 0x7B && byte <= 0x7E)) return 5; // Punctuation/Symbols
+  if (byte >= 0x80) return 6; // High-Bit
+  return 7; // Other
+}
+
+MarkovMatrix compute_matrix(const std::vector<uint8_t>& segment) {
+  MarkovMatrix m = {};
+  if (segment.empty()) return m;
+  uint8_t prev_class = get_byte_class(segment[0]);
+  for (size_t i = 1; i < segment.size(); ++i) {
+    uint8_t curr_class = get_byte_class(segment[i]);
+    m.transitions[prev_class][curr_class] += 1.0f;
+    prev_class = curr_class;
+  }
+  // Normalize
+  for (int i = 0; i < 8; ++i) {
+    float sum = 0.0f;
+    for (int j = 0; j < 8; ++j) sum += m.transitions[i][j];
+    if (sum > 0.0f) {
+      for (int j = 0; j < 8; ++j) m.transitions[i][j] /= sum;
+    }
+  }
+  return m;
+}
+
+float hellinger_distance(const MarkovMatrix& m1, const MarkovMatrix& m2) {
+  float dist = 0.0f;
+  for (int i = 0; i < 8; ++i) {
+    for (int j = 0; j < 8; ++j) {
+      float diff = sqrtf(m1.transitions[i][j]) - sqrtf(m2.transitions[i][j]);
+      dist += diff * diff;
+    }
+  }
+  return sqrtf(dist);
+}
 
 static void printHeader() {
   std::cout
@@ -84,6 +156,10 @@ public:
     kModeObserver,
     // Segment mode for entropy-based segmentation
     kModeSegment,
+    // Fingerprint mode for structural fingerprinting
+    kModeFingerprint,
+    // Oracle mode for testing candidate pairs compression
+    kModeOracle,
   };
   Mode mode = kModeUnknown;
   bool opt_mode = false;
@@ -100,8 +176,8 @@ public:
   size_t segment_window = 512;
   float segment_threshold = 3.0f;
   size_t segment_min_segment = 2048;
-  size_t segment_lookback = 1024;
-
+  size_t segment_lookback = 1024;  // Fingerprinting parameters
+  size_t fingerprint_top_k = 32;
   int usage(const std::string& name) {
     printHeader();
     std::cout
@@ -115,6 +191,7 @@ public:
       << "-test tests the file after compression is done" << std::endl
       << "-observer generates entropy profile instead of compressing" << std::endl
       << "-segment performs entropy-based segmentation on .entropy file" << std::endl
+      << "-fingerprint performs structural fingerprinting on .segments file" << std::endl
       << "-window <size> smoothing window size (default 64)" << std::endl
       << "-threshold <float> gradient threshold for boundaries (default 0.01)" << std::endl
       << "-min-segment <size> minimum segment size (default 1024)" << std::endl
@@ -142,6 +219,8 @@ public:
       else if (arg == "-stest") parsed_mode = kModeSingleTest;
       else if (arg == "-observer") parsed_mode = kModeObserver;
       else if (arg == "-segment") parsed_mode = kModeSegment;
+      else if (arg == "-fingerprint") parsed_mode = kModeFingerprint;
+      else if (arg == "-oracle") parsed_mode = kModeOracle;
       else if (arg == "c") parsed_mode = kModeCompress;
       else if (arg == "l") parsed_mode = kModeList;
       else if (arg == "d") parsed_mode = kModeDecompress;
@@ -811,6 +890,232 @@ int main(int argc, char* argv[]) {
     }
     ofs.close();
     std::cout << "Wrote " << formatNumber(num_segments) << " segments to " << out_file << std::endl;
+    break;
+  }
+  case Options::kModeFingerprint: {
+    printHeader();
+    std::cout << "Running Fingerprinting Mode" << std::endl;
+    // Read .segments file
+    if (argc != 3) {
+      std::cerr << "Usage: mcm -fingerprint <segments_file>" << std::endl;
+      return 1;
+    }
+    std::string in_file = argv[2];
+    std::cout << "in_file: " << in_file << std::endl;
+    std::ifstream ifs(in_file);
+    if (!ifs) {
+      std::cerr << "Error opening segments file: " << in_file << std::endl;
+      return 1;
+    }
+    size_t num_segments;
+    ifs >> num_segments;
+    std::vector<std::pair<size_t, size_t>> segments(num_segments);
+    for (size_t i = 0; i < num_segments; ++i) {
+      ifs >> segments[i].first >> segments[i].second;
+    }
+    ifs.close();
+
+    // Determine original file
+    std::string original_file;
+    size_t entropy_pos = in_file.find(".entropy");
+    if (entropy_pos != std::string::npos) {
+      original_file = in_file.substr(0, entropy_pos);
+    } else {
+      original_file = in_file.substr(0, in_file.find_last_of('.'));
+    }
+
+    // Load original file
+    File fin;
+    if (fin.open(original_file, std::ios_base::in | std::ios_base::binary)) {
+      std::cerr << "Error opening original file: " << original_file << std::endl;
+      return 1;
+    }
+    std::vector<uint8_t> file_data(fin.length());
+    fin.read(&file_data[0], fin.length());
+    fin.close();
+
+    // Compute matrices
+    std::vector<std::pair<size_t, size_t>> valid_segments;
+    for (auto& seg : segments) {
+      size_t start = seg.first;
+      size_t len = seg.second;
+      if (start >= file_data.size() || len == 0) continue;
+      if (start + len > file_data.size()) {
+        len = file_data.size() - start;
+      }
+      valid_segments.push_back({start, len});
+    }
+    size_t num_valid = valid_segments.size();
+    std::vector<MarkovMatrix> matrices(num_valid);
+    for (size_t i = 0; i < num_valid; ++i) {
+      size_t start = valid_segments[i].first;
+      size_t len = valid_segments[i].second;
+      std::vector<uint8_t> segment_data(file_data.begin() + start, file_data.begin() + start + len);
+      matrices[i] = compute_matrix(segment_data);
+    }
+
+    // Compute distances and find top-k
+    size_t top_k = options.fingerprint_top_k;
+    std::vector<std::vector<size_t>> candidates(num_valid);
+    for (size_t i = 0; i < num_valid; ++i) {
+      std::vector<std::pair<float, size_t>> distances;
+      for (size_t j = 0; j < num_valid; ++j) {
+        if (i == j) continue;
+        float dist = hellinger_distance(matrices[i], matrices[j]);
+        distances.emplace_back(dist, j);
+      }
+      std::sort(distances.begin(), distances.end());
+      for (size_t k = 0; k < std::min(top_k, distances.size()); ++k) {
+        candidates[i].push_back(distances[k].second);
+      }
+    }
+
+    // Output .candidates file
+    std::string out_file = in_file + ".candidates";
+    std::ofstream ofs(out_file);
+    if (!ofs) {
+      std::cerr << "Error opening output file: " << out_file << std::endl;
+      return 1;
+    }
+    for (size_t i = 0; i < num_valid; ++i) {
+      ofs << i << ":";
+      for (size_t j = 0; j < candidates[i].size(); ++j) {
+        if (j > 0) ofs << ",";
+        ofs << candidates[i][j];
+      }
+      ofs << std::endl;
+    }
+    ofs.close();
+    std::cout << "Wrote candidate lists for " << num_valid << " segments to " << out_file << std::endl;
+    break;
+  }
+  case Options::kModeOracle: {
+    printHeader();
+    std::cout << "Running Oracle Mode" << std::endl;
+    if (argc != 3) {
+      std::cerr << "Usage: mcm -oracle <candidates_file>" << std::endl;
+      return 1;
+    }
+    std::string in_file = argv[2];
+    std::cout << "in_file: " << in_file << std::endl;
+    std::ifstream ifs(in_file);
+    if (!ifs) {
+      std::cerr << "Error opening candidates file: " << in_file << std::endl;
+      return 1;
+    }
+    std::vector<std::vector<size_t>> candidates;
+    std::string line;
+    while (std::getline(ifs, line)) {
+      std::istringstream iss(line);
+      std::string token;
+      std::getline(iss, token, ':');
+      size_t i = std::stoul(token);
+      if (i >= candidates.size()) candidates.resize(i + 1);
+      std::vector<size_t>& cands = candidates[i];
+      while (std::getline(iss, token, ',')) {
+        if (!token.empty()) cands.push_back(std::stoul(token));
+      }
+    }
+    ifs.close();
+    size_t num_segments = candidates.size();
+    std::cout << "Read " << num_segments << " segments from candidates" << std::endl;
+
+    // Determine segments file
+    std::string segments_file = in_file.substr(0, in_file.find_last_of('.')); // remove .candidates
+    std::cout << "segments_file: " << segments_file << std::endl;
+    std::ifstream seg_ifs(segments_file);
+    if (!seg_ifs) {
+      std::cerr << "Error opening segments file: " << segments_file << std::endl;
+      return 1;
+    }
+    size_t num_seg;
+    seg_ifs >> num_seg;
+    std::vector<std::pair<size_t, size_t>> segments(num_seg);
+    for (size_t i = 0; i < num_seg; ++i) {
+      seg_ifs >> segments[i].first >> segments[i].second;
+    }
+    seg_ifs.close();
+
+    // Load original file
+    std::string original_file = segments_file.substr(0, segments_file.find_last_of('.'));
+    std::cout << "original_file: " << original_file << std::endl;
+    File fin;
+    if (fin.open(original_file, std::ios_base::in | std::ios_base::binary)) {
+      std::cerr << "Error opening original file: " << original_file << std::endl;
+      return 1;
+    }
+    size_t file_size = fin.length();
+    std::vector<uint8_t> file_data(file_size);
+    fin.read(&file_data[0], file_size);
+    fin.close();
+
+    // Filter valid segments as in fingerprint
+    std::vector<std::pair<size_t, size_t>> valid_segments;
+    for (auto& seg : segments) {
+      size_t start = seg.first;
+      size_t len = seg.second;
+      if (start >= file_size || len == 0) continue;
+      if (start + len > file_size) {
+        len = file_size - start;
+      }
+      valid_segments.push_back({start, len});
+    }
+    if (valid_segments.size() != num_segments) {
+      std::cerr << "Mismatch: valid_segments " << valid_segments.size() << " vs candidates " << num_segments << std::endl;
+      return 1;
+    }
+
+    // For each i, for each j in candidates[i], compress j, snapshot, then compress head_i, measure entropy cost
+    std::vector<size_t> best_j(num_segments, SIZE_MAX);
+    std::vector<double> best_cost(num_segments, 1e100);
+    // #pragma omp parallel for
+    for (size_t i = 0; i < num_segments; ++i) {
+      size_t start_i = valid_segments[i].first;
+      size_t len_i = valid_segments[i].second;
+      std::vector<uint8_t> data_i(file_data.begin() + start_i, file_data.begin() + start_i + len_i);
+      size_t head_len = std::min((size_t)10240, data_i.size());
+      std::vector<uint8_t> head_i(data_i.begin(), data_i.begin() + head_len);
+      size_t local_best_j = SIZE_MAX;
+      double local_best_cost = 1e100;
+      for (size_t j : candidates[i]) {
+        cm::CM<6, false> cm(FrequencyCounter<256>(), 6, true, Detector::kProfileText);
+        cm.observer_mode = true;
+        size_t start_j = valid_segments[j].first;
+        size_t len_j = valid_segments[j].second;
+        std::vector<uint8_t> data_j(file_data.begin() + start_j, file_data.begin() + start_j + len_j);
+        std::vector<uint8_t> buffer = data_j;
+        buffer.insert(buffer.end(), head_i.begin(), head_i.end());
+        cm.entropies.clear();
+        MemoryReadStream in(buffer);
+        VoidWriteStream out;
+        cm.compress(&in, &out, buffer.size());
+        double transition_cost = 0.0;
+        size_t start = cm.entropies.size() - head_i.size();
+        for (size_t k = start; k < cm.entropies.size(); ++k) {
+          transition_cost += cm.entropies[k];
+        }
+        if (transition_cost < local_best_cost) {
+          local_best_cost = transition_cost;
+          local_best_j = j;
+        }
+      }
+      best_j[i] = local_best_j;
+      best_cost[i] = local_best_cost;
+      if (i % 100 == 0) std::cout << "Processed " << i << " segments" << std::endl;
+    }
+
+    // Output .oracle file
+    std::string out_file = in_file + ".oracle";
+    std::ofstream ofs(out_file);
+    if (!ofs) {
+      std::cerr << "Error opening output file: " << out_file << std::endl;
+      return 1;
+    }
+    for (size_t i = 0; i < num_segments; ++i) {
+      ofs << i << ":" << best_j[i] << "," << best_cost[i] << std::endl;
+    }
+    ofs.close();
+    std::cout << "Wrote oracle results to " << out_file << std::endl;
     break;
   }
   }

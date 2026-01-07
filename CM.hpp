@@ -342,6 +342,54 @@ namespace cm {
     static const uint32_t huffman_len_limit = 16;
     Huffman huff;
 
+    // State Snapshot for rollback
+    struct StateSnapshot {
+      std::vector<FastAdaptiveProbMap<256>> probs_snapshot;
+      MixerArray<CMMixer> mixers_snapshot[kNumMixers];
+      MixerArray<CMMixer2> mix2_snapshot;
+      ByteStateMap ctx_state_snapshot;
+      MatchModelType match_model_snapshot;
+      uint64_t last_bytes_snapshot;
+      uint64_t interval_model_snapshot;
+      uint64_t interval_model2_snapshot;
+      uint64_t small_interval_model_snapshot;
+    };
+
+    StateSnapshot takeSnapshot() const {
+      StateSnapshot snap;
+      snap.probs_snapshot.reserve(kProbCtx);
+      for (int i = 0; i < kProbCtx; ++i) {
+        snap.probs_snapshot.push_back(probs_[i]);
+      }
+      for (int i = 0; i < kNumMixers; ++i) {
+        snap.mixers_snapshot[i] = mixers_[i];
+      }
+      snap.mix2_snapshot = mix2_;
+      snap.ctx_state_snapshot = ctx_state_;
+      snap.match_model_snapshot = match_model_;
+      snap.last_bytes_snapshot = last_bytes_;
+      snap.interval_model_snapshot = interval_model_;
+      snap.interval_model2_snapshot = interval_model2_;
+      snap.small_interval_model_snapshot = small_interval_model_;
+      return snap;
+    }
+
+    void restoreSnapshot(const StateSnapshot& snap) {
+      for (int i = 0; i < kProbCtx; ++i) {
+        probs_[i] = snap.probs_snapshot[i];
+      }
+      for (int i = 0; i < kNumMixers; ++i) {
+        mixers_[i] = snap.mixers_snapshot[i];
+      }
+      mix2_ = snap.mix2_snapshot;
+      ctx_state_ = snap.ctx_state_snapshot;
+      match_model_ = snap.match_model_snapshot;
+      last_bytes_ = snap.last_bytes_snapshot;
+      interval_model_ = snap.interval_model_snapshot;
+      interval_model2_ = snap.interval_model2_snapshot;
+      small_interval_model_ = snap.small_interval_model_snapshot;
+    }
+
     // If force profile is true then we dont use a detector.
     bool force_profile_;
 
