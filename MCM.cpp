@@ -26,6 +26,8 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
+#include <queue>
 #include <stdio.h>
 #include <string.h>
 #include <string>
@@ -1150,6 +1152,52 @@ int main(int argc, char* argv[]) {
     size_t num_segments = num_seg;
     std::cout << "Read " << num_segments << " segments from segments file" << std::endl;
 
+    std::string original_file = segments_file.substr(0, segments_file.find_last_of('.')); // remove .segments
+    std::cout << "original_file: " << original_file << std::endl;
+
+    // Read entropy for segment costs
+    std::string entropy_file = original_file + ".entropy";
+    std::vector<double> entropies;
+    std::ifstream eifs(entropy_file, std::ios::binary);
+    if (eifs) {
+      uint64_t num_bytes;
+      eifs.read(reinterpret_cast<char*>(&num_bytes), sizeof(num_bytes));
+      entropies.resize(num_bytes);
+      eifs.read(reinterpret_cast<char*>(&entropies[0]), num_bytes * sizeof(double));
+      eifs.close();
+      std::cout << "Read " << num_bytes << " entropies" << std::endl;
+    } else {
+      std::cout << "Warning: entropy file not found, using length for costs" << std::endl;
+    }
+
+    // Read candidates for orphan clustering
+    std::string candidates_file = segments_file + ".candidates";
+    std::cout << "candidates_file: " << candidates_file << std::endl;
+    std::ifstream cifs(candidates_file);
+    std::vector<std::vector<std::pair<size_t, double>>> candidate_distances(num_segments);
+    if (cifs) {
+      std::string line;
+      while (std::getline(cifs, line)) {
+        std::istringstream iss(line);
+        std::string token;
+        std::getline(iss, token, ':');
+        size_t i = std::stoul(token);
+        if (i >= num_segments) continue;
+        std::vector<std::pair<size_t, double>>& dists = candidate_distances[i];
+        while (std::getline(iss, token, ',')) {
+          if (token.empty()) continue;
+          size_t j = std::stoul(token);
+          std::getline(iss, token, ',');
+          double d = std::stod(token);
+          dists.push_back({j, d});
+        }
+      }
+      cifs.close();
+      std::cout << "Read candidate distances" << std::endl;
+    } else {
+      std::cout << "Warning: candidates file not found, using simple orphan sort" << std::endl;
+    }
+
     // Read oracle
     std::vector<size_t> best_j(num_segments, std::numeric_limits<size_t>::max());
     std::vector<double> costs(num_segments, 1e100);
@@ -1174,8 +1222,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Read oracle data" << std::endl;
 
     // Load original file
-    std::string original_file = segments_file.substr(0, segments_file.find_last_of('.')); // remove .segments
-    std::cout << "original_file: " << original_file << std::endl;
     File fin;
     if (fin.open(original_file, std::ios_base::in | std::ios_base::binary)) {
       std::cerr << "Error opening original file: " << original_file << std::endl;
@@ -1268,15 +1314,87 @@ int main(int argc, char* argv[]) {
       return a.density > b.density;
     });
 
-    // For orphans, sort by id (simple clustering)
-    std::sort(orphans.begin(), orphans.end());
+    // Cluster orphans
+    std::vector<std::vector<size_t>> orphan_clusters;
+    if (!candidate_distances.empty() && !candidate_distances[0].empty()) {
+      // Build graph for orphans
+      std::vector<std::vector<size_t>> graph(orphans.size());
+      std::map<size_t, size_t> orphan_index;
+      for (size_t idx = 0; idx < orphans.size(); ++idx) {
+        orphan_index[orphans[idx]] = idx;
+      }
+      const double threshold = 0.5; // Hellinger distance threshold
+      for (size_t i = 0; i < orphans.size(); ++i) {
+        size_t seg_i = orphans[i];
+        for (const auto& p : candidate_distances[seg_i]) {
+          size_t j = p.first;
+          double d = p.second;
+          if (d < threshold && orphan_index.count(j)) {
+            size_t idx_j = orphan_index[j];
+            if (std::find(graph[i].begin(), graph[i].end(), idx_j) == graph[i].end()) {
+              graph[i].push_back(idx_j);
+              graph[idx_j].push_back(i); // undirected
+            }
+          }
+        }
+      }
+      // Find connected components using BFS
+      std::vector<bool> visited(orphans.size(), false);
+      for (size_t i = 0; i < orphans.size(); ++i) {
+        if (!visited[i]) {
+          std::vector<size_t> cluster;
+          std::queue<size_t> q;
+          q.push(i);
+          visited[i] = true;
+          while (!q.empty()) {
+            size_t idx = q.front(); q.pop();
+            cluster.push_back(orphans[idx]);
+            for (size_t nei : graph[idx]) {
+              if (!visited[nei]) {
+                visited[nei] = true;
+                q.push(nei);
+              }
+            }
+          }
+          orphan_clusters.push_back(cluster);
+        }
+      }
+    } else {
+      orphan_clusters = {orphans};
+    }
+
+    // Sort within each cluster by entropy cost ascending
+    auto get_cost = [&](size_t seg) -> double {
+      if (!entropies.empty()) {
+        double cost = 0.0;
+        size_t start = segments[seg].first;
+        size_t len = segments[seg].second;
+        for (size_t k = 0; k < len; ++k) {
+          cost += entropies[start + k];
+        }
+        return cost;
+      } else {
+        return segments[seg].second; // length as proxy
+      }
+    };
+    for (auto& cluster : orphan_clusters) {
+      std::sort(cluster.begin(), cluster.end(), [&](size_t a, size_t b) {
+        return get_cost(a) < get_cost(b);
+      });
+    }
+
+    // Flatten orphan clusters
+    std::vector<size_t> sorted_orphans;
+    for (const auto& cluster : orphan_clusters) {
+      sorted_orphans.insert(sorted_orphans.end(), cluster.begin(), cluster.end());
+    }
 
     // Build reordered segment list
     std::vector<size_t> reordered_segments;
     for (const auto& ci : chain_infos) {
       reordered_segments.insert(reordered_segments.end(), ci.segments.begin(), ci.segments.end());
     }
-    reordered_segments.insert(reordered_segments.end(), orphans.begin(), orphans.end());
+    reordered_segments.insert(reordered_segments.end(), sorted_orphans.begin(), sorted_orphans.end());
 
     // Generate reordered file
     std::string reordered_file = original_file + ".reordered";
