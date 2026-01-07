@@ -161,7 +161,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
   const size_t mixer_shift_bits = (kMixerBits - 15);
   mixers_[0].Init(0x100 << extra_mixer_bits, mixer_bits, 25);
 
-  std::cout << std::endl;
+  if (!observer_mode) std::cout << std::endl;
   for (auto& m : mixers_) {
     // std::cout << "Mixers " << m.Size() << " RAM=" << m.Size() * sizeof(CMMixer) << " bytes" << std::endl;
   }
@@ -369,8 +369,8 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
     detector.init();
   }
   init();
-  std::cout << "Starting compress with max_count = " << max_count << std::endl;
-  std::cout << "observer_mode = " << observer_mode << std::endl;
+  if (!observer_mode) std::cout << "Starting compress with max_count = " << max_count << std::endl;
+  if (!observer_mode) std::cout << "observer_mode = " << observer_mode << std::endl;
   ent = Range7();
   byte_index = 0;
   if (use_huffman) {
@@ -409,15 +409,15 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
     update(c);
   }
   ent.flush(sout);
-  std::cout << "Final max_count = " << max_count << std::endl;
-  std::cout << "processed " << processed << " bytes" << std::endl;
+  if (!observer_mode) std::cout << "Final max_count = " << max_count << std::endl;
+  if (!observer_mode) std::cout << "processed " << processed << " bytes" << std::endl;
 
   {
     uint64_t total = 0, less64 = 0;
     for (size_t i = 0; i < 64; ++i) less64 += ctx_count_[i];
     for (size_t i = 0; i < 256; ++i) total += ctx_count_[i];
     if (total > 0) {
-      std::cout << std::endl << less64 << "/" << total << " = " << double(less64) / double(total) << std::endl;
+      if (!observer_mode) std::cout << std::endl << less64 << "/" << total << " = " << double(less64) / double(total) << std::endl;
     }
   }
 

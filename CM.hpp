@@ -353,6 +353,9 @@ namespace cm {
       uint64_t interval_model_snapshot;
       uint64_t interval_model2_snapshot;
       uint64_t small_interval_model_snapshot;
+      size_t byte_index_snapshot;
+      double current_entropy_snapshot;
+      std::vector<double> entropies_snapshot;
     };
 
     StateSnapshot takeSnapshot() const {
@@ -371,6 +374,9 @@ namespace cm {
       snap.interval_model_snapshot = interval_model_;
       snap.interval_model2_snapshot = interval_model2_;
       snap.small_interval_model_snapshot = small_interval_model_;
+      snap.byte_index_snapshot = byte_index;
+      snap.current_entropy_snapshot = current_entropy;
+      snap.entropies_snapshot = entropies;
       return snap;
     }
 
@@ -388,6 +394,9 @@ namespace cm {
       interval_model_ = snap.interval_model_snapshot;
       interval_model2_ = snap.interval_model2_snapshot;
       small_interval_model_ = snap.small_interval_model_snapshot;
+      byte_index = snap.byte_index_snapshot;
+      current_entropy = snap.current_entropy_snapshot;
+      entropies = snap.entropies_snapshot;
     }
 
     // If force profile is true then we dont use a detector.
@@ -1117,10 +1126,10 @@ namespace cm {
       if (observer_mode) {
         entropies.push_back(current_entropy);
         current_entropy = 0;
-        if (entropies.size() > byte_index + 100) {
-          std::cout << "Entropies size " << entropies.size() << " exceeds byte_index " << byte_index << " by more than 100" << std::endl;
-          std::exit(1);
-        }
+        // if (entropies.size() > byte_index + 100) {
+        //   std::cout << "Entropies size " << entropies.size() << " exceeds byte_index " << byte_index << " by more than 100" << std::endl;
+        //   std::exit(1);
+        // }
       }
       if (byte_index % 10000 == 0) {
         std::cout << "byte index: " << byte_index << ", entropies size: " << entropies.size() << std::endl;

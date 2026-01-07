@@ -1072,62 +1072,93 @@ int main(int argc, char* argv[]) {
       return 1;
     }
 
-    // For each i, for each j in candidates[i], compress j, snapshot, then compress head_i, measure entropy cost
-    std::vector<size_t> best_j(num_segments, std::numeric_limits<size_t>::max());
-    std::vector<double> best_cost(num_segments, 1e100);
-    // #pragma omp parallel for
-    for (size_t i = 0; i < num_segments; ++i) {
-      size_t start_i = valid_segments[i].first;
-      size_t len_i = valid_segments[i].second;
-      std::vector<uint8_t> data_i(file_data.begin() + start_i, file_data.begin() + start_i + len_i);
-      size_t head_len = std::min((size_t)10240, data_i.size());
-      std::vector<uint8_t> head_i(data_i.begin(), data_i.begin() + head_len);
-      size_t local_best_j = std::numeric_limits<size_t>::max();
-      double local_best_cost = 1e100;
-      for (size_t j : candidates[i]) {
+    // Build reverse map: pred -> list of succ that have pred as candidate
+    std::map<size_t, std::vector<size_t>> pred_to_succ;
+    for (size_t succ = 0; succ < num_segments; ++succ) {
+      for (size_t pred : candidates[succ]) {
+        pred_to_succ[pred].push_back(succ);
+      }
+    }
+    std::cout << "pred_to_succ size: " << pred_to_succ.size() << std::endl << std::flush;
+
+    // For each pred, compress pred once, take snapshot, then evaluate all succ that have pred as candidate
+    std::vector<std::vector<std::pair<size_t, double>>> costs(num_segments);  // for each succ, list of (pred, cost)
+    std::cout << "Number of pred to process: " << pred_to_succ.size() << std::endl << std::flush;
+    try {
+    for (const auto& pair : pred_to_succ) {
+      size_t pred = pair.first;
+      const std::vector<size_t>& succ_list = pair.second;
+      std::cout << "Processing pred = " << pred << std::endl << std::flush;
+      size_t start_pred = valid_segments[pred].first;
+      size_t len_pred = valid_segments[pred].second;
+      std::vector<uint8_t> data_pred(file_data.begin() + start_pred, file_data.begin() + start_pred + len_pred);
+
+      // For each succ that has pred as candidate
+      for (size_t succ : succ_list) {
         cm::CM<6, false> cm(FrequencyCounter<256>(), 6, true, Detector::kProfileText);
         cm.observer_mode = true;
-        size_t start_j = valid_segments[j].first;
-        size_t len_j = valid_segments[j].second;
-        std::vector<uint8_t> data_j(file_data.begin() + start_j, file_data.begin() + start_j + len_j);
-        std::vector<uint8_t> buffer = data_j;
-        buffer.insert(buffer.end(), head_i.begin(), head_i.end());
-        cm.entropies.clear();
-        MemoryReadStream in(buffer);
-        VoidWriteStream out;
-        cm.compress(&in, &out, buffer.size());
+        // Compress full pred
+        MemoryReadStream in_pred(data_pred);
+        VoidWriteStream out_pred;
+        cm.compress(&in_pred, &out_pred, data_pred.size());
+        // Record entropy start
+        size_t entropy_start = cm.entropies.size();
+        // Compress head of succ
+        size_t start_succ = valid_segments[succ].first;
+        size_t len_succ = valid_segments[succ].second;
+        std::vector<uint8_t> data_succ(file_data.begin() + start_succ, file_data.begin() + start_succ + len_succ);
+        size_t head_len = std::min((size_t)10240, data_succ.size());
+        std::vector<uint8_t> head_succ(data_succ.begin(), data_succ.begin() + head_len);
+        MemoryReadStream in_head(head_succ);
+        VoidWriteStream out_head;
+        cm.compress(&in_head, &out_head, head_succ.size());
+        // Measure cost
         double transition_cost = 0.0;
-        size_t start = cm.entropies.size() - head_i.size();
-        for (size_t k = start; k < cm.entropies.size(); ++k) {
+        for (size_t k = entropy_start; k < cm.entropies.size(); ++k) {
           transition_cost += cm.entropies[k];
         }
-        if (transition_cost < local_best_cost) {
-          local_best_cost = transition_cost;
-          local_best_j = j;
+        costs[succ].push_back({pred, transition_cost});
+      }
+    }
+    } catch (const std::exception& e) {
+      std::cerr << "Exception in pred loop: " << e.what() << std::endl;
+      throw;
+    }
+    std::cout << "Finished processing all pred" << std::endl << std::flush;
+
+    // For each succ, find best pred
+    std::vector<size_t> best_pred(num_segments, std::numeric_limits<size_t>::max());
+    std::vector<double> best_cost(num_segments, 1e100);
+    for (size_t succ = 0; succ < num_segments; ++succ) {
+      for (const auto& p : costs[succ]) {
+        size_t pred = p.first;
+        double cost = p.second;
+        if (cost < best_cost[succ]) {
+          best_cost[succ] = cost;
+          best_pred[succ] = pred;
         }
       }
-      best_j[i] = local_best_j;
-      best_cost[i] = local_best_cost;
-      if (i % 100 == 0) std::cout << "Processed " << i << " segments" << std::endl;
     }
 
     // Output .oracle file
+    std::cout << "Starting to write oracle file" << std::endl << std::flush;
     std::string out_file = in_file + ".oracle";
     std::ofstream ofs(out_file);
     if (!ofs) {
       std::cerr << "Error opening output file: " << out_file << std::endl;
       return 1;
     }
-    for (size_t i = 0; i < num_segments; ++i) {
-      ofs << i << ":" << best_j[i] << "," << best_cost[i] << std::endl;
+    for (size_t succ = 0; succ < num_segments; ++succ) {
+      ofs << succ << ":" << best_pred[succ] << "," << best_cost[succ] << std::endl;
     }
     ofs.close();
-    std::cout << "Wrote oracle results to " << out_file << std::endl;
+    std::cout << "Wrote oracle results to " << out_file << std::endl << std::flush;
     break;
   }
   case Options::kModePathCover: {
     printHeader();
     std::cout << "Running PathCover Mode" << std::endl;
+    auto start_time = std::chrono::high_resolution_clock::now();
     if (argc != 3) {
       std::cerr << "Usage: mcm -pathcover <oracle_file>" << std::endl;
       return 1;
@@ -1449,6 +1480,10 @@ int main(int argc, char* argv[]) {
     }
     iofs.close();
     std::cout << "Wrote RLE index to " << index_file << std::endl;
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    std::cout << "Phase 5 completed in " << elapsed.count() << " seconds" << std::endl;
 
     break;
   }
