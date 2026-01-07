@@ -1240,7 +1240,9 @@ int main(int argc, char* argv[]) {
     std::vector<Edge> edges;
     for (size_t i = 0; i < num_segments; ++i) {
       if (best_j[i] != std::numeric_limits<size_t>::max()) {
-        edges.push_back({i, best_j[i], -costs[i]});
+        size_t len_j = segments[best_j[i]].second;
+        double benefit = -costs[i] / len_j;  // Normalize by target segment length to prefer longer segments
+        edges.push_back({i, best_j[i], benefit});
       }
     }
     // Sort edges by benefit descending
