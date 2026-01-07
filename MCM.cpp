@@ -1094,7 +1094,6 @@ int main(int argc, char* argv[]) {
     std::vector<std::vector<std::pair<size_t, double>>> costs(num_segments);  // for each succ, list of (pred, cost)
     std::cout << "Number of pred to process: " << limited_pred_to_succ.size() << std::endl << std::flush;
     std::vector<std::pair<size_t, std::vector<size_t>>> pred_list(limited_pred_to_succ.begin(), limited_pred_to_succ.end());
-    try {
     // #pragma omp parallel for  // Disabled for now due to exception handling issues in OpenMP
     for (int i = 0; i < static_cast<int>(pred_list.size()); ++i) {
       const auto& pair = pred_list[i];
@@ -1132,10 +1131,6 @@ int main(int argc, char* argv[]) {
         }
         costs[succ].push_back({pred, transition_cost});
       }
-    }
-    } catch (const std::exception& e) {
-      std::cerr << "Exception in pred loop: " << e.what() << std::endl;
-      throw;
     }
     std::cout << "Finished processing all pred" << std::endl << std::flush;
 
