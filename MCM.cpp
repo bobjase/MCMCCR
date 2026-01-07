@@ -1377,21 +1377,12 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "pred_to_succ size: " << pred_to_succ.size() << std::endl << std::flush;
 
-    // TEMP: limit to 127 pred for testing
-    std::map<size_t, std::vector<size_t>> limited_pred_to_succ;
-    size_t count = 0;
-    for (const auto& p : pred_to_succ) {
-      if (count >= 127) break;
-      limited_pred_to_succ.insert(p);
-      ++count;
-    }
-
     // For each pred, compress pred once, take snapshot, then evaluate all succ that have pred as candidate
     std::vector<std::vector<std::pair<size_t, double>>> pred_costs(num_segments);  // for each pred, list of (succ, cost)
-    std::cout << "Number of pred to process: " << limited_pred_to_succ.size() << std::endl << std::flush;
+    std::cout << "Number of pred to process: " << pred_to_succ.size() << std::endl << std::flush;
 
     // Use multi-process approach
-    int ret = run_oracle_multiprocess(argv[0], file_data, valid_segments, limited_pred_to_succ, pred_costs);
+    int ret = run_oracle_multiprocess(argv[0], file_data, valid_segments, pred_to_succ, pred_costs);
     if (ret != 0) {
       std::cerr << "Multi-process oracle failed" << std::endl;
       return ret;
