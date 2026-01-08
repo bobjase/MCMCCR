@@ -388,8 +388,8 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
     detector.init();
   }
   init();
-  if (!observer_mode) std::cout << "Starting compress with max_count = " << max_count << std::endl;
-  if (!observer_mode) std::cout << "observer_mode = " << observer_mode << std::endl;
+  //if (!observer_mode) std::cout << "Starting compress with max_count = " << max_count << std::endl;
+  //if (!observer_mode) std::cout << "observer_mode = " << observer_mode << std::endl;
   ent = Range7();
   byte_index = 0;
   if (use_huffman) {
@@ -414,13 +414,13 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
         SetDataProfile(data_profile);
       }
     } else {
-      processed++;
-      if (processed % 100000 == 0) std::cout << "Processed " << processed << " bytes, remaining max_count = " << max_count << std::endl;
+      //processed++;
+      //if (processed % 100000 == 0) std::cout << "Processed " << processed << " bytes, remaining max_count = " << max_count << std::endl;
       c = sin.get();
       if (c == EOF) {
-        std::cout << "EOF at processed = " << processed << std::endl;
-        break;
-      }
+      //   std::cout << "EOF at processed = " << processed << std::endl;
+         break;
+       }
     }
     c = reorder_[c];
     dcheck(c != EOF);
@@ -428,8 +428,8 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
     update(c);
   }
   ent.flush(sout);
-  if (!observer_mode) std::cout << "Final max_count = " << max_count << std::endl;
-  if (!observer_mode) std::cout << "processed " << processed << " bytes" << std::endl;
+  //if (!observer_mode) std::cout << "Final max_count = " << max_count << std::endl;
+  //if (!observer_mode) std::cout << "processed " << processed << " bytes" << std::endl;
 
   {
     uint64_t total = 0, less64 = 0;

@@ -486,7 +486,7 @@ void testFilter(Stream* stream, Analyzer* analyzer) {
 
 static inline std::string smartExt(const std::string& ext) {
   if (ext == "h" || ext == "hpp" || ext == "inl" || ext == "cpp") return "c";
-  if (ext == "jpg" || ext == "zip" || ext == "7z" || ext == "apk" || ext == "mp3" || ext == "gif" || ext == "png") return "ÿ" + ext;
+  if (ext == "jpg" || ext == "zip" || ext == "7z" || ext == "apk" || ext == "mp3" || ext == "gif" || ext == "png") return "ï¿½" + ext;
   return ext;
 }
 
@@ -560,7 +560,7 @@ public:
     const uint64_t cur_bytes = (stream_ != nullptr ? stream_->tell() : 0u) + add_bytes_;
     const uint32_t rate = uint32_t(double(cur_bytes / KB) / (double(time_delta) / double(CLOCKS_PER_SEC)));
     std::cout << "Analyzed " << add_files_ << " size=" << prettySize(cur_bytes) << " " << rate << "KB/s   ";
-    std::cout << "\t\r" << std::flush;
+    //std::cout << "\t\r" << std::flush;
   }
 
 private:

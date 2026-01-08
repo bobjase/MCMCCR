@@ -978,8 +978,8 @@ namespace cm {
 
     template <const bool decode, typename TStream>
     size_t processByte(TStream& stream, uint32_t c = 0) {
-      process_count++;
-      byte_index++;
+      //process_count++;
+      //byte_index++;
       size_t base_contexts[kInputs] = {};
       auto* ctx_ptr = base_contexts;
 
@@ -1158,9 +1158,9 @@ namespace cm {
         //   std::exit(1);
         // }
       }
-      if (byte_index % 10000 == 0) {
-        std::cout << "byte index: " << byte_index << ", entropies size: " << entropies.size() << std::endl;
-      }
+      // if (byte_index % 10000 == 0) {
+      //   std::cout << "byte index: " << byte_index << ", entropies size: " << entropies.size() << std::endl;
+      // }
 
       return c;
     }
