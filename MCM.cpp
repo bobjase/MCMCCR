@@ -212,8 +212,9 @@ public:
   std::string dict_file;
   // Segmentation parameters
   size_t segment_window = 512;
-  float segment_threshold = 4.50f;
+  float segment_threshold = 16.0f;
   size_t segment_min_segment = 4096;
+  size_t segment_max_segment = 65536;  // 64KB max segment size
   size_t segment_lookback = 1024;  // Fingerprinting parameters
   size_t fingerprint_top_k = 32;
   int usage(const std::string& name) {
@@ -233,6 +234,7 @@ public:
       << "-window <size> smoothing window size (default 64)" << std::endl
       << "-threshold <float> gradient threshold for boundaries (default 0.01)" << std::endl
       << "-min-segment <size> minimum segment size (default 1024)" << std::endl
+      << "-max-segment <size> maximum segment size (default 65536)" << std::endl
       << "-lookback <size> lookback distance for inflection points (default 512)" << std::endl
       // << "-b <mb> specifies block size in MB" << std::endl
       // << "-t <threads> the number of threads to use (decompression requires the same number of threads" << std::endl
@@ -307,6 +309,9 @@ public:
       } else if (arg == "-min-segment") {
         if (i + 1 >= argc) return usage(program);
         segment_min_segment = std::stoull(argv[++i]);
+      } else if (arg == "-max-segment") {
+        if (i + 1 >= argc) return usage(program);
+        segment_max_segment = std::stoull(argv[++i]);
       } else if (arg == "-lookback") {
         if (i + 1 >= argc) return usage(program);
         segment_lookback = std::stoull(argv[++i]);
@@ -1196,10 +1201,11 @@ int main(int argc, char* argv[]) {
     // Boundary detection: find points where smoothed entropy > threshold
     const double threshold = options.segment_threshold;  // Minimum entropy value
     const size_t min_segment = options.segment_min_segment;
+    const size_t max_segment = options.segment_max_segment;
     std::vector<size_t> boundaries;
     boundaries.push_back(0);
     for (size_t i = 1; i < num_bytes; ++i) {
-      if (smoothed[i] > threshold && i - boundaries.back() >= min_segment) {
+      if (i - boundaries.back() >= max_segment || (smoothed[i] > threshold && i - boundaries.back() >= min_segment)) {
         boundaries.push_back(i);
       }
     }
@@ -1265,10 +1271,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Output segments
-    std::string out_file = options.archive_file.getName();
-    if (out_file.empty()) {
-      out_file = in_file + ".segments";
-    }
+    std::string out_file = in_file + ".segments";
     std::ofstream ofs(out_file);
     if (!ofs) {
       std::cerr << "Error opening output file: " << out_file << std::endl;
