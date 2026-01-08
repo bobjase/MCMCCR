@@ -184,6 +184,7 @@ public:
   }
 
   void init() {
+    debugLog("Detector init start");
     overhead_bytes_ = 0;
     small_len_ = 0;
     for (size_t i = 0; i < kProfileCount; ++i) {
@@ -252,6 +253,7 @@ public:
         out_buffer_pos_ = 0;
       }
     }
+    debugLog("Detector init end");
   }
 
   Profile detect() {

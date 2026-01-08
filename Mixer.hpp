@@ -351,11 +351,13 @@ class MixerArray {
 public:
   template <typename... Args>
   void Init(size_t count, Args... args) {
+    debugLog("MixerArray Init start");
     mixers_.resize(count);
     for (auto& m : mixers_) {
       m.Init(args...);
     }
     SetContext(0);
+    debugLog("MixerArray Init end");
   }
 
   ALWAYS_INLINE size_t Size() const {

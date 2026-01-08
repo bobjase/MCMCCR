@@ -99,7 +99,9 @@ public:
 
   // Observer mode
   bool observer_mode = false;
+  bool cow_mode = false;
   std::vector<float> entropies;
+  std::vector<float> cow_entropies;
 
   // Mixer
   typedef Mixer<int, 4> CMMixer;
@@ -117,6 +119,8 @@ public:
   }
 
   void init() {
+    debugLog("TurboCM.init start");
+
     ReorderMap<uint8_t, 256> reorder;
     ent = Range7();
     for (auto& c : order0) c = 0;
@@ -189,6 +193,7 @@ public:
 
     owhash = 0;
     byte_count = 0;
+    debugLog("TurboCM.init end");
   }
 
   ALWAYS_INLINE uint8_t nextState(uint8_t t, uint32_t bit, uint32_t smi = 0) {
@@ -401,7 +406,7 @@ public:
       }
     } while ((ctx & 0x100) == 0);
     if (observer_mode && !kDecode) {
-      entropies.push_back(current_entropy);
+      if (cow_mode) cow_entropies.push_back(current_entropy); else entropies.push_back(current_entropy);
     }
     return ctx ^ 256;
   }

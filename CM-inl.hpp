@@ -159,7 +159,9 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
   // const size_t extra_mixer_bits = std::min(opt_var_, static_cast<size_t>(4u)) + mem_level_;
   const size_t mixer_bits = kMixerBits;
   const size_t mixer_shift_bits = (kMixerBits - 15);
+  debugLog("no crash yet");
   mixers_[0].Init(0x100 << extra_mixer_bits, mixer_bits, 25);
+  debugLog("this never appears because of a crash");
 
   if (!observer_mode) std::cout << std::endl;
   for (auto& m : mixers_) {
@@ -214,14 +216,20 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
 #endif
   for (auto& s : mixer_skip_) s = 0;
 
+  debugLog("CM about to build statemap");
+
   NSStateMap<kShift> sm;
   sm.build(nullptr);
+
+  debugLog("CM after building statemap");
 
   sse_.init(257 * 256, &table_);
   sse2_.init(257 * 256, &table_);
   sse3_.init(257 * 256, &table_);
   mixer_sse_ctx_ = 0;
   sse_ctx_ = 0;
+
+  debugLog("CM after SSE init");
 
   hash_mask_ = ((2 * MB) << mem_level_) / sizeof(hash_table_[0]) - 1;
   hash_alloc_size_ = hash_mask_ + kHashStart + (1 << huffman_len_limit);
@@ -230,9 +238,12 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
 
   buffer_.Resize((MB / 4) << mem_level_, sizeof(uint32_t));
 
+  debugLog("CM after buffer resize");
+
   // Match model.
   match_model_.resize(buffer_.Size() >> 1);
   match_model_.init(MatchModelType::kMinMatch, 80U);
+  debugLog("CM after match model init");
   fixed_match_probs_.resize(81U * 2);
   int magic_array[100];
   for (size_t i = 1; i < 100; ++i) magic_array[i] = (kMaxValue / 2) / i;
@@ -260,6 +271,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
   uint8_t text_mask[] = { 15,0,0,2,15,0,8,3,2,12,13,1,3,0,7,9,12,0,0,0,0,0,0,2,0,6,0,0,9,0,0,0,12,7,14,9,7,11,4,11,10,4,9,14,9,8,7,6,5,5,5,5,5,5,5,5,5,5,14,9,2,15,13,4,2,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,2,4,4,4,4,4,4,5,4,4,3,3,10,1,3,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,4,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, };
   uint8_t text_mask2[] = { 4,2,0,7,2,0,13,0,0,5,4,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,11,2,10,8,5,6,3,9,14,7,7,3,1,5,15,10,0,0,0,0,0,0,0,0,0,0,1,13,13,8,7,7,14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,15,6,12,14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,12,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, };
   reorder_.Copy(text_reorder_);
+  debugLog("CM after reorder.copy");
   if(0) {
     std::ofstream of("of.txt");
     for (size_t i = 0; i < 256; ++i) of << (size_t)reorder_.Backward(i) << ",";
@@ -284,6 +296,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
   word_model_.Init(reorder_);
   bracket_.Init(reorder_);
   special_char_model_.Init(reorder_);
+  debugLog("CM after special_char_model_.init");
 
   reorder_.Copy(binary_reorder_);
   for (size_t i = 0; i < 256; ++i) {
@@ -309,6 +322,8 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
       state_trans_[i][j] = sm.getTransition(i, j);
     }
   }
+
+  debugLog("CM after state_trans_ optimization");
 
   unsigned short initial_probs[][256] = {
     {1895,1286,725,499,357,303,156,155,154,117,107,117,98,66,125,64,51,107,78,74,66,68,47,61,56,61,77,46,43,59,40,41,28,22,37,42,37,33,25,29,40,42,26,47,64,31,39,0,0,1,19,6,20,1058,391,195,265,194,240,132,107,125,151,113,110,91,90,95,56,105,300,22,831,997,1248,719,1194,159,156,1381,689,581,476,400,403,388,372,360,377,1802,626,740,664,1708,1141,1012,973,780,883,713,1816,1381,1621,1528,1865,2123,2456,2201,2565,2822,3017,2301,1766,1681,1472,1082,983,2585,1504,1909,2058,2844,1611,1349,2973,3084,2293,3283,2350,1689,3093,2502,1759,3351,2638,3395,3450,3430,3552,3374,3536,3560,2203,1412,3112,3591,3673,3588,1939,1529,2819,3655,3643,3731,3764,2350,3943,2640,3962,2619,3166,2244,1949,2579,2873,1683,2512,1876,3197,3712,1678,3099,3020,3308,1671,2608,1843,3487,3465,2304,3384,3577,3689,3671,3691,1861,3809,2346,1243,3790,3868,2764,2330,3795,3850,3864,3903,3933,3963,3818,3720,3908,3899,1950,3964,3924,3954,3960,4091,2509,4089,2512,4087,2783,2073,4084,2656,2455,3104,2222,3683,2815,3304,2268,1759,2878,3295,3253,2094,2254,2267,2303,3201,3013,1860,2471,2396,2311,3345,3731,3705,3709,2179,3580,3350,2332,4009,3996,3989,4032,4007,4023,2937,4008,4095,2048,},
@@ -341,8 +356,10 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
     fast_mix_[i].setP(2048);
   }
   SetDataProfile(data_profile_);
+  debugLog("CM after SetDataProfile");
   last_bytes_ = 0;
   SetUpCtxState();
+  debugLog("CM after SetUpCtxState");
   // Statistics
   if (kStatistics) {
     for (auto& c : mixer_skip_) c = 0;
@@ -355,10 +372,12 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
     for (auto& c : miss_count_) c = 0;
     fast_bytes_ = 0;
   }
+  debugLog("CM-inl.hpp end");
 }
 
 template <size_t kInputs, bool kUseSSE, typename HistoryType>
 inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Stream* out_stream, uint64_t max_count) {
+  debugLog("compress start");
   BufferedStreamWriter<4 * KB> sout(out_stream);
   BufferedStreamReader<4 * KB> sin(in_stream);
   assert(in_stream != nullptr);
@@ -505,6 +524,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
         << " lzp_normal_bytes=" << formatNumber(normal_bytes_) << std::endl;
     }
   }
+  debugLog("compress end");
 }
 
 template <size_t kInputs, bool kUseSSE, typename HistoryType>
@@ -561,10 +581,12 @@ inline CM<kInputs, kUseSSE, HistoryType>::CM(
   Detector::Profile profile)
   : mem_level_(mem_level)
   , data_profile_(profileForDetectorProfile(profile)) {
+  debugLog("CM constructor start");
   force_profile_ = profile != Detector::kProfileDetect;
   lzp_enabled_ = lzp_enabled;
   opts_ = dummy_opts;
-  frequencies_ = freq;
+  // frequencies_ = freq;
+  debugLog("CM constructor end");
 }
 
 // Context map for each context.
@@ -690,6 +712,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::OptimalCtxState() {
     }
   }
   SetStates(ctx_map);
+  debugLog("CM init end");
 }
 
 }

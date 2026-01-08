@@ -29,8 +29,10 @@
 #include <mutex>
 #include <cassert>
 #include <ctime>
+#include <chrono>
 #include <emmintrin.h>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <mmintrin.h>
 #include <ostream>
@@ -577,5 +579,9 @@ public:
     return frequencies_;
   }
 };
+
+inline void debugLog(const std::string& msg) {
+    return;
+}
 
 #endif

@@ -25,12 +25,15 @@
 #include <ctime>
 #include <fstream>
 #include <windows.h>
+#include <eh.h>
 #include <deque>
 #include <vector>
 #include <io.h>
 #include <fcntl.h>
+#include <cctype>
 
 // --- Helper: Binary I/O ---
+#include "Util.hpp"
 template <typename T>
 void WriteBinary(const std::string& filename, const std::vector<T>& vec) {
     FILE* f = fopen(filename.c_str(), "wb");
@@ -61,6 +64,8 @@ std::vector<T> ReadBinary(const std::string& filename) {
 #include <thread>
 
 #include <omp.h>
+
+#include <fstream>
 
 #include "Archive.hpp"
 #include "CM.hpp"
@@ -207,7 +212,7 @@ public:
   std::string dict_file;
   // Segmentation parameters
   size_t segment_window = 512;
-  float segment_threshold = 3.0f;
+  float segment_threshold = 2.50f;
   size_t segment_min_segment = 2048;
   size_t segment_lookback = 1024;  // Fingerprinting parameters
   size_t fingerprint_top_k = 32;
@@ -420,34 +425,39 @@ public:
 
 extern void RunBenchmarks();
 
+// SEH translator
+void se_translator(unsigned int code, EXCEPTION_POINTERS* ep) {
+    throw std::runtime_error("SEH exception");
+}
+
 // --- Oracle Child Process Function ---
 int OracleChildMain() {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
+    setbuf(stdout, NULL);  // Unbuffered
+    debugLog("OracleChildMain start");
+    HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD written;
     try {
         // Read file_data from stdin
         uint64_t file_size;
         if (fread(&file_size, sizeof(uint64_t), 1, stdin) != 1) {
-            std::cerr << "Failed to read file_size" << std::endl;
             return 1;
         }
         std::vector<uint8_t> file_data(file_size);
         if (file_size > 0 && fread(file_data.data(), sizeof(uint8_t), file_size, stdin) != file_size) {
-            std::cerr << "Failed to read file_data" << std::endl;
             return 1;
         }
 
         // Read valid_segments
         uint64_t num_segments;
         if (fread(&num_segments, sizeof(uint64_t), 1, stdin) != 1) {
-            std::cerr << "Failed to read num_segments" << std::endl;
             return 1;
         }
         std::vector<std::pair<size_t, size_t>> valid_segments(num_segments);
         for (auto& seg : valid_segments) {
             if (fread(&seg.first, sizeof(size_t), 1, stdin) != 1 ||
                 fread(&seg.second, sizeof(size_t), 1, stdin) != 1) {
-                std::cerr << "Failed to read segment" << std::endl;
                 return 1;
             }
         }
@@ -455,21 +465,26 @@ int OracleChildMain() {
         // Read pred_id
         size_t pred_id;
         if (fread(&pred_id, sizeof(size_t), 1, stdin) != 1) {
-            std::cerr << "Failed to read pred_id" << std::endl;
             return 1;
         }
 
         // Read succ_list
         uint64_t num_succ;
         if (fread(&num_succ, sizeof(uint64_t), 1, stdin) != 1) {
-            std::cerr << "Failed to read num_succ" << std::endl;
             return 1;
         }
         std::vector<size_t> succ_list(num_succ);
         if (num_succ > 0 && fread(succ_list.data(), sizeof(size_t), num_succ, stdin) != num_succ) {
-            std::cerr << "Failed to read succ_list" << std::endl;
             return 1;
         }
+
+        // Test write
+        uint64_t test = 999;
+        debugLog("test " + std::to_string(test));
+
+        // Debug: before CM creation
+        uint64_t step = 1000;
+        debugLog("step " + std::to_string(step));
 
         // Process the pred
         std::map<size_t, std::vector<std::pair<size_t, double>>> succ_costs;
@@ -479,78 +494,112 @@ int OracleChildMain() {
         size_t len_pred = valid_segments[pred_id].second;
         std::vector<uint8_t> data_pred(file_data.begin() + start_pred, file_data.begin() + start_pred + len_pred);
 
+        // Create CM once
+        cm::CM<8, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
+        cm.cur_profile_ = cm::CMProfile::CreateSimple(8);
+        cm.observer_mode = true;
+        cm.cow_mode = false;
+
+        // Compress pred data
+        MemoryReadStream in_pred(data_pred);
+        VoidWriteStream out_pred;
+        cm.compress(&in_pred, &out_pred, data_pred.size());
+
+        // Set CoW mode
+        cm.cow_mode = true;
+
         // For each succ
         for (size_t succ : succ_list) {
-            // Create CM
-            cm::CM<6, false> cm(FrequencyCounter<256>(), 4, true, Detector::kProfileText);
-            cm.observer_mode = true;
-
-            // Compress full pred
-            MemoryReadStream in_pred(data_pred);
-            VoidWriteStream out_pred;
-            cm.compress(&in_pred, &out_pred, data_pred.size());
+            debugLog("Processing succ " + std::to_string(succ) + " for pred " + std::to_string(pred_id));
 
             // Get succ data
+            debugLog("Getting succ data for " + std::to_string(succ));
             size_t start_succ = valid_segments[succ].first;
             size_t len_succ = valid_segments[succ].second;
+            debugLog("succ start: " + std::to_string(start_succ) + ", len: " + std::to_string(len_succ));
             std::vector<uint8_t> data_succ(file_data.begin() + start_succ, file_data.begin() + start_succ + len_succ);
+            debugLog("Allocated data_succ for " + std::to_string(succ));
             size_t head_len = std::min((size_t)10240, data_succ.size());
+            debugLog("head_len: " + std::to_string(head_len));
             std::vector<uint8_t> head_succ(data_succ.begin(), data_succ.begin() + head_len);
-
-            // Record entropy start
-            size_t entropy_start = cm.entropies.size();
+            debugLog("Allocated head_succ for " + std::to_string(succ));
 
             // Compress head
+            debugLog("Compressing head for succ " + std::to_string(succ));
             MemoryReadStream in_head(head_succ);
             VoidWriteStream out_head;
-            cm.compress(&in_head, &out_head, head_succ.size());
-
-            // Measure cost
             double transition_cost = 0.0;
-            for (size_t k = entropy_start; k < cm.entropies.size(); ++k) {
-                transition_cost += cm.entropies[k];
+            size_t initial_entropies_size = cm.entropies.size();
+            try {
+                cm.compress(&in_head, &out_head, head_succ.size());
+                debugLog("compress done for succ " + std::to_string(succ));
+                // Measure cost: sum entropies added during head compression
+                debugLog("Measuring cost for succ " + std::to_string(succ));
+                for (size_t i = initial_entropies_size; i < cm.entropies.size(); ++i) {
+                    transition_cost += cm.cow_entropies[static_cast<size_t>(cm.entropies[i])];
+                }
+                debugLog("cost calculated for succ " + std::to_string(succ));
+                debugLog("transition_cost: " + std::to_string(transition_cost) + " for succ " + std::to_string(succ));
+                // Resize back to remove the added entropies
+                cm.entropies.resize(initial_entropies_size);
+                debugLog("resized for succ " + std::to_string(succ));
+            } catch (...) {
+                debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
+                transition_cost = 1e9;  // High cost to avoid selecting
+                cm.entropies.resize(initial_entropies_size);
             }
 
             succ_costs[succ].emplace_back(pred_id, transition_cost);
+            debugLog("emplaced for succ " + std::to_string(succ));
+            debugLog("Emplaced cost for succ " + std::to_string(succ));
         }
 
-        // Write results to stdout
-        // First, number of succ with costs
+        debugLog("loop end");
+        // Write results to stderr using WriteFile
+        // Write results to stderr using WriteFile
+        debugLog("before writing results");
         uint64_t num_results = succ_costs.size();
-        fwrite(&num_results, sizeof(uint64_t), 1, stdout);
+        WriteFile(hStderr, &num_results, sizeof(uint64_t), &written, NULL);
         for (const auto& succ_pair : succ_costs) {
             size_t succ = succ_pair.first;
             const auto& costs = succ_pair.second;
-            fwrite(&succ, sizeof(size_t), 1, stdout);
+            WriteFile(hStderr, &succ, sizeof(size_t), &written, NULL);
             uint64_t num_costs = costs.size();
-            fwrite(&num_costs, sizeof(uint64_t), 1, stdout);
+            WriteFile(hStderr, &num_costs, sizeof(uint64_t), &written, NULL);
             for (const auto& cost_pair : costs) {
-                fwrite(&cost_pair.first, sizeof(size_t), 1, stdout);
-                fwrite(&cost_pair.second, sizeof(double), 1, stdout);
+                WriteFile(hStderr, &cost_pair.first, sizeof(size_t), &written, NULL);
+                WriteFile(hStderr, &cost_pair.second, sizeof(double), &written, NULL);
             }
         }
-        fflush(stdout);
-
+        debugLog("after writing results");
+        debugLog("OracleChildMain end");
         return 0;
+    } catch (const std::bad_alloc& e) {
+        return 1;
+    } catch (const std::out_of_range& e) {
+        return 1;
+    } catch (const std::runtime_error& e) {
+        return 1;
     } catch (const std::exception& e) {
-        std::cerr << "OracleChildMain exception: " << e.what() << std::endl;
         return 1;
     } catch (...) {
-        std::cerr << "OracleChildMain unknown exception" << std::endl;
         return 1;
     }
 }
 
 int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& file_data, const std::vector<std::pair<size_t, size_t>>& valid_segments, const std::map<size_t, std::vector<size_t>>& pred_to_succ, std::vector<std::vector<std::pair<size_t, double>>>& pred_costs) {
+    debugLog("run_oracle_multiprocess start");
     // Detect number of CPUs
     SYSTEM_INFO sysinfo;
     GetSystemInfo(&sysinfo);
     size_t num_cpus = sysinfo.dwNumberOfProcessors;
-    const size_t window_size = std::max<size_t>(1, num_cpus - 2);  // Use up to numCPUs-2, min 1
+    const size_t window_size = num_cpus;  // Use all CPUs for parallelism
     std::cout << "Detected " << num_cpus << " CPUs, using window size " << window_size << std::endl;
     std::vector<std::pair<size_t, std::vector<size_t>>> pred_list(pred_to_succ.begin(), pred_to_succ.end());
     std::vector<HANDLE> processes;
     std::vector<HANDLE> child_stdout_reads;
+    std::vector<HANDLE> child_stderr_reads;
+    std::vector<size_t> current_preds;  // Track which pred each process is for
     size_t pred_index = 0;
 
     while (pred_index < pred_list.size() || !processes.empty()) {
@@ -559,6 +608,7 @@ int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& fi
             const auto& pair = pred_list[pred_index];
             size_t pred = pair.first;
             const std::vector<size_t>& succ_list = pair.second;
+            std::cout << "Launching pred " << pred << " with " << succ_list.size() << " succ" << std::endl;
 
             // Create pipes for child's stdin
             HANDLE hChildStdinRead, hChildStdinWrite;
@@ -581,12 +631,25 @@ int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& fi
             SetHandleInformation(hChildStdoutRead, HANDLE_FLAG_INHERIT, 0);  // Parent reads, don't inherit
             SetHandleInformation(hChildStdoutWrite, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);  // Child writes
 
+            // Create pipes for child's stderr
+            HANDLE hChildStderrRead, hChildStderrWrite;
+            if (!CreatePipe(&hChildStderrRead, &hChildStderrWrite, &sa, 0)) {
+                std::cerr << "Failed to create stderr pipe for pred " << pred << std::endl;
+                CloseHandle(hChildStdinRead);
+                CloseHandle(hChildStdinWrite);
+                CloseHandle(hChildStdoutRead);
+                CloseHandle(hChildStdoutWrite);
+                return 1;
+            }
+            SetHandleInformation(hChildStderrRead, HANDLE_FLAG_INHERIT, 0);  // Parent reads, don't inherit
+            SetHandleInformation(hChildStderrWrite, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);  // Child writes
+
             // Create process
             STARTUPINFO si = {sizeof(STARTUPINFO)};
             si.dwFlags = STARTF_USESTDHANDLES;
             si.hStdInput = hChildStdinRead;
             si.hStdOutput = hChildStdoutWrite;
-            si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+            si.hStdError = hChildStderrWrite;
 
             PROCESS_INFORMATION pi;
             std::string cmd = "mcm.exe -oracle-child";
@@ -605,6 +668,7 @@ int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& fi
             // Close handles not needed in parent
             CloseHandle(hChildStdinRead);
             CloseHandle(hChildStdoutWrite);
+            CloseHandle(hChildStderrWrite);
 
             // Write data to child's stdin
             DWORD written;
@@ -630,6 +694,8 @@ int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& fi
 
             processes.push_back(pi.hProcess);
             child_stdout_reads.push_back(hChildStdoutRead);
+            child_stderr_reads.push_back(hChildStderrRead);
+            current_preds.push_back(pred);
 
             std::cout << "Launched process for pred = " << pred << std::endl;
             ++pred_index;
@@ -642,44 +708,66 @@ int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& fi
                 size_t completed_index = wait_result - WAIT_OBJECT_0;
                 HANDLE completed_process = processes[completed_index];
                 HANDLE completed_stdout = child_stdout_reads[completed_index];
+                HANDLE completed_stderr = child_stderr_reads[completed_index];
 
                 // Get exit code
                 DWORD exit_code;
                 GetExitCodeProcess(completed_process, &exit_code);
                 if (exit_code != 0) {
-                    std::cerr << "Child process failed with exit code " << exit_code << std::endl;
-                    return 1;
-                }
-
-                // Read results from stdout
-                uint64_t num_results;
-                DWORD read_bytes;
-                ReadFile(completed_stdout, &num_results, sizeof(uint64_t), &read_bytes, NULL);
-                for (uint64_t i = 0; i < num_results; ++i) {
-                    size_t succ;
-                    ReadFile(completed_stdout, &succ, sizeof(size_t), &read_bytes, NULL);
-                    uint64_t num_costs;
-                    ReadFile(completed_stdout, &num_costs, sizeof(uint64_t), &read_bytes, NULL);
-                    for (uint64_t j = 0; j < num_costs; ++j) {
-                        size_t pred_read;
-                        double cost;
-                        ReadFile(completed_stdout, &pred_read, sizeof(size_t), &read_bytes, NULL);
-                        ReadFile(completed_stdout, &cost, sizeof(double), &read_bytes, NULL);
-                        pred_costs[pred_read].emplace_back(succ, cost);
+                    std::cerr << "Child process for pred " << current_preds[completed_index] << " failed with exit code " << exit_code << ", skipping" << std::endl;
+                    // pred_costs[pred] remains empty
+                } else {
+                    // Read results from stderr pipe
+                    DWORD bytesRead;
+                    uint64_t num_results;
+                    if (!ReadFile(completed_stderr, &num_results, sizeof(uint64_t), &bytesRead, NULL) || bytesRead != sizeof(uint64_t)) {
+                        std::cerr << "Failed to read num_results from pipe for pred " << current_preds[completed_index] << std::endl;
+                        // pred_costs[pred] remains empty
+                    } else {
+                        std::cout << "Read num_results: " << num_results << " for pred " << current_preds[completed_index] << std::endl;
+                        for (uint64_t i = 0; i < num_results; ++i) {
+                            size_t succ;
+                            if (!ReadFile(completed_stderr, &succ, sizeof(size_t), &bytesRead, NULL) || bytesRead != sizeof(size_t)) {
+                                std::cerr << "Failed to read succ from pipe" << std::endl;
+                                break;
+                            }
+                            uint64_t num_costs;
+                            if (!ReadFile(completed_stderr, &num_costs, sizeof(uint64_t), &bytesRead, NULL) || bytesRead != sizeof(uint64_t)) {
+                                std::cerr << "Failed to read num_costs from pipe" << std::endl;
+                                break;
+                            }
+                            for (uint64_t j = 0; j < num_costs; ++j) {
+                                size_t pred_read;
+                                double cost;
+                                if (!ReadFile(completed_stderr, &pred_read, sizeof(size_t), &bytesRead, NULL) || bytesRead != sizeof(size_t)) {
+                                    std::cerr << "Failed to read pred_read from pipe" << std::endl;
+                                    break;
+                                }
+                                if (!ReadFile(completed_stderr, &cost, sizeof(double), &bytesRead, NULL) || bytesRead != sizeof(double)) {
+                                    std::cerr << "Failed to read cost from pipe" << std::endl;
+                                    break;
+                                }
+                                pred_costs[pred_read].emplace_back(succ, cost);
+                            }
+                        }
                     }
                 }
 
                 // Close handles
                 CloseHandle(completed_process);
                 CloseHandle(completed_stdout);
+                CloseHandle(completed_stderr);
 
                 // Remove from vectors
                 processes.erase(processes.begin() + completed_index);
                 child_stdout_reads.erase(child_stdout_reads.begin() + completed_index);
+                child_stderr_reads.erase(child_stderr_reads.begin() + completed_index);
+                current_preds.erase(current_preds.begin() + completed_index);
             }
         }
     }
 
+    debugLog("run_oracle_multiprocess end");
     return 0;
 }
 
@@ -1301,27 +1389,37 @@ int main(int argc, char* argv[]) {
     }
     std::string in_file = argv[2];
     std::cout << "in_file: " << in_file << std::endl;
-    std::ifstream ifs(in_file);
-    if (!ifs) {
-      std::cerr << "Error opening candidates file: " << in_file << std::endl;
-      return 1;
-    }
+    std::ifstream ifs(in_file, std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    ifs.close();
+    content.erase(std::remove(content.begin(), content.end(), '\r'), content.end());
     std::vector<std::vector<size_t>> candidates;
+    std::istringstream iss(content);
     std::string line;
-    while (std::getline(ifs, line)) {
-      std::istringstream iss(line);
+    while (std::getline(iss, line, '\n')) {
+      if (line.empty()) continue;
+      std::istringstream iss_line(line);
       std::string token;
-      std::getline(iss, token, ':');
+      std::getline(iss_line, token, ':');
       size_t i = std::stoul(token);
       if (i >= candidates.size()) candidates.resize(i + 1);
       std::vector<size_t>& cands = candidates[i];
-      while (std::getline(iss, token, ',')) {
-        if (!token.empty()) cands.push_back(std::stoul(token));
+      while (std::getline(iss_line, token, ',')) {
+        // Trim leading/trailing whitespace
+        token.erase(token.begin(), std::find_if(token.begin(), token.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        token.erase(std::find_if(token.rbegin(), token.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), token.end());
+        if (!token.empty()) {
+          size_t pos = token.find_first_not_of("0123456789");
+          if (pos != std::string::npos) token = token.substr(0, pos);
+          if (!token.empty()) {
+            cands.push_back(std::stoul(token));
+          }
+        }
       }
     }
-    ifs.close();
     size_t num_segments = candidates.size();
     std::cout << "Read " << num_segments << " segments from candidates" << std::endl;
+    if (candidates.size() > 0) std::cout << "candidates[0].size() = " << candidates[0].size() << std::endl;
 
     // Determine segments file
     std::string segments_file = in_file.substr(0, in_file.find_last_of('.')); // remove .candidates
@@ -1370,9 +1468,18 @@ int main(int argc, char* argv[]) {
 
     // Build reverse map: pred -> list of succ that have pred as candidate
     std::map<size_t, std::vector<size_t>> pred_to_succ;
-    for (size_t succ = 0; succ < num_segments; ++succ) {
-      for (size_t pred : candidates[succ]) {
-        pred_to_succ[pred].push_back(succ);
+    for (size_t pred = 0; pred < candidates.size(); ++pred) {
+      if (!candidates[pred].empty()) {
+        for (auto it = candidates[pred].begin(); it != candidates[pred].end(); ) {
+          if (*it >= num_segments) {
+            it = candidates[pred].erase(it);
+          } else {
+            ++it;
+          }
+        }
+        if (!candidates[pred].empty()) {
+          pred_to_succ[pred] = candidates[pred];
+        }
       }
     }
     std::cout << "pred_to_succ size: " << pred_to_succ.size() << std::endl << std::flush;
@@ -1490,9 +1597,12 @@ int main(int argc, char* argv[]) {
       std::cout << "Warning: candidates file not found, using simple orphan sort" << std::endl;
     }
 
-    // Read oracle
-    std::vector<size_t> best_j(num_segments, std::numeric_limits<size_t>::max());
-    std::vector<double> costs(num_segments, 1e100);
+    // Read oracle - NEW FORMAT: multiple candidates per predecessor
+    struct Edge {
+      size_t from, to;
+      double cost;
+    };
+    std::vector<Edge> all_edges;
     std::ifstream oracle_ifs(in_file);
     if (!oracle_ifs) {
       std::cerr << "Error opening oracle file: " << in_file << std::endl;
@@ -1503,161 +1613,99 @@ int main(int argc, char* argv[]) {
       std::istringstream iss(line);
       std::string token;
       std::getline(iss, token, ':');
-      size_t i = std::stoul(token);
-      if (i >= num_segments) continue;
-      std::getline(iss, token, ',');
-      best_j[i] = std::stoul(token);
-      std::getline(iss, token);
-      costs[i] = std::stod(token);
+      size_t pred_id = std::stoul(token);
+      std::string transitions_str;
+      std::getline(iss, transitions_str);
+      std::istringstream trans_iss(transitions_str);
+      std::string trans_token;
+      while (std::getline(trans_iss, trans_token, ';')) {
+        if (trans_token.empty()) continue;
+        std::istringstream pair_iss(trans_token);
+        std::string succ_str, cost_str;
+        std::getline(pair_iss, succ_str, ',');
+        std::getline(pair_iss, cost_str);
+        size_t succ_id = std::stoul(succ_str);
+        double cost = std::stod(cost_str);
+        all_edges.push_back({pred_id, succ_id, cost});
+      }
     }
     oracle_ifs.close();
-    std::cout << "Read oracle data" << std::endl;
+    std::cout << "Read " << all_edges.size() << " candidate transitions from oracle" << std::endl;
 
-    // Load original file
-    File fin;
-    if (fin.open(original_file, std::ios_base::in | std::ios_base::binary)) {
-      std::cerr << "Error opening original file: " << original_file << std::endl;
-      return 1;
-    }
-    size_t file_size = fin.length();
-    std::vector<uint8_t> file_data(file_size);
-    fin.read(&file_data[0], file_size);
-    fin.close();
-
-    // Collect edges
-    struct Edge {
-      size_t from, to;
-      double benefit;
-    };
-    std::vector<Edge> edges;
-    for (size_t i = 0; i < num_segments; ++i) {
-      if (best_j[i] != std::numeric_limits<size_t>::max()) {
-        size_t len_j = segments[best_j[i]].second;
-        double benefit = -costs[i] / len_j;  // Normalize by target segment length to prefer longer segments
-        edges.push_back({i, best_j[i], benefit});
-      }
-    }
-    // Sort edges by benefit descending
-    std::sort(edges.begin(), edges.end(), [](const Edge& a, const Edge& b) {
-      return a.benefit > b.benefit;
+    // Sort all edges globally by cost ascending (lower cost = better)
+    std::sort(all_edges.begin(), all_edges.end(), [](const Edge& a, const Edge& b) {
+      return a.cost < b.cost;
     });
 
-    // Initialize chains
-    std::vector<std::vector<size_t>> chains(num_segments);
-    std::vector<size_t> chain_of(num_segments);
+    // Disjoint Set Union for cycle detection
+    std::vector<size_t> parent(num_segments);
+    std::vector<size_t> rank(num_segments, 0);
     for (size_t i = 0; i < num_segments; ++i) {
-      chains[i] = {i};
-      chain_of[i] = i;
+      parent[i] = i;
     }
+    auto find = [&](auto& self, size_t x) -> size_t {
+      if (parent[x] != x) parent[x] = self(self, parent[x]);
+      return parent[x];
+    };
+    auto unite = [&](size_t x, size_t y) {
+      size_t px = find(find, x), py = find(find, y);
+      if (px != py) {
+        if (rank[px] < rank[py]) std::swap(px, py);
+        parent[py] = px;
+        if (rank[px] == rank[py]) rank[px]++;
+      }
+    };
 
-    // Greedy linking
-    for (const auto& edge : edges) {
-      size_t from_chain = chain_of[edge.from];
-      size_t to_chain = chain_of[edge.to];
-      if (from_chain != to_chain && chains[from_chain].back() == edge.from && chains[to_chain].front() == edge.to) {
-        // Merge: append to_chain to from_chain
-        chains[from_chain].insert(chains[from_chain].end(), chains[to_chain].begin(), chains[to_chain].end());
-        for (size_t seg : chains[to_chain]) {
-          chain_of[seg] = from_chain;
-        }
-        chains[to_chain].clear();
+    // Track connections
+    std::vector<size_t> successor(num_segments, std::numeric_limits<size_t>::max());
+    std::vector<size_t> predecessor(num_segments, std::numeric_limits<size_t>::max());
+
+    // The "Draft Pick" Algorithm: iterate through sorted edges
+    std::vector<Edge> accepted_edges;
+    for (const auto& edge : all_edges) {
+      size_t from = edge.from, to = edge.to;
+      // Check if both are unconnected and not in same component
+      if (successor[from] == std::numeric_limits<size_t>::max() &&
+          predecessor[to] == std::numeric_limits<size_t>::max() &&
+          find(find, from) != find(find, to)) {
+        // Accept this edge
+        successor[from] = to;
+        predecessor[to] = from;
+        unite(from, to);
+        accepted_edges.push_back(edge);
       }
     }
 
-    // Collect valid chains and orphans
-    std::vector<std::vector<size_t>> valid_chains;
+    std::cout << "Accepted " << accepted_edges.size() << " transitions out of " << all_edges.size() << " candidates" << std::endl;
+
+    // Build chains from accepted edges
+    std::vector<std::vector<size_t>> chains;
+    std::vector<bool> visited(num_segments, false);
+    for (size_t i = 0; i < num_segments; ++i) {
+      if (!visited[i] && predecessor[i] == std::numeric_limits<size_t>::max()) {
+        // Start of a chain
+        std::vector<size_t> chain;
+        size_t current = i;
+        while (current != std::numeric_limits<size_t>::max()) {
+          visited[current] = true;
+          chain.push_back(current);
+          current = successor[current];
+        }
+        chains.push_back(chain);
+      }
+    }
+
+    // Collect orphans (segments not in any chain)
     std::vector<size_t> orphans;
     for (size_t i = 0; i < num_segments; ++i) {
-      if (!chains[i].empty()) {
-        if (chains[i].size() > 1) {
-          valid_chains.push_back(chains[i]);
-        } else {
-          orphans.push_back(chains[i][0]);
-        }
+      if (!visited[i]) {
+        orphans.push_back(i);
       }
     }
 
-    // Compute densities for chains
-    struct ChainInfo {
-      std::vector<size_t> segments;
-      double density;
-    };
-    std::vector<ChainInfo> chain_infos;
-    for (const auto& chain : valid_chains) {
-      double total_benefit = 0.0;
-      size_t total_bytes = 0;
-      for (size_t seg : chain) {
-        total_bytes += segments[seg].second;
-        // Benefit from edges: for each transition in chain
-        if (seg < chain.size() - 1) {
-          size_t next = chain[seg + 1];
-          // Find the edge benefit
-          for (const auto& e : edges) {
-            if (e.from == seg && e.to == next) {
-              total_benefit += e.benefit;
-              break;
-            }
-          }
-        }
-      }
-      double density = total_benefit / total_bytes;
-      chain_infos.push_back({chain, density});
-    }
-    // Sort chains by density descending
-    std::sort(chain_infos.begin(), chain_infos.end(), [](const ChainInfo& a, const ChainInfo& b) {
-      return a.density > b.density;
-    });
+    std::cout << "Built " << chains.size() << " chains and found " << orphans.size() << " orphans" << std::endl;
 
-    // Cluster orphans
-    std::vector<std::vector<size_t>> orphan_clusters;
-    if (!candidate_distances.empty() && !candidate_distances[0].empty()) {
-      // Build graph for orphans
-      std::vector<std::vector<size_t>> graph(orphans.size());
-      std::map<size_t, size_t> orphan_index;
-      for (size_t idx = 0; idx < orphans.size(); ++idx) {
-        orphan_index[orphans[idx]] = idx;
-      }
-      const double threshold = 0.5; // Hellinger distance threshold
-      for (size_t i = 0; i < orphans.size(); ++i) {
-        size_t seg_i = orphans[i];
-        for (const auto& p : candidate_distances[seg_i]) {
-          size_t j = p.first;
-          double d = p.second;
-          if (d < threshold && orphan_index.count(j)) {
-            size_t idx_j = orphan_index[j];
-            if (std::find(graph[i].begin(), graph[i].end(), idx_j) == graph[i].end()) {
-              graph[i].push_back(idx_j);
-              graph[idx_j].push_back(i); // undirected
-            }
-          }
-        }
-      }
-      // Find connected components using BFS
-      std::vector<bool> visited(orphans.size(), false);
-      for (size_t i = 0; i < orphans.size(); ++i) {
-        if (!visited[i]) {
-          std::vector<size_t> cluster;
-          std::queue<size_t> q;
-          q.push(i);
-          visited[i] = true;
-          while (!q.empty()) {
-            size_t idx = q.front(); q.pop();
-            cluster.push_back(orphans[idx]);
-            for (size_t nei : graph[idx]) {
-              if (!visited[nei]) {
-                visited[nei] = true;
-                q.push(nei);
-              }
-            }
-          }
-          orphan_clusters.push_back(cluster);
-        }
-      }
-    } else {
-      orphan_clusters = {orphans};
-    }
-
-    // Sort within each cluster by entropy cost ascending
+    // Handle orphans: sort by entropy cost ascending
     auto get_cost = [&](size_t seg) -> double {
       if (!entropies.empty()) {
         double cost = 0.0;
@@ -1671,24 +1719,32 @@ int main(int argc, char* argv[]) {
         return segments[seg].second; // length as proxy
       }
     };
-    for (auto& cluster : orphan_clusters) {
-      std::sort(cluster.begin(), cluster.end(), [&](size_t a, size_t b) {
-        return get_cost(a) < get_cost(b);
-      });
-    }
+    std::sort(orphans.begin(), orphans.end(), [&](size_t a, size_t b) {
+      return get_cost(a) < get_cost(b);
+    });
 
-    // Flatten orphan clusters
-    std::vector<size_t> sorted_orphans;
-    for (const auto& cluster : orphan_clusters) {
-      sorted_orphans.insert(sorted_orphans.end(), cluster.begin(), cluster.end());
-    }
-
-    // Build reordered segment list
+    // Build reordered segment list: chains first (in some order), then orphans
     std::vector<size_t> reordered_segments;
-    for (const auto& ci : chain_infos) {
-      reordered_segments.insert(reordered_segments.end(), ci.segments.begin(), ci.segments.end());
+    for (const auto& chain : chains) {
+      reordered_segments.insert(reordered_segments.end(), chain.begin(), chain.end());
     }
-    reordered_segments.insert(reordered_segments.end(), sorted_orphans.begin(), sorted_orphans.end());
+    reordered_segments.insert(reordered_segments.end(), orphans.begin(), orphans.end());
+
+    // Load original file data
+    std::ifstream data_ifs(original_file, std::ios::binary | std::ios::ate);
+    if (!data_ifs) {
+      std::cerr << "Error opening original file: " << original_file << std::endl;
+      return 1;
+    }
+    size_t file_size = data_ifs.tellg();
+    data_ifs.seekg(0);
+    std::vector<uint8_t> file_data(file_size);
+    if (file_size > 0 && !data_ifs.read(reinterpret_cast<char*>(&file_data[0]), file_size)) {
+      std::cerr << "Error reading original file: " << original_file << std::endl;
+      return 1;
+    }
+    data_ifs.close();
+    std::cout << "Loaded " << file_size << " bytes from original file" << std::endl;
 
     // Generate reordered file
     std::string reordered_file = original_file + ".reordered";

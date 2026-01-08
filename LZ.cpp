@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include "Util.hpp"
 
 #ifdef WIN32
 #include <intrin.h>
@@ -198,6 +199,8 @@ void VRolz::decompressBytes(uint8_t* in, uint8_t* out, size_t count) {
 }
 
 void CMRolz::init() {
+  debugLog("CMRolz.init start");
+    
   lookahead_.Resize(4 * KB);
   buffer_.Resize(16 * MB);
   for (size_t i = 0; i < 256; ++i) {
@@ -231,6 +234,7 @@ void CMRolz::init() {
     }
   }
   owhash_ = 0;
+  debugLog("CMRolz.init end");
 }
 
 void CMRolz::compress(Stream* in_stream, Stream* out_stream) {

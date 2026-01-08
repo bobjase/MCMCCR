@@ -27,6 +27,8 @@
 #include <cstdlib>
 #include <type_traits>
 #include <vector>
+#include <windows.h>
+#include <fstream>
 
 #include "BracketModel.hpp"
 #include "Detector.hpp"
@@ -92,12 +94,15 @@ namespace cm {
       return enabled;
     }
     ALWAYS_INLINE bool ModelEnabled(ModelType model) const {
-      return (enabled_models_ & (1U << static_cast<uint32_t>(model))) != 0;
+      bool ret = (enabled_models_ & (1U << static_cast<uint32_t>(model))) != 0;
+      return ret;
     }
 
     ALWAYS_INLINE void EnableModel(ModelType model) {
+      debugLog("EnableModel start for model " + std::to_string(static_cast<int>(model)));
       enabled_models_ |= 1 << static_cast<size_t>(model);
       CalculateMaxOrder();
+      debugLog("EnableModel end");
     }
 
     template <typename T>
@@ -108,17 +113,22 @@ namespace cm {
     }
 
     void CalculateMaxOrder() {
+      debugLog("CalculateMaxOrder start");
       max_model_order_ = 0;
       for (size_t order = 0; order <= kMaxOrder; ++order) {
         if (ModelEnabled(static_cast<ModelType>(kModelOrder0 + order))) {
           max_model_order_ = order;
         }
       }
+      debugLog("CalculateMaxOrder after loop");
       max_order_ = std::max(max_model_order_, match_model_order_);
+      debugLog("CalculateMaxOrder end");
     }
 
     void SetMinLZPLen(size_t len) {
+      debugLog("SetMinLZPLen start");
       min_lzp_len_ = len;
+      debugLog("SetMinLZPLen end");
     }
 
     size_t MinLZPLen() const {
@@ -126,8 +136,10 @@ namespace cm {
     }
 
     void SetMatchModelOrder(size_t order) {
+      debugLog("SetMatchModelOrder start");
       match_model_order_ = order ? order - 1 : 0;
       max_order_ = std::max(max_model_order_, match_model_order_);
+      debugLog("SetMatchModelOrder end");
     }
 
     size_t MatchModelOrder() const {
@@ -151,6 +163,7 @@ namespace cm {
     }
 
     static CMProfile CreateSimple(size_t inputs, size_t min_lzp_len = 10) {
+      debugLog("CreateSimple start");
       CMProfile base;
       base.EnableModel(kModelOrder0);
       size_t idx = 0;
@@ -165,6 +178,7 @@ namespace cm {
       if (inputs > idx++) base.EnableModel(kModelOrder9);
       base.SetMatchModelOrder(8);
       base.SetMinLZPLen(min_lzp_len);
+      debugLog("CreateSimple end");
       return base;
     }
 
@@ -250,6 +264,8 @@ namespace cm {
 
     std::vector<double> entropies;
     bool observer_mode = false;
+    bool cow_mode = false;
+    std::vector<double> cow_entropies;
     size_t process_count = 0;
     double current_entropy = 0;
     size_t byte_index = 0;
@@ -357,7 +373,6 @@ namespace cm {
       double current_entropy_snapshot;
       std::vector<double> entropies_snapshot;
       size_t buffer_pos_snapshot;
-      std::vector<uint8_t> buffer_content_snapshot;
     };
 
     StateSnapshot takeSnapshot() const {
@@ -380,7 +395,6 @@ namespace cm {
       snap.current_entropy_snapshot = current_entropy;
       snap.entropies_snapshot = entropies;
       snap.buffer_pos_snapshot = buffer_.Pos();
-      snap.buffer_content_snapshot.assign(buffer_.Data(), buffer_.Data() + buffer_.Mask() + 1);
       return snap;
     }
 
@@ -402,7 +416,6 @@ namespace cm {
       current_entropy = snap.current_entropy_snapshot;
       entropies = snap.entropies_snapshot;
       buffer_.SetPos(snap.buffer_pos_snapshot);
-      std::copy(snap.buffer_content_snapshot.begin(), snap.buffer_content_snapshot.end(), buffer_.Data());
       memset(hash_table_, 0, hash_alloc_size_);
     }
 
@@ -1109,7 +1122,7 @@ namespace cm {
           }
           if (bit) {
             if (observer_mode) {
-              entropies.push_back(current_entropy);
+              if (cow_mode) cow_entropies.push_back(current_entropy); else entropies.push_back(current_entropy);
               current_entropy = 0;
             }
             return expected_char;
@@ -1131,7 +1144,7 @@ namespace cm {
       }
 
       if (observer_mode) {
-        entropies.push_back(current_entropy);
+        if (cow_mode) cow_entropies.push_back(current_entropy); else entropies.push_back(current_entropy);
         current_entropy = 0;
         // if (entropies.size() > byte_index + 100) {
         //   std::cout << "Entropies size " << entropies.size() << " exceeds byte_index " << byte_index << " by more than 100" << std::endl;
@@ -1146,10 +1159,12 @@ namespace cm {
     }
 
     static DataProfile profileForDetectorProfile(Detector::Profile profile) {
+      debugLog("profileForDetectorProfile start");
       switch (profile) {
       case Detector::kProfileText: return kProfileText;
       case Detector::kProfileSimple: return kProfileSimple;
       }
+      debugLog("profileForDetectorProfile end");
       return kProfileBinary;
     }
 
