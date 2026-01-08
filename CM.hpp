@@ -788,7 +788,10 @@ namespace cm {
 					ent.encode(stream, bit, p, kShift);
 				}
 				if (observer_mode) {
-					current_entropy += 1.0;
+					double p_scaled = (double)p / (double)(1 << kShift);
+					double prob = bit ? p_scaled : (1.0 - p_scaled);
+					if (prob < 1e-9) prob = 1e-9;
+					current_entropy += -log2(prob);
 				}
         if (bits == 1) {
           // ++ctx_count_[cur_ctx];  // Only for last context.

@@ -212,8 +212,8 @@ public:
   std::string dict_file;
   // Segmentation parameters
   size_t segment_window = 512;
-  float segment_threshold = 2.50f;
-  size_t segment_min_segment = 2048;
+  float segment_threshold = 4.50f;
+  size_t segment_min_segment = 4096;
   size_t segment_lookback = 1024;  // Fingerprinting parameters
   size_t fingerprint_top_k = 32;
   int usage(const std::string& name) {
@@ -1154,9 +1154,9 @@ int main(int argc, char* argv[]) {
     // Read .entropy file
     std::vector<FileInfo> files = options.files;
     std::string in_file = files[0].getName();
-    std::ifstream ifs(in_file, std::ios::binary);
+    std::ifstream ifs(in_file + ".entropy", std::ios::binary);
     if (!ifs) {
-      std::cerr << "Error opening entropy file: " << in_file << std::endl;
+      std::cerr << "Error opening entropy file: " << in_file + ".entropy" << std::endl;
       return 1;
     }
     uint64_t num_bytes;
