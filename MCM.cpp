@@ -529,11 +529,22 @@ int OracleChildMain() {
             std::vector<uint8_t> head_succ(data_succ.begin(), data_succ.begin() + head_len);
             debugLog("Allocated head_succ for " + std::to_string(succ));
 
-            // Compress head
+            // Compute alone_bits
+            cm::CM<8, false> cm_alone(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
+            cm_alone.cur_profile_ = cm::CMProfile::CreateSimple(8);
+            cm_alone.observer_mode = true;
+            MemoryReadStream in_alone(head_succ);
+            VoidWriteStream out_alone;
+            cm_alone.compress(&in_alone, &out_alone, head_succ.size());
+            double alone_bits = 0.0;
+            for (double e : cm_alone.entropies) alone_bits += e;
+
+            // Compress head with CoW
             debugLog("Compressing head for succ " + std::to_string(succ));
             MemoryReadStream in_head(head_succ);
             VoidWriteStream out_head;
             double transition_cost = 0.0;
+            double cost = 0.0;
             size_t initial_entropies_size = cm.entropies.size();
             debugLog("head_succ.size() = " + std::to_string(head_succ.size()));
             try {
@@ -552,13 +563,16 @@ int OracleChildMain() {
                 // Resize back to remove the added entropies
                 cm.entropies.resize(initial_entropies_size);
                 debugLog("resized for succ " + std::to_string(succ));
+                // Compute cost as savings: transition_cost - alone_bits
+                cost = transition_cost - alone_bits;
+                debugLog("cost: " + std::to_string(cost) + " for succ " + std::to_string(succ));
             } catch (...) {
                 debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
-                transition_cost = 1e9;  // High cost to avoid selecting
+                cost = 1e9;  // High cost to avoid selecting
                 cm.entropies.resize(initial_entropies_size);
             }
 
-            succ_costs[succ].emplace_back(pred_id, transition_cost);
+            succ_costs[succ].emplace_back(pred_id, cost);
             debugLog("emplaced for succ " + std::to_string(succ));
             debugLog("Emplaced cost for succ " + std::to_string(succ));
         }
@@ -1211,21 +1225,18 @@ int main(int argc, char* argv[]) {
     }
     boundaries.push_back(num_bytes);
 
+    std::cout << "Boundaries size: " << boundaries.size() << std::endl;
+
     // Atomic Fusion: Hot/Cold Dependency Check
-    std::string original_file;
-    if (in_file.find("enwik8_5MB") != std::string::npos) {
-      original_file = "testFiles/enwik8_5MB";
-    } else if (in_file.find("helloWorld") != std::string::npos) {
-      original_file = "testFiles/helloWorld.txt";
-    } else {
-      original_file = in_file.substr(0, in_file.size() - 7);
-    }
-    File original_fin(original_file, std::ios_base::in | std::ios_base::binary);
-    if (!original_fin.isOpen()) {
+    std::string original_file = std::string(argv[2]);
+    std::ifstream fin(original_file, std::ios::binary);
+    if (!fin) {
       std::cerr << "Error opening original file: " << original_file << std::endl;
       return 1;
     }
-    uint64_t file_size = original_fin.length();
+    fin.seekg(0, std::ios::end);
+    uint64_t file_size = fin.tellg();
+    fin.seekg(0, std::ios::beg);
     if (num_bytes > file_size) {
       num_bytes = file_size;
       entropies.resize(num_bytes);
@@ -1293,12 +1304,12 @@ int main(int argc, char* argv[]) {
     std::cout << "Running Fingerprinting Mode" << std::endl;
     // Read .segments file
     if (argc != 3) {
-      std::cerr << "Usage: mcm -fingerprint <segments_file>" << std::endl;
+      std::cerr << "Usage: mcm -fingerprint <original_file>" << std::endl;
       return 1;
     }
     std::string in_file = argv[2];
     std::cout << "in_file: " << in_file << std::endl;
-    std::ifstream ifs(in_file);
+    std::ifstream ifs(in_file + ".segments");
     if (!ifs) {
       std::cerr << "Error opening segments file: " << in_file << std::endl;
       return 1;
@@ -1312,13 +1323,7 @@ int main(int argc, char* argv[]) {
     ifs.close();
 
     // Determine original file
-    std::string original_file;
-    size_t entropy_pos = in_file.find(".entropy");
-    if (entropy_pos != std::string::npos) {
-      original_file = in_file.substr(0, entropy_pos);
-    } else {
-      original_file = in_file.substr(0, in_file.find_last_of('.'));
-    }
+    std::string original_file = in_file;
 
     // Load original file
     File fin;
@@ -1367,7 +1372,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Output .candidates file
-    std::string out_file = in_file + ".candidates";
+    std::string out_file = in_file + ".segments.candidates";
     std::ofstream ofs(out_file);
     if (!ofs) {
       std::cerr << "Error opening output file: " << out_file << std::endl;
@@ -1391,12 +1396,12 @@ int main(int argc, char* argv[]) {
     std::cout << "Running Oracle Mode" << std::endl;
     auto start_time = std::chrono::high_resolution_clock::now();
     if (argc != 3) {
-      std::cerr << "Usage: mcm -oracle <candidates_file>" << std::endl;
+      std::cerr << "Usage: mcm -oracle <original_file>" << std::endl;
       return 1;
     }
-    std::string in_file = argv[2];
+    std::string in_file = std::string(argv[2]) + ".segments";
     std::cout << "in_file: " << in_file << std::endl;
-    std::ifstream ifs(in_file, std::ios::binary);
+    std::ifstream ifs(in_file + ".candidates");
     std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
     ifs.close();
     content.erase(std::remove(content.begin(), content.end(), '\r'), content.end());
@@ -1429,7 +1434,7 @@ int main(int argc, char* argv[]) {
     if (candidates.size() > 0) std::cout << "candidates[0].size() = " << candidates[0].size() << std::endl;
 
     // Determine segments file
-    std::string segments_file = in_file.substr(0, in_file.find_last_of('.')); // remove .candidates
+    std::string segments_file = in_file; // remove .candidates
     std::cout << "segments_file: " << segments_file << std::endl;
     std::ifstream seg_ifs(segments_file);
     if (!seg_ifs) {
@@ -1445,33 +1450,25 @@ int main(int argc, char* argv[]) {
     seg_ifs.close();
 
     // Load original file
-    std::string original_file = segments_file.substr(0, segments_file.find_last_of('.'));
+    std::string original_file = in_file.substr(0, in_file.find_last_of('.'));
     std::cout << "original_file: " << original_file << std::endl;
-    File fin;
-    if (fin.open(original_file, std::ios_base::in | std::ios_base::binary)) {
+    std::ifstream fin(original_file, std::ios::binary);
+    if (!fin) {
       std::cerr << "Error opening original file: " << original_file << std::endl;
       return 1;
     }
-    size_t file_size = fin.length();
+    fin.seekg(0, std::ios::end);
+    size_t file_size = fin.tellg();
+    fin.seekg(0, std::ios::beg);
     std::vector<uint8_t> file_data(file_size);
-    fin.read(&file_data[0], file_size);
+    if (file_size > 0 && !fin.read((char*)&file_data[0], file_size)) {
+      std::cerr << "Error reading original file: " << original_file << std::endl;
+      return 1;
+    }
     fin.close();
 
     // Filter valid segments as in fingerprint
-    std::vector<std::pair<size_t, size_t>> valid_segments;
-    for (auto& seg : segments) {
-      size_t start = seg.first;
-      size_t len = seg.second;
-      if (start >= file_size || len == 0) continue;
-      if (start + len > file_size) {
-        len = file_size - start;
-      }
-      valid_segments.push_back({start, len});
-    }
-    if (valid_segments.size() != num_segments) {
-      std::cerr << "Mismatch: valid_segments " << valid_segments.size() << " vs candidates " << num_segments << std::endl;
-      return 1;
-    }
+    std::vector<std::pair<size_t, size_t>> valid_segments = segments;
 
     // Build reverse map: pred -> list of succ that have pred as candidate
     std::map<size_t, std::vector<size_t>> pred_to_succ;
@@ -1530,18 +1527,65 @@ int main(int argc, char* argv[]) {
     std::cout << "Oracle processing completed in " << elapsed.count() << " seconds" << std::endl;
     break;
   }
+  struct BeamState {
+    double total_cost;  // Lower is better (entropy)
+    
+    // Graph Connectivity State
+    std::vector<int> next_segment; // [i] = successor of i (or -1)
+    std::vector<int> prev_segment; // [i] = predecessor of i (or -1)
+    
+    // Cycle Detection (Union-Find / DSU)
+    std::vector<int> dsu_parent;
+    
+    // Constructor
+    BeamState(size_t num_segments) : total_cost(0.0) {
+      next_segment.assign(num_segments, -1);
+      prev_segment.assign(num_segments, -1);
+      dsu_parent.resize(num_segments);
+      std::iota(dsu_parent.begin(), dsu_parent.end(), 0);
+    }
+    
+    // Helper: Find Representative (Path Compression)
+    int find_set(int v) {
+      if (v == dsu_parent[v]) return v;
+      return dsu_parent[v] = find_set(dsu_parent[v]);
+    }
+    
+    // Const version without path compression
+    int find_set(int v) const {
+      if (v == dsu_parent[v]) return v;
+      return find_set(dsu_parent[v]);
+    }
+    
+    // Helper: Union Sets
+    void union_sets(int a, int b) {
+      a = find_set(a);
+      b = find_set(b);
+      if (a != b) dsu_parent[b] = a;
+    }
+    
+    // Clone for beam expansion
+    BeamState clone() const {
+      BeamState copy(next_segment.size());
+      copy.total_cost = total_cost;
+      copy.next_segment = next_segment;
+      copy.prev_segment = prev_segment;
+      copy.dsu_parent = dsu_parent;
+      return copy;
+    }
+  };
   case Options::kModePathCover: {
     printHeader();
     std::cout << "Running PathCover Mode" << std::endl;
     auto start_time = std::chrono::high_resolution_clock::now();
     if (argc != 3) {
-      std::cerr << "Usage: mcm -pathcover <oracle_file>" << std::endl;
+      std::cerr << "Usage: mcm -pathcover <original_file>" << std::endl;
       return 1;
     }
-    std::string in_file = argv[2];
+    std::string in_file = std::string(argv[2]) + ".segments";
     std::cout << "in_file: " << in_file << std::endl;
     // Read segments file
-    std::string segments_file = in_file.substr(0, in_file.find(".candidates"));
+    std::string segments_file = in_file;
     std::cout << "segments_file: " << segments_file << std::endl;
     std::ifstream seg_ifs(segments_file);
     if (!seg_ifs) {
@@ -1606,11 +1650,11 @@ int main(int argc, char* argv[]) {
 
     // Read oracle - NEW FORMAT: multiple candidates per predecessor
     struct Edge {
-      size_t from, to;
+      size_t to;
       double cost;
     };
-    std::vector<Edge> all_edges;
-    std::ifstream oracle_ifs(in_file);
+    std::vector<std::vector<Edge>> candidates(num_segments);
+    std::ifstream oracle_ifs(in_file + ".oracle");
     if (!oracle_ifs) {
       std::cerr << "Error opening oracle file: " << in_file << std::endl;
       return 1;
@@ -1633,70 +1677,91 @@ int main(int argc, char* argv[]) {
         std::getline(pair_iss, cost_str);
         size_t succ_id = std::stoul(succ_str);
         double cost = std::stod(cost_str);
-        all_edges.push_back({pred_id, succ_id, cost});
+        candidates[pred_id].push_back({succ_id, cost});
+      }
+      // Sort and keep top 32
+      std::sort(candidates[pred_id].begin(), candidates[pred_id].end(), 
+                [](const Edge& a, const Edge& b) { return a.cost < b.cost; });
+      if (candidates[pred_id].size() > 32) {
+        candidates[pred_id].resize(32);
       }
     }
     oracle_ifs.close();
-    std::cout << "Read " << all_edges.size() << " candidate transitions from oracle" << std::endl;
+    size_t total_candidates = 0;
+    for (const auto& c : candidates) total_candidates += c.size();
+    std::cout << "Read " << total_candidates << " candidate transitions from oracle" << std::endl;
 
-    // Sort all edges globally by cost ascending (lower cost = better)
-    std::sort(all_edges.begin(), all_edges.end(), [](const Edge& a, const Edge& b) {
-      return a.cost < b.cost;
-    });
+    std::cout << "Read " << total_candidates << " candidate transitions from oracle" << std::endl;
 
-    // Disjoint Set Union for cycle detection
-    std::vector<size_t> parent(num_segments);
-    std::vector<size_t> rank(num_segments, 0);
-    for (size_t i = 0; i < num_segments; ++i) {
-      parent[i] = i;
-    }
-    auto find = [&](auto& self, size_t x) -> size_t {
-      if (parent[x] != x) parent[x] = self(self, parent[x]);
-      return parent[x];
-    };
-    auto unite = [&](size_t x, size_t y) {
-      size_t px = find(find, x), py = find(find, y);
-      if (px != py) {
-        if (rank[px] < rank[py]) std::swap(px, py);
-        parent[py] = px;
-        if (rank[px] == rank[py]) rank[px]++;
+    // Beam Search Parameters
+    const size_t BEAM_WIDTH = 10000;
+    const double ORPHAN_PENALTY = 1000.0;  // Heuristic penalty for leaving nodes unconnected
+
+    // Initialize beam with one empty state
+    std::vector<BeamState> current_beam;
+    current_beam.emplace_back(num_segments);
+
+    // Process segments in order
+    for (size_t current_node = 0; current_node < num_segments; ++current_node) {
+      std::vector<BeamState> next_beam_candidates;
+      
+      // Expand each state in current beam
+      for (const auto& state : current_beam) {
+        // Option 1: Skip current_node (leave as orphan)
+        {
+          BeamState new_state = state.clone();
+          new_state.total_cost += ORPHAN_PENALTY;  // Penalty for orphan
+          next_beam_candidates.push_back(std::move(new_state));
+        }
+        
+        // Option 2: Try linking to candidates
+        for (const auto& edge : candidates[current_node]) {
+          size_t succ = edge.to;
+          double cost = edge.cost;
+          
+          // Check validity
+          if (state.prev_segment[succ] != -1) continue;  // succ already has predecessor
+          if (state.find_set(current_node) == state.find_set(succ)) continue;  // would create cycle
+          
+          // Valid: create new state
+          BeamState new_state = state.clone();
+          new_state.next_segment[current_node] = succ;
+          new_state.prev_segment[succ] = current_node;
+          new_state.union_sets(current_node, succ);
+          new_state.total_cost += cost;
+          next_beam_candidates.push_back(std::move(new_state));
+        }
       }
-    };
-
-    // Track connections
-    std::vector<size_t> successor(num_segments, std::numeric_limits<size_t>::max());
-    std::vector<size_t> predecessor(num_segments, std::numeric_limits<size_t>::max());
-
-    // The "Draft Pick" Algorithm: iterate through sorted edges
-    std::vector<Edge> accepted_edges;
-    for (const auto& edge : all_edges) {
-      size_t from = edge.from, to = edge.to;
-      // Check if both are unconnected and not in same component
-      if (successor[from] == std::numeric_limits<size_t>::max() &&
-          predecessor[to] == std::numeric_limits<size_t>::max() &&
-          find(find, from) != find(find, to)) {
-        // Accept this edge
-        successor[from] = to;
-        predecessor[to] = from;
-        unite(from, to);
-        accepted_edges.push_back(edge);
+      
+      // Prune to top BEAM_WIDTH by cost
+      std::sort(next_beam_candidates.begin(), next_beam_candidates.end(), 
+                [](const BeamState& a, const BeamState& b) {
+                  return a.total_cost < b.total_cost;
+                });
+      if (next_beam_candidates.size() > BEAM_WIDTH) {
+        next_beam_candidates.erase(next_beam_candidates.begin() + BEAM_WIDTH, next_beam_candidates.end());
       }
+      current_beam = std::move(next_beam_candidates);
+      
+      std::cout << "Processed node " << current_node << ", beam size: " << current_beam.size() << std::endl;
     }
 
-    std::cout << "Accepted " << accepted_edges.size() << " transitions out of " << all_edges.size() << " candidates" << std::endl;
+    // Select best state
+    const BeamState& best_state = current_beam[0];
+    std::cout << "Best state cost: " << best_state.total_cost << std::endl;
 
-    // Build chains from accepted edges
+    // Build chains from best state
     std::vector<std::vector<size_t>> chains;
     std::vector<bool> visited(num_segments, false);
     for (size_t i = 0; i < num_segments; ++i) {
-      if (!visited[i] && predecessor[i] == std::numeric_limits<size_t>::max()) {
+      if (!visited[i] && best_state.prev_segment[i] == -1) {
         // Start of a chain
         std::vector<size_t> chain;
         size_t current = i;
-        while (current != std::numeric_limits<size_t>::max()) {
+        while (current != static_cast<size_t>(-1)) {
           visited[current] = true;
           chain.push_back(current);
-          current = successor[current];
+          current = best_state.next_segment[current];
         }
         chains.push_back(chain);
       }
