@@ -387,7 +387,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
     detector.setOptVar(opt_var_);
     detector.init();
   }
-  init();
+  if (!skip_init) init();
   //if (!observer_mode) std::cout << "Starting compress with max_count = " << max_count << std::endl;
   //if (!observer_mode) std::cout << "observer_mode = " << observer_mode << std::endl;
   ent = Range7();

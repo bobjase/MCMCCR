@@ -265,6 +265,7 @@ namespace cm {
     std::vector<double> entropies;
     bool observer_mode = false;
     bool cow_mode = false;
+    bool skip_init = false;
     std::vector<double> cow_entropies;
     size_t process_count = 0;
     double current_entropy = 0;

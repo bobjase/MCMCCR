@@ -501,8 +501,16 @@ int OracleChildMain() {
 
         // Create CM once
         cm::CM<8, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
-        cm.cur_profile_ = cm::CMProfile::CreateSimple(8);
+        // Use full profile for max compression accuracy
+        cm.cur_profile_ = cm::CMProfile();
+        for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
+            cm.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
+        }
+        cm.cur_profile_.SetMatchModelOrder(12);
+        cm.cur_profile_.SetMinLZPLen(10);
         cm.observer_mode = true;
+        cm.init();
+        cm.skip_init = true;
         cm.cow_mode = false;
 
         // Compress pred data
@@ -531,7 +539,13 @@ int OracleChildMain() {
 
             // Compute alone_bits
             cm::CM<8, false> cm_alone(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
-            cm_alone.cur_profile_ = cm::CMProfile::CreateSimple(8);
+            // Use full profile for max compression accuracy
+            cm_alone.cur_profile_ = cm::CMProfile();
+            for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
+                cm_alone.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
+            }
+            cm_alone.cur_profile_.SetMatchModelOrder(12);
+            cm_alone.cur_profile_.SetMinLZPLen(10);
             cm_alone.observer_mode = true;
             MemoryReadStream in_alone(head_succ);
             VoidWriteStream out_alone;
@@ -566,10 +580,18 @@ int OracleChildMain() {
                 // Compute cost as savings: transition_cost - alone_bits
                 cost = transition_cost - alone_bits;
                 debugLog("cost: " + std::to_string(cost) + " for succ " + std::to_string(succ));
+                if (pred_id == 1 && succ == 0) {
+                    std::ofstream testfile("test_output.txt", std::ios::app);
+                    testfile << "TEST: pred=1 succ=0 alone_bits=" << alone_bits << " transition_cost=" << transition_cost << " cost=" << cost << std::endl;
+                }
             } catch (...) {
                 debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
                 cost = 1e9;  // High cost to avoid selecting
                 cm.entropies.resize(initial_entropies_size);
+                if (pred_id == 1 && succ == 0) {
+                    std::ofstream testfile("test_output.txt", std::ios::app);
+                    testfile << "TEST: pred=1 succ=0 exception, cost=1e9" << std::endl;
+                }
             }
 
             succ_costs[succ].emplace_back(pred_id, cost);
@@ -1487,6 +1509,16 @@ int main(int argc, char* argv[]) {
       }
     }
     std::cout << "pred_to_succ size: " << pred_to_succ.size() << std::endl << std::flush;
+
+    // For testing, only process pred=1 with succ=0
+    // std::map<size_t, std::vector<size_t>> test_pred_to_succ;
+    // if (pred_to_succ.count(1)) {
+    //     auto& succs = pred_to_succ[1];
+    //     if (std::find(succs.begin(), succs.end(), 0) != succs.end()) {
+    //         test_pred_to_succ[1] = {0};
+    //     }
+    // }
+    // pred_to_succ = test_pred_to_succ;
 
     // For each pred, compress pred once, take snapshot, then evaluate all succ that have pred as candidate
     std::vector<std::vector<std::pair<size_t, double>>> pred_costs(num_segments);  // for each pred, list of (succ, cost)
