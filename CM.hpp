@@ -727,53 +727,58 @@ namespace cm {
 				}
 				dcheck(bit < 2);
 
-				const size_t kLimit = kMaxLearn - 1;
-				const size_t kDelta = 5;
-				// Returns false if we skipped the update due to a low error, should happen moderately frequently on highly compressible files.
-				bool ret = m0->Update(
-					mixer_p, bit,
-					kShift, kLimit, 600, 1,
-					// mixer_update_rate_[m0->NextLearn(8)], 16,
-					mixer_update_rate_[m0->GetLearn()], 16,
-					p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15
-				);
-				// Only update the states / predictions if the mixer was far enough from the bounds, helps 60k on enwik8 and 1-2sec.
-				const bool kOptP = false;
-				if (ret) {
-					auto updater = probs_[0].GetUpdater(bit);
-          if (kBitType != kBitTypeLZP && mm_l == 0) {
-            if (kInputs > 0) *sp0 = NextState(sp0 - hash_table_, s0, bit, updater, 0, kOptP ? opts_[0] : 23);
-          }
-					if (kInputs > 1) *sp1 = NextState(sp1 - hash_table_, s1, bit, updater, 1, kOptP ? opts_[1] : 10);
-					if (kInputs > 2) *sp2 = NextState(sp2 - hash_table_, s2, bit, updater, 2, kOptP ? opts_[2] : 9);
-					if (kInputs > 3) *sp3 = NextState(sp3 - hash_table_, s3, bit, updater, 3, kOptP ? opts_[3] : 9);
-					if (kInputs > 4) *sp4 = NextState(sp4 - hash_table_, s4, bit, updater, 4, kOptP ? opts_[4] : 9);
-					if (kInputs > 5) *sp5 = NextState(sp5 - hash_table_, s5, bit, updater, 5, kOptP ? opts_[5] : 9);
-					if (kInputs > 6) *sp6 = NextState(sp6 - hash_table_, s6, bit, updater, 6, kOptP ? opts_[6] : 9);
-					if (kInputs > 7) *sp7 = NextState(sp7 - hash_table_, s7, bit, updater, 7, kOptP ? opts_[7] : 9);
-					if (kInputs > 8) *sp8 = NextState(sp8 - hash_table_, s8, bit, updater, 8, kOptP ? opts_[8] : 9);
-					if (kInputs > 9) *sp9 = NextState(sp9 - hash_table_, s9, bit, updater, 9, kOptP ? opts_[9] : 9);
-					if (kInputs > 10) *sp10 = NextState(sp10 - hash_table_, s10, bit, updater, 10, kOptP ? opts_[10] : 9);
-					if (kInputs > 11) *sp11 = NextState(sp11 - hash_table_, s11, bit, updater, 11, kOptP ? opts_[11] : 9);
-					if (kInputs > 12) *sp12 = NextState(sp12 - hash_table_, s12, bit, updater, 12, kOptP ? opts_[12] : 9);
-					if (kInputs > 13) *sp13 = NextState(sp13 - hash_table_, s13, bit, updater, 13, kOptP ? opts_[13] : 9);
-					if (kInputs > 14) *sp14 = NextState(sp14 - hash_table_, s14, bit, updater, 14, kOptP ? opts_[14] : 9);
-					if (kInputs > 15) *sp15 = NextState(sp15 - hash_table_, s15, bit, updater, 15, kOptP ? opts_[15] : 9);
-				}
-				if (kUseLZP) {
-					if (kUseLZPSSE) {
-						if (kBitType == kBitTypeLZP) {
-							sse2_.update(bit);
-						} else if (kBitType == kBitTypeNormalSSE) {
-							sse_.update(bit);
-						}
+				bool ret = false;
+				if (!observer_mode) {
+					const size_t kLimit = kMaxLearn - 1;
+					const size_t kDelta = 5;
+					// Returns false if we skipped the update due to a low error, should happen moderately frequently on highly compressible files.
+					ret = m0->Update(
+						mixer_p, bit,
+						kShift, kLimit, 600, 1,
+						// mixer_update_rate_[m0->NextLearn(8)], 16,
+						mixer_update_rate_[m0->GetLearn()], 16,
+						p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15
+					);
+					// Only update the states / predictions if the mixer was far enough from the bounds, helps 60k on enwik8 and 1-2sec.
+					const bool kOptP = false;
+					if (ret) {
+						auto updater = probs_[0].GetUpdater(bit);
+	          if (kBitType != kBitTypeLZP && mm_l == 0) {
+	            if (kInputs > 0) *sp0 = NextState(sp0 - hash_table_, s0, bit, updater, 0, kOptP ? opts_[0] : 23);
+	          }
+						if (kInputs > 1) *sp1 = NextState(sp1 - hash_table_, s1, bit, updater, 1, kOptP ? opts_[1] : 10);
+						if (kInputs > 2) *sp2 = NextState(sp2 - hash_table_, s2, bit, updater, 2, kOptP ? opts_[2] : 9);
+						if (kInputs > 3) *sp3 = NextState(sp3 - hash_table_, s3, bit, updater, 3, kOptP ? opts_[3] : 9);
+						if (kInputs > 4) *sp4 = NextState(sp4 - hash_table_, s4, bit, updater, 4, kOptP ? opts_[4] : 9);
+						if (kInputs > 5) *sp5 = NextState(sp5 - hash_table_, s5, bit, updater, 5, kOptP ? opts_[5] : 9);
+						if (kInputs > 6) *sp6 = NextState(sp6 - hash_table_, s6, bit, updater, 6, kOptP ? opts_[6] : 9);
+						if (kInputs > 7) *sp7 = NextState(sp7 - hash_table_, s7, bit, updater, 7, kOptP ? opts_[7] : 9);
+						if (kInputs > 8) *sp8 = NextState(sp8 - hash_table_, s8, bit, updater, 8, kOptP ? opts_[8] : 9);
+						if (kInputs > 9) *sp9 = NextState(sp9 - hash_table_, s9, bit, updater, 9, kOptP ? opts_[9] : 9);
+						if (kInputs > 10) *sp10 = NextState(sp10 - hash_table_, s10, bit, updater, 10, kOptP ? opts_[10] : 9);
+						if (kInputs > 11) *sp11 = NextState(sp11 - hash_table_, s11, bit, updater, 11, kOptP ? opts_[11] : 9);
+						if (kInputs > 12) *sp12 = NextState(sp12 - hash_table_, s12, bit, 12, kOptP ? opts_[12] : 9);
+						if (kInputs > 13) *sp13 = NextState(sp13 - hash_table_, s13, bit, updater, 13, kOptP ? opts_[13] : 9);
+						if (kInputs > 14) *sp14 = NextState(sp14 - hash_table_, s14, bit, updater, 14, kOptP ? opts_[14] : 9);
+						if (kInputs > 15) *sp15 = NextState(sp15 - hash_table_, s15, bit, updater, 15, kOptP ? opts_[15] : 9);
 					}
 				}
-				if (sse3) {
-					sse3_.update(bit);
-				}
-				if (kBitType != kBitTypeLZP) {
-					match_model_.UpdateBit(bit, true, 7);
+				if (!observer_mode) {
+					if (kUseLZP) {
+						if (kUseLZPSSE) {
+							if (kBitType == kBitTypeLZP) {
+								sse2_.update(bit);
+							} else if (kBitType == kBitTypeNormalSSE) {
+								sse_.update(bit);
+							}
+						}
+					}
+					if (sse3) {
+						sse3_.update(bit);
+					}
+					if (kBitType != kBitTypeLZP) {
+						match_model_.UpdateBit(bit, true, 7);
+					}
 				}
 				if (kStatistics) ++mixer_skip_[ret];
 
@@ -783,10 +788,7 @@ namespace cm {
 					ent.encode(stream, bit, p, kShift);
 				}
 				if (observer_mode) {
-					double p_scaled = (double)p / (double)(1 << kShift);
-					double prob = (bit == 1) ? p_scaled : (1.0 - p_scaled);
-					if (prob < 1e-9) prob = 1e-9;
-					current_entropy += -log2(prob);
+					current_entropy += 1.0;
 				}
         if (bits == 1) {
           // ++ctx_count_[cur_ctx];  // Only for last context.
@@ -1144,7 +1146,9 @@ namespace cm {
       }
 
       if (observer_mode) {
-        if (cow_mode) cow_entropies.push_back(current_entropy); else entropies.push_back(current_entropy);
+        debugLog("pushing current_entropy: " + std::to_string(current_entropy));
+        debugLog("cow_mode = " + std::to_string(cow_mode));
+        if (cow_mode) { entropies.push_back(cow_entropies.size()); cow_entropies.push_back(current_entropy); } else entropies.push_back(current_entropy);
         current_entropy = 0;
         // if (entropies.size() > byte_index + 100) {
         //   std::cout << "Entropies size " << entropies.size() << " exceeds byte_index " << byte_index << " by more than 100" << std::endl;

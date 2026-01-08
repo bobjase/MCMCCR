@@ -530,11 +530,15 @@ int OracleChildMain() {
             VoidWriteStream out_head;
             double transition_cost = 0.0;
             size_t initial_entropies_size = cm.entropies.size();
+            debugLog("head_succ.size() = " + std::to_string(head_succ.size()));
             try {
                 cm.compress(&in_head, &out_head, head_succ.size());
                 debugLog("compress done for succ " + std::to_string(succ));
+                debugLog("after compress, cm.entropies.size() = " + std::to_string(cm.entropies.size()));
                 // Measure cost: sum entropies added during head compression
                 debugLog("Measuring cost for succ " + std::to_string(succ));
+                debugLog("cm.entropies.size() = " + std::to_string(cm.entropies.size()));
+                debugLog("cm.cow_entropies.size() = " + std::to_string(cm.cow_entropies.size()));
                 for (size_t i = initial_entropies_size; i < cm.entropies.size(); ++i) {
                     transition_cost += cm.cow_entropies[static_cast<size_t>(cm.entropies[i])];
                 }
