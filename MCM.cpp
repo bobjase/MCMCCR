@@ -472,6 +472,9 @@ int OracleChildMain() {
         if (fread(&pred_id, sizeof(size_t), 1, stdin) != 1) {
             return 1;
         }
+        if (pred_id >= valid_segments.size()) {
+            return 1;  // Invalid pred_id
+        }
 
         // Read succ_list
         uint64_t num_succ;
@@ -497,38 +500,36 @@ int OracleChildMain() {
         // Get pred data
         size_t start_pred = valid_segments[pred_id].first;
         size_t len_pred = valid_segments[pred_id].second;
-        std::vector<uint8_t> data_pred(file_data.begin() + start_pred, file_data.begin() + start_pred + len_pred);
-
-        // Create CM once
-        cm::CM<8, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
-        // Use full profile for max compression accuracy
-        cm.cur_profile_ = cm::CMProfile();
-        for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
-            cm.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
+        if (start_pred + len_pred > file_data.size()) {
+            return 1;  // Invalid segment
         }
-        cm.cur_profile_.SetMatchModelOrder(12);
-        cm.cur_profile_.SetMinLZPLen(10);
-        cm.observer_mode = true;
-        cm.init();
-        cm.skip_init = true;
-        cm.cow_mode = false;
-
-        // Compress pred data
-        MemoryReadStream in_pred(data_pred);
-        VoidWriteStream out_pred;
-        cm.compress(&in_pred, &out_pred, data_pred.size());
-
-        // Set CoW mode
-        cm.cow_mode = true;
+        std::vector<uint8_t> data_pred(file_data.begin() + start_pred, file_data.begin() + start_pred + len_pred);
 
         // For each succ
         for (size_t succ : succ_list) {
+            if (succ >= valid_segments.size()) continue;  // Invalid succ
             debugLog("Processing succ " + std::to_string(succ) + " for pred " + std::to_string(pred_id));
+
+            // Create CM for this succ
+            cm::CM<8, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
+            // Use full profile for max compression accuracy
+            cm.cur_profile_ = cm::CMProfile();
+            for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
+                cm.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
+            }
+            cm.cur_profile_.SetMatchModelOrder(12);
+            cm.cur_profile_.SetMinLZPLen(10);
+            cm.observer_mode = true;
+            cm.init();
+            cm.skip_init = true;
 
             // Get succ data
             debugLog("Getting succ data for " + std::to_string(succ));
             size_t start_succ = valid_segments[succ].first;
             size_t len_succ = valid_segments[succ].second;
+            if (start_succ + len_succ > file_data.size()) {
+                continue;  // Invalid segment
+            }
             debugLog("succ start: " + std::to_string(start_succ) + ", len: " + std::to_string(len_succ));
             std::vector<uint8_t> data_succ(file_data.begin() + start_succ, file_data.begin() + start_succ + len_succ);
             debugLog("Allocated data_succ for " + std::to_string(succ));
@@ -547,36 +548,34 @@ int OracleChildMain() {
             cm_alone.cur_profile_.SetMatchModelOrder(12);
             cm_alone.cur_profile_.SetMinLZPLen(10);
             cm_alone.observer_mode = true;
+            cm_alone.init();
+            cm_alone.skip_init = true;
             MemoryReadStream in_alone(head_succ);
             VoidWriteStream out_alone;
             cm_alone.compress(&in_alone, &out_alone, head_succ.size());
             double alone_bits = 0.0;
             for (double e : cm_alone.entropies) alone_bits += e;
 
-            // Compress head with CoW
+            // Compress pred data
+            MemoryReadStream in_pred(data_pred);
+            VoidWriteStream out_pred;
+            cm.compress(&in_pred, &out_pred, data_pred.size());
+            double pred_entropy_sum = 0.0;
+            for (double e : cm.entropies) pred_entropy_sum += e;
+
+            // Compress head
             debugLog("Compressing head for succ " + std::to_string(succ));
             MemoryReadStream in_head(head_succ);
             VoidWriteStream out_head;
-            double transition_cost = 0.0;
             double cost = 0.0;
-            size_t initial_entropies_size = cm.entropies.size();
             debugLog("head_succ.size() = " + std::to_string(head_succ.size()));
             try {
                 cm.compress(&in_head, &out_head, head_succ.size());
                 debugLog("compress done for succ " + std::to_string(succ));
-                debugLog("after compress, cm.entropies.size() = " + std::to_string(cm.entropies.size()));
-                // Measure cost: sum entropies added during head compression
-                debugLog("Measuring cost for succ " + std::to_string(succ));
-                debugLog("cm.entropies.size() = " + std::to_string(cm.entropies.size()));
-                debugLog("cm.cow_entropies.size() = " + std::to_string(cm.cow_entropies.size()));
-                for (size_t i = initial_entropies_size; i < cm.entropies.size(); ++i) {
-                    transition_cost += cm.cow_entropies[static_cast<size_t>(cm.entropies[i])];
-                }
-                debugLog("cost calculated for succ " + std::to_string(succ));
+                double total_entropy_sum = 0.0;
+                for (double e : cm.entropies) total_entropy_sum += e;
+                double transition_cost = total_entropy_sum - pred_entropy_sum;
                 debugLog("transition_cost: " + std::to_string(transition_cost) + " for succ " + std::to_string(succ));
-                // Resize back to remove the added entropies
-                cm.entropies.resize(initial_entropies_size);
-                debugLog("resized for succ " + std::to_string(succ));
                 // Compute cost as savings: transition_cost - alone_bits
                 cost = transition_cost - alone_bits;
                 debugLog("cost: " + std::to_string(cost) + " for succ " + std::to_string(succ));
@@ -587,7 +586,6 @@ int OracleChildMain() {
             } catch (...) {
                 debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
                 cost = 1e9;  // High cost to avoid selecting
-                cm.entropies.resize(initial_entropies_size);
                 if (pred_id == 1 && succ == 0) {
                     std::ofstream testfile("test_output.txt", std::ios::app);
                     testfile << "TEST: pred=1 succ=0 exception, cost=1e9" << std::endl;
@@ -638,7 +636,7 @@ int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& fi
     SYSTEM_INFO sysinfo;
     GetSystemInfo(&sysinfo);
     size_t num_cpus = sysinfo.dwNumberOfProcessors;
-    const size_t window_size = num_cpus;  // Use all CPUs for parallelism
+    const size_t window_size = 1;  // Run sequentially to debug failures
     std::cout << "Detected " << num_cpus << " CPUs, using window size " << window_size << std::endl;
     std::vector<std::pair<size_t, std::vector<size_t>>> pred_list(pred_to_succ.begin(), pred_to_succ.end());
     std::vector<HANDLE> processes;
