@@ -1326,37 +1326,47 @@ int main(int argc, char* argv[]) {
     for (float e : entropies) global_avg += e;
     global_avg /= num_bytes;
     std::vector<size_t> to_remove;
-/*    for (size_t i = 1; i < boundaries.size() - 1; ++i) {
+    // --- ATOMIC FUSION (Re-Enabled) ---
+    std::cout << "Running Atomic Fusion (Hot/Cold Check)..." << std::endl;
+    
+    // We need a compressor instance for "Cold" checks
+    // Using a lighter profile for speed, as we just need relative entropy
+    cm::CM<8, false> cold_comp(FrequencyCounter<256>(), options.options_.mem_usage_, false, Detector::kProfileSimple);
+    
+    for (size_t i = 1; i < boundaries.size() - 1; ++i) {
       size_t start_b = boundaries[i];
       size_t end_b = boundaries[i + 1];
       size_t len_b = end_b - start_b;
-      float avg_b = 0;
-      for (size_t j = start_b; j < end_b; ++j) avg_b += entropies[j];
-      avg_b /= len_b;
-      if (avg_b >= global_avg) continue; // skip high-entropy segments
-      // Read segment bytes
-      std::vector<uint8_t> segment_bytes(len_b);
-      original_fin.seek(start_b);
-      size_t read_count = original_fin.read(segment_bytes.data(), len_b);
-      if (read_count != len_b) {
-        std::cerr << "Error reading segment bytes" << std::endl;
-        continue;
-      }
-      // Cold compression
-      cm::CM<12, true, uint32_t> cold_comp(FrequencyCounter<256>(), options.options_.mem_usage_, true, Detector::kProfileText);
-      ReadMemoryStream rms_seg(segment_bytes.data(), segment_bytes.data() + len_b);
-      VoidWriteStream vws_seg;
-      cold_comp.compress(&rms_seg, &vws_seg, len_b);
-      uint64_t cold_bits = vws_seg.tell() * 8;
-      // Hot cost
+      
+      // 1. Calculate "Hot" Cost (Entropy from the continuous Observer run)
       float hot_sum = 0;
       for (size_t j = start_b; j < end_b; ++j) hot_sum += entropies[j];
-      // Check dependency
+      
+      // 2. Calculate "Cold" Cost (Compressing this segment in isolation)
+      // Read segment bytes
+      std::vector<uint8_t> segment_bytes(len_b);
+      fin.seekg(start_b);
+      fin.read(reinterpret_cast<char*>(segment_bytes.data()), len_b);
+      
+      cold_comp.init(); // Reset state
+      MemoryReadStream rms_seg(segment_bytes);
+      VoidWriteStream vws_seg;
+      cold_comp.compress(&rms_seg, &vws_seg, len_b);
+      
+      // Entropy estimate in bits (file size * 8)
+      double cold_bits = vws_seg.tell() * 8.0;
+
+      // 3. The Fusion Decision
+      // If independent compression (Cold) is significantly WORSE (>5%) than 
+      // continuous compression (Hot), then the cut BROKE the context.
+      // We should DELETE this boundary (Merge).
       if (cold_bits > hot_sum * 1.05f) {
         to_remove.push_back(i);
       }
+      
+      if (i % 100 == 0) std::cout << "\rFusion Check: " << i << "/" << boundaries.size() << std::flush;
     }
-*/
+    std::cout << std::endl;
     // Remove boundaries (fuse)
     for (auto it = to_remove.rbegin(); it != to_remove.rend(); ++it) {
       boundaries.erase(boundaries.begin() + *it);
@@ -1439,18 +1449,38 @@ int main(int argc, char* argv[]) {
     // Compute distances and find top-k
     size_t top_k = options.fingerprint_top_k;
     std::vector<std::vector<size_t>> candidates(num_valid);
-    for (size_t i = 0; i < num_valid; ++i) {
+
+    std::cout << "Fingerprinting " << num_valid << " segments on " << omp_get_max_threads() << " threads..." << std::endl;
+
+    // PARALLEL LOOP
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < (int)num_valid; ++i) {
       std::vector<std::pair<float, size_t>> distances;
+      distances.reserve(num_valid);
+      
       for (size_t j = 0; j < num_valid; ++j) {
         if (i == j) continue;
         float dist = hellinger_distance(matrices[i], matrices[j]);
         distances.emplace_back(dist, j);
       }
-      std::sort(distances.begin(), distances.end());
-      for (size_t k = 0; k < std::min(top_k, distances.size()); ++k) {
-        candidates[i].push_back(distances[k].second);
+      
+      // Partial Sort (faster than full sort for just Top-K)
+      if (distances.size() > top_k) {
+          std::partial_sort(distances.begin(), distances.begin() + top_k, distances.end());
+          distances.resize(top_k);
+      } else {
+          std::sort(distances.begin(), distances.end());
+      }
+
+      for (const auto& pair : distances) {
+        candidates[i].push_back(pair.second);
+      }
+      
+      if (i % 100 == 0 && omp_get_thread_num() == 0) {
+          std::cout << "\rProgress: " << i << "/" << num_valid << std::flush;
       }
     }
+    std::cout << std::endl;
 
     // Output .candidates file
     std::string out_file = in_file + ".segments.candidates";
