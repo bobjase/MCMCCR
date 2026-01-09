@@ -636,9 +636,9 @@ int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& fi
     SYSTEM_INFO sysinfo;
     GetSystemInfo(&sysinfo);
     size_t num_cpus = sysinfo.dwNumberOfProcessors;
-    const size_t window_size = 1;  // Run sequentially to debug failures
-    std::cout << "Detected " << num_cpus << " CPUs, using window size " << window_size << std::endl;
     std::vector<std::pair<size_t, std::vector<size_t>>> pred_list(pred_to_succ.begin(), pred_to_succ.end());
+    const size_t window_size = std::min(pred_list.size(), num_cpus);  // Restore parallel processing
+    std::cout << "Detected " << num_cpus << " CPUs, using window size " << window_size << std::endl;
     std::vector<HANDLE> processes;
     std::vector<HANDLE> child_stdout_reads;
     std::vector<HANDLE> child_stderr_reads;
