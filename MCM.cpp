@@ -1267,19 +1267,29 @@ int main(int argc, char* argv[]) {
     ifs.close();
     std::cout << "Read " << formatNumber(num_bytes) << " entropy values, stock size " << formatNumber(stock_size) << std::endl;
 
-    // 1. PERFORM SMOOTHING FIRST (using optimized running sum for O(N))
+    // 1. PERFORM SMOOTHING (Centered Window Fix - eliminates phase lag)
     const size_t window = options.segment_window;
+    size_t half_window = window / 2;
     std::vector<double> smoothed(num_bytes);
-    double running_sum = 0;
-    size_t window_count = 0;
-    
-    // Initial window fill with running sum optimization
+
+    // Step 1: Calculate Trailing Average (existing logic)
+    std::vector<double> trailing(num_bytes);
+    double r_sum = 0;
     for (size_t i = 0; i < num_bytes; ++i) {
-      running_sum += entropies[i];
-      if (i >= window) running_sum -= entropies[i - window];
-      
-      size_t count = std::min(i + 1, window);
-      smoothed[i] = running_sum / count;
+        r_sum += entropies[i];
+        if (i >= window) r_sum -= entropies[i - window];
+        size_t count = std::min(i + 1, window);
+        trailing[i] = r_sum / count;
+    }
+
+    // Step 2: Shift to Fix Phase Lag - center the smoothing window
+    // smoothed[i] takes the value from trailing[i + half_window]
+    for (size_t i = 0; i < num_bytes; ++i) {
+        if (i + half_window < num_bytes) {
+            smoothed[i] = trailing[i + half_window];
+        } else {
+            smoothed[i] = trailing[num_bytes - 1]; // Clamp end
+        }
     }
 
     // 2. CALCULATE STATS ON SMOOTHED DATA (not raw entropies)
