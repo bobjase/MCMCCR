@@ -1825,7 +1825,27 @@ int main(int argc, char* argv[]) {
     for (const auto& c : candidates) total_candidates += c.size();
     std::cout << "Read " << total_candidates << " candidate transitions from oracle" << std::endl;
 
-    std::cout << "Read " << total_candidates << " candidate transitions from oracle" << std::endl;
+    // --- STEP 1: Calculate Donor Scores ---
+    // A negative cost means the predecessor makes the successor smaller (Savings).
+    // We want to find "Universal Donors" (High negative sum).
+    std::vector<double> donor_scores(num_segments, 0.0);
+    for (size_t i = 0; i < num_segments; ++i) {
+        for (const auto& edge : candidates[i]) {
+            // Only count "savings" (negative costs), ignore "pollution" (positive costs)
+            if (edge.cost < 0) {
+                donor_scores[i] += edge.cost;
+            }
+        }
+    }
+    
+    // Debug: Print top donors
+    std::vector<std::pair<double, size_t>> top_donors;
+    for (size_t i = 0; i < num_segments; ++i) top_donors.push_back({donor_scores[i], i});
+    std::sort(top_donors.begin(), top_donors.end()); // Ascending (most negative first)
+    std::cout << "Top 3 Donors: " 
+              << top_donors[0].second << " (" << top_donors[0].first << "), "
+              << top_donors[1].second << " (" << top_donors[1].first << "), "
+              << top_donors[2].second << " (" << top_donors[2].first << ")" << std::endl;
 
     // Beam Search Parameters
     const size_t BEAM_WIDTH = 2000;
@@ -1911,6 +1931,18 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Built " << chains.size() << " chains and found " << orphans.size() << " orphans" << std::endl;
 
+    // --- STEP 2: Sort Chains by Donor Priority ---
+    // We want chains that start with strong donors to be placed earlier in the file.
+    // Score of a chain = Sum of donor scores of all segments in the chain.
+    std::sort(chains.begin(), chains.end(), [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
+        double score_a = 0.0;
+        double score_b = 0.0;
+        for (size_t seg : a) score_a += donor_scores[seg];
+        for (size_t seg : b) score_b += donor_scores[seg];
+        return score_a < score_b; // Ascending (Most negative/savings first)
+    });
+    std::cout << "Sorted " << chains.size() << " chains by Donor Priority." << std::endl;
+
     // Handle orphans: sort by entropy cost ascending
     auto get_cost = [&](size_t seg) -> double {
       if (!entropies.empty()) {
@@ -1925,9 +1957,19 @@ int main(int argc, char* argv[]) {
         return segments[seg].second; // length as proxy
       }
     };
+    // --- STEP 3: Smart Orphan Sort ---
+    // Primary Key: Donor Score (Ascending) -> Put useful segments first.
+    // Secondary Key: Entropy Cost (Ascending) -> Put "Safe" segments before "Noise".
     std::sort(orphans.begin(), orphans.end(), [&](size_t a, size_t b) {
-      return get_cost(a) < get_cost(b);
+        // 1. Primary: Donor Score
+        // Use a small epsilon for float comparison if needed, or just raw verify
+        if (std::abs(donor_scores[a] - donor_scores[b]) > 1e-4) {
+             return donor_scores[a] < donor_scores[b]; // Stronger donor first
+        }
+        // 2. Secondary: Entropy (The existing 'get_cost' logic)
+        return get_cost(a) < get_cost(b);
     });
+    std::cout << "Sorted orphans by Donor Score -> Entropy." << std::endl;
 
     // Build reordered segment list: chains first (in some order), then orphans
     std::vector<size_t> reordered_segments;
