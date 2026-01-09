@@ -62,6 +62,8 @@ std::vector<T> ReadBinary(const std::string& filename) {
 #include <string>
 #include <sstream>
 #include <thread>
+#include <cmath>
+#include <numeric>
 
 #include <omp.h>
 
@@ -1265,33 +1267,47 @@ int main(int argc, char* argv[]) {
     ifs.close();
     std::cout << "Read " << formatNumber(num_bytes) << " entropy values, stock size " << formatNumber(stock_size) << std::endl;
 
-    // Compute entropy stats
-    double min_e = *std::min_element(entropies.begin(), entropies.end());
-    double max_e = *std::max_element(entropies.begin(), entropies.end());
-    double avg_e = std::accumulate(entropies.begin(), entropies.end(), 0.0) / entropies.size();
-    std::cout << "Entropy stats: min=" << min_e << " max=" << max_e << " avg=" << avg_e << std::endl;
-
-    // Smoothing: moving average
+    // 1. PERFORM SMOOTHING FIRST (using optimized running sum for O(N))
     const size_t window = options.segment_window;
     std::vector<double> smoothed(num_bytes);
+    double running_sum = 0;
+    size_t window_count = 0;
+    
+    // Initial window fill with running sum optimization
     for (size_t i = 0; i < num_bytes; ++i) {
-      float sum = 0;
-      size_t count = 0;
-      for (size_t j = (i > window/2 ? i - window/2 : 0); j < std::min(i + window/2 + 1, num_bytes); ++j) {
-        sum += entropies[j];
-        ++count;
-      }
-      smoothed[i] = sum / count;
+      running_sum += entropies[i];
+      if (i >= window) running_sum -= entropies[i - window];
+      
+      size_t count = std::min(i + 1, window);
+      smoothed[i] = running_sum / count;
     }
 
-    // Compute smoothed stats
-    double min_s = *std::min_element(smoothed.begin(), smoothed.end());
-    double max_s = *std::max_element(smoothed.begin(), smoothed.end());
-    double avg_s = std::accumulate(smoothed.begin(), smoothed.end(), 0.0) / smoothed.size();
-    std::cout << "Smoothed stats: min=" << min_s << " max=" << max_s << " avg=" << avg_s << std::endl;
+    // 2. CALCULATE STATS ON SMOOTHED DATA (not raw entropies)
+    double sum = 0.0;
+    for (double v : smoothed) sum += v;
+    double mean = sum / smoothed.size();
+
+    double sq_sum = 0.0;
+    for (double v : smoothed) {
+        sq_sum += (v - mean) * (v - mean);
+    }
+    double stdev = std::sqrt(sq_sum / smoothed.size());
+
+    // 3. AUTO-TUNE THRESHOLD
+    double k_factor = 1.5; 
+    double dynamic_threshold = mean + (k_factor * stdev);
+    
+    // Safety: Ensure we catch strong edges even if the file is very flat
+    // But don't make it unreachable (reduced from 0.5 to 0.2)
+    dynamic_threshold = std::max(dynamic_threshold, mean + 0.2);
+
+    double max_smoothed = *std::max_element(smoothed.begin(), smoothed.end());
+    std::cout << "Auto-Tuning (Smoothed): Mean=" << mean << " StDev=" << stdev 
+              << " -> Dynamic Threshold=" << dynamic_threshold 
+              << " (Max Smoothed=" << max_smoothed << ")" << std::endl;
 
     // Boundary detection: find points where smoothed entropy > threshold
-    const double threshold = options.segment_threshold;  // Minimum entropy value
+    const double threshold = dynamic_threshold;  // Auto-tuned threshold
     const size_t min_segment = options.segment_min_segment;
     const size_t max_segment = options.segment_max_segment;
     std::vector<size_t> boundaries;
@@ -1812,7 +1828,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Read " << total_candidates << " candidate transitions from oracle" << std::endl;
 
     // Beam Search Parameters
-    const size_t BEAM_WIDTH = 10000;
+    const size_t BEAM_WIDTH = 2000;
     const double ORPHAN_PENALTY = 1000.0;  // Heuristic penalty for leaving nodes unconnected
 
     // Initialize beam with one empty state
