@@ -569,21 +569,33 @@ int OracleChildMain(int argc, char* argv[]) {
         memcpy(data_pred.data(), file_data + start_pred, len_pred);
         debugLog("Got pred data");
 
+        // Define CM objects ONCE (performance optimization)
+        cm::CM<8, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
+        // Use full profile for max compression accuracy
+        cm.cur_profile_ = cm::CMProfile();
+        for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
+            cm.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
+        }
+        cm.cur_profile_.SetMatchModelOrder(12);
+        cm.cur_profile_.SetMinLZPLen(10);
+        cm.observer_mode = true;
+
+        cm::CM<8, false> cm_alone(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
+        // Use full profile for max compression accuracy
+        cm_alone.cur_profile_ = cm::CMProfile();
+        for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
+            cm_alone.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
+        }
+        cm_alone.cur_profile_.SetMatchModelOrder(12);
+        cm_alone.cur_profile_.SetMinLZPLen(10);
+        cm_alone.observer_mode = true;
+
         // For each succ
         for (size_t succ : succ_list) {
             if (succ >= valid_segments.size()) continue;  // Invalid succ
             debugLog("Processing succ " + std::to_string(succ) + " for pred " + std::to_string(pred_id));
 
-            // Create CM for this succ
-            cm::CM<8, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
-            // Use full profile for max compression accuracy
-            cm.cur_profile_ = cm::CMProfile();
-            for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
-                cm.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
-            }
-            cm.cur_profile_.SetMatchModelOrder(12);
-            cm.cur_profile_.SetMinLZPLen(10);
-            cm.observer_mode = true;
+            // Fast Reset (performance optimization)
             cm.init();
             cm.skip_init = true;
 
@@ -597,15 +609,7 @@ int OracleChildMain(int argc, char* argv[]) {
             debugLog("Got succ data");
 
             // Compute alone_bits
-            cm::CM<8, false> cm_alone(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
-            // Use full profile for max compression accuracy
-            cm_alone.cur_profile_ = cm::CMProfile();
-            for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
-                cm_alone.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
-            }
-            cm_alone.cur_profile_.SetMatchModelOrder(12);
-            cm_alone.cur_profile_.SetMinLZPLen(10);
-            cm_alone.observer_mode = true;
+            // Fast Reset (performance optimization)
             cm_alone.init();
             cm_alone.skip_init = true;
             MemoryReadStream in_alone(head_succ);
