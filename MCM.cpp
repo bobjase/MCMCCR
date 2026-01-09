@@ -103,7 +103,11 @@ public:
   uint64_t tell() const override { return pos; }
 };
 
+#ifdef NDEBUG
+static constexpr bool kReleaseBuild = true;
+#else
 static constexpr bool kReleaseBuild = false;
+#endif
 
 struct MarkovMatrix {
   float transitions[8][8];
@@ -153,13 +157,7 @@ float hellinger_distance(const MarkovMatrix& m1, const MarkovMatrix& m2) {
 }
 
 static void printHeader() {
-  std::cout
-    << "======================================================================" << std::endl
-    << "mcm compressor v" << Archive::Header::kCurMajorVersion << "." << Archive::Header::kCurMinorVersion
-    << ", by Mathieu Chartier (c)2016 Google Inc." << std::endl
-    << "Experimental, may contain bugs. Contact mathieu.a.chartier@gmail.com" << std::endl
-    << "Special thanks to: Matt Mahoney, Stephan Busch, Christopher Mattern." << std::endl
-    << "======================================================================" << std::endl;
+  std::cout << "MCM compressor" << std::endl;
 }
 
 class Options {
@@ -241,12 +239,16 @@ public:
       << "Examples:" << std::endl
       << "Compress: " << name << " -m9 enwik8 enwik8.mcm" << std::endl
       << "Decompress: " << name << " d enwik8.mcm enwik8.ref" << std::endl;
+    std::cout << std::flush;
     return 0;
   }
 
   int parse(int argc, char* argv[]) {
     assert(argc >= 1);
     std::string program(trimExt(argv[0]));
+    if (argc <= 1) {
+      return usage(program);
+    }
     // Parse options.
     int i = 1;
     bool has_comp_args = false;
@@ -555,14 +557,6 @@ int OracleChildMain(int argc, char* argv[]) {
         }
         debugLog("read succ_list");
 
-        // Test write
-        uint64_t test = 999;
-        debugLog("test " + std::to_string(test));
-
-        // Debug: before CM creation
-        uint64_t step = 1000;
-        debugLog("step " + std::to_string(step));
-
         // Process the pred
         std::map<size_t, std::vector<std::pair<size_t, double>>> succ_costs;
 
@@ -641,17 +635,9 @@ int OracleChildMain(int argc, char* argv[]) {
                 // Compute cost as savings: transition_cost - alone_bits
                 cost = transition_cost - alone_bits;
                 debugLog("cost: " + std::to_string(cost) + " for succ " + std::to_string(succ));
-                if (pred_id == 1 && succ == 0) {
-                    std::ofstream testfile("test_output.txt", std::ios::app);
-                    testfile << "TEST: pred=1 succ=0 alone_bits=" << alone_bits << " transition_cost=" << transition_cost << " cost=" << cost << std::endl;
-                }
             } catch (...) {
                 debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
                 cost = 1e9;  // High cost to avoid selecting
-                if (pred_id == 1 && succ == 0) {
-                    std::ofstream testfile("test_output.txt", std::ios::app);
-                    testfile << "TEST: pred=1 succ=0 exception, cost=1e9" << std::endl;
-                }
             }
 
             succ_costs[succ].emplace_back(pred_id, cost);
@@ -876,9 +862,9 @@ int run_oracle_multiprocess(const char* exe_path, const char* in_file, const std
 }
 
 int main(int argc, char* argv[]) {
-  if (!kReleaseBuild) {
-    RunAllTests();
-  }
+  // if (!kReleaseBuild) {
+  //   RunAllTests();
+  // }
   Options options;
   auto ret = options.parse(argc, argv);
   if (ret) {
@@ -972,6 +958,10 @@ int main(int argc, char* argv[]) {
   case Options::kModeOpt:
   case Options::kModeCompress:
   case Options::kModeTest: {
+    if (options.files.empty()) {
+      options.usage(argv[0]);
+      return 1;
+    }
     printHeader();
 
     int err = 0;
@@ -1187,6 +1177,7 @@ int main(int argc, char* argv[]) {
     break;
   }
   case Options::kModeObserver: {
+    try {
     printHeader();
     std::cout << "Running in Observer Mode" << std::endl;
     // Read the input file
@@ -1194,8 +1185,8 @@ int main(int argc, char* argv[]) {
     uint64_t total_size = 0;
     for (const auto& f : files) {
       File fin;
-      if (fin.open(f.getName(), std::ios_base::in | std::ios_base::binary)) {
-        std::cerr << "Error opening: " << f.getName() << std::endl;
+      if (fin.open(f.getName(), std::ios_base::in | std::ios_base::binary) != 0) {
+        std::cerr << "Error opening: " << f.getName() << " errno: " << errno << std::endl;
         return 1;
       }
       std::cout << "Length of " << f.getName() << ": " << fin.length() << std::endl;
@@ -1214,8 +1205,7 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Read " << pos << " bytes" << std::endl;
     // Create CM
-    cm::CM<8, true> compressor(FrequencyCounter<256>(), 8, true, Detector::kProfileSimple);
-    compressor.cur_profile_ = cm::CMProfile::CreateSimple(8);
+    cm::CM<8, false> compressor(FrequencyCounter<256>(), 8, false, Detector::kProfileSimple);
     compressor.observer_mode = true;
     // Create streams
     ReadMemoryStream rms(buffer.data(), buffer.data() + buffer.size());
@@ -1246,6 +1236,13 @@ int main(int argc, char* argv[]) {
     ofs.write(reinterpret_cast<const char*>(compressor.entropies.data()), num_bytes * sizeof(double));
     ofs.close();
     std::cout << "Wrote " << num_bytes << " entropy values and stock size " << stock_size << " to " << out_file << std::endl;
+    } catch (const std::exception& e) {
+      std::cerr << "Exception in observer: " << e.what() << std::endl;
+      return 1;
+    } catch (...) {
+      std::cerr << "Unknown exception in observer" << std::endl;
+      return 1;
+    }
     break;
   }
   case Options::kModeSegment: {
@@ -1366,7 +1363,7 @@ int main(int argc, char* argv[]) {
       
       if (i % 100 == 0) std::cout << "\rFusion Check: " << i << "/" << boundaries.size() << std::flush;
     }
-    std::cout << std::endl;
+    
     // Remove boundaries (fuse)
     for (auto it = to_remove.rbegin(); it != to_remove.rend(); ++it) {
       boundaries.erase(boundaries.begin() + *it);
@@ -1450,10 +1447,10 @@ int main(int argc, char* argv[]) {
     size_t top_k = options.fingerprint_top_k;
     std::vector<std::vector<size_t>> candidates(num_valid);
 
-    std::cout << "Fingerprinting " << num_valid << " segments on " << omp_get_max_threads() << " threads..." << std::endl;
+    std::cout << "Fingerprinting " << num_valid << " segments..." << std::endl;
 
     // PARALLEL LOOP
-    #pragma omp parallel for schedule(dynamic)
+    // #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < (int)num_valid; ++i) {
       std::vector<std::pair<float, size_t>> distances;
       distances.reserve(num_valid);
@@ -1476,7 +1473,7 @@ int main(int argc, char* argv[]) {
         candidates[i].push_back(pair.second);
       }
       
-      if (i % 100 == 0 && omp_get_thread_num() == 0) {
+      if (i % 100 == 0) {
           std::cout << "\rProgress: " << i << "/" << num_valid << std::flush;
       }
     }
@@ -1775,7 +1772,7 @@ int main(int argc, char* argv[]) {
       double cost;
     };
     std::vector<std::vector<Edge>> candidates(num_segments);
-    std::ifstream oracle_ifs(in_file + ".oracle");
+    std::ifstream oracle_ifs(original_file + ".oracle");
     if (!oracle_ifs) {
       std::cerr << "Error opening oracle file: " << in_file << std::endl;
       return 1;

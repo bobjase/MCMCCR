@@ -29,10 +29,10 @@ echo Phase 5: Pathcover
 "%MCM_EXE%" -pathcover "%INPUT%"
 
 echo Compressing original file
-"%MCM_EXE%" -m9 "%INPUT%" "%BASE%.mcm"
+"%MCM_EXE%" -x11 "%INPUT%" "%BASE%.mcm"
 
 echo Compressing reordered file
-"%MCM_EXE%" -m9 "%INPUT%.reordered" "%BASE%.reordered.mcm"
+"%MCM_EXE%" -x11 "%INPUT%.reordered" "%BASE%.reordered.mcm"
 
 echo Getting file sizes...
 for %%A in ("%BASE%.mcm") do set ORIG_SIZE=%%~zA
