@@ -436,55 +436,124 @@ void se_translator(unsigned int code, EXCEPTION_POINTERS* ep) {
 }
 
 // --- Oracle Child Process Function ---
-int OracleChildMain() {
+int OracleChildMain(int argc, char* argv[]) {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
     setbuf(stdout, NULL);  // Unbuffered
     debugLog("OracleChildMain start");
     HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
+    HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD written;
     try {
-        // Read file_data from stdin
-        uint64_t file_size;
-        if (fread(&file_size, sizeof(uint64_t), 1, stdin) != 1) {
+        if (argc < 6) {
+            debugLog("Error: argc < 6");
             return 1;
         }
-        std::vector<uint8_t> file_data(file_size);
-        if (file_size > 0 && fread(file_data.data(), sizeof(uint8_t), file_size, stdin) != file_size) {
+        std::string original_file = argv[4];
+        std::string segments_file = argv[5];
+
+        // Memory map segments file
+        HANDLE hSegFile = CreateFileA(segments_file.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hSegFile == INVALID_HANDLE_VALUE) {
+            debugError("CreateFile failed for segments file: " + segments_file);
+            return 1;
+        }
+        LARGE_INTEGER segFileSize;
+        if (!GetFileSizeEx(hSegFile, &segFileSize)) {
+            debugError("GetFileSizeEx failed for segments file");
+            CloseHandle(hSegFile);
+            return 1;
+        }
+        HANDLE hSegMapping = CreateFileMapping(hSegFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (hSegMapping == NULL) {
+            debugError("CreateFileMapping failed for segments");
+            CloseHandle(hSegFile);
+            return 1;
+        }
+        LPVOID pSegView = MapViewOfFile(hSegMapping, FILE_MAP_READ, 0, 0, 0);
+        if (pSegView == NULL) {
+            debugError("MapViewOfFile failed for segments");
+            CloseHandle(hSegMapping);
+            CloseHandle(hSegFile);
+            return 1;
+        }
+        std::string seg_content((char*)pSegView, segFileSize.QuadPart);
+        std::istringstream seg_iss(seg_content);
+        uint64_t num_segments;
+        seg_iss >> num_segments;
+        debugLog("num_segments: " + std::to_string(num_segments));
+        std::vector<std::pair<size_t, size_t>> valid_segments(num_segments);
+        debugLog("valid_segments resized");
+        for (auto& seg : valid_segments) {
+            seg_iss >> seg.first >> seg.second;
+        }
+        debugLog("read valid_segments");
+        // Unmap segments
+        UnmapViewOfFile(pSegView);
+        CloseHandle(hSegMapping);
+        CloseHandle(hSegFile);
+        debugLog("segments file unmapped");
+
+        // Memory map original file
+        HANDLE hFile = CreateFileA(original_file.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            debugError("CreateFile failed for " + original_file);
             return 1;
         }
 
-        // Read valid_segments
-        uint64_t num_segments;
-        if (fread(&num_segments, sizeof(uint64_t), 1, stdin) != 1) {
+        HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (hMapping == NULL) {
+            debugError("CreateFileMapping failed");
+            CloseHandle(hFile);
             return 1;
         }
-        std::vector<std::pair<size_t, size_t>> valid_segments(num_segments);
-        for (auto& seg : valid_segments) {
-            if (fread(&seg.first, sizeof(size_t), 1, stdin) != 1 ||
-                fread(&seg.second, sizeof(size_t), 1, stdin) != 1) {
-                return 1;
-            }
+
+        LPVOID pView = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        if (pView == NULL) {
+            debugError("MapViewOfFile failed");
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
+            return 1;
         }
+        char* file_data = (char*)pView;
 
         // Read pred_id
         size_t pred_id;
         if (fread(&pred_id, sizeof(size_t), 1, stdin) != 1) {
+            debugLog("Failed to read pred_id");
+            UnmapViewOfFile(pView);
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
             return 1;
         }
+        debugLog("read pred_id: " + std::to_string(pred_id));
         if (pred_id >= valid_segments.size()) {
+            debugLog("Invalid pred_id");
+            UnmapViewOfFile(pView);
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
             return 1;  // Invalid pred_id
         }
 
         // Read succ_list
         uint64_t num_succ;
         if (fread(&num_succ, sizeof(uint64_t), 1, stdin) != 1) {
+            debugLog("Failed to read num_succ");
+            UnmapViewOfFile(pView);
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
             return 1;
         }
+        debugLog("read num_succ: " + std::to_string(num_succ));
         std::vector<size_t> succ_list(num_succ);
         if (num_succ > 0 && fread(succ_list.data(), sizeof(size_t), num_succ, stdin) != num_succ) {
+            debugLog("Failed to read succ_list");
+            UnmapViewOfFile(pView);
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
             return 1;
         }
+        debugLog("read succ_list");
 
         // Test write
         uint64_t test = 999;
@@ -500,10 +569,9 @@ int OracleChildMain() {
         // Get pred data
         size_t start_pred = valid_segments[pred_id].first;
         size_t len_pred = valid_segments[pred_id].second;
-        if (start_pred + len_pred > file_data.size()) {
-            return 1;  // Invalid segment
-        }
-        std::vector<uint8_t> data_pred(file_data.begin() + start_pred, file_data.begin() + start_pred + len_pred);
+        std::vector<uint8_t> data_pred(len_pred);
+        memcpy(data_pred.data(), file_data + start_pred, len_pred);
+        debugLog("Got pred data");
 
         // For each succ
         for (size_t succ : succ_list) {
@@ -527,16 +595,10 @@ int OracleChildMain() {
             debugLog("Getting succ data for " + std::to_string(succ));
             size_t start_succ = valid_segments[succ].first;
             size_t len_succ = valid_segments[succ].second;
-            if (start_succ + len_succ > file_data.size()) {
-                continue;  // Invalid segment
-            }
-            debugLog("succ start: " + std::to_string(start_succ) + ", len: " + std::to_string(len_succ));
-            std::vector<uint8_t> data_succ(file_data.begin() + start_succ, file_data.begin() + start_succ + len_succ);
-            debugLog("Allocated data_succ for " + std::to_string(succ));
-            size_t head_len = std::min((size_t)10240, data_succ.size());
-            debugLog("head_len: " + std::to_string(head_len));
-            std::vector<uint8_t> head_succ(data_succ.begin(), data_succ.begin() + head_len);
-            debugLog("Allocated head_succ for " + std::to_string(succ));
+            size_t head_len = std::min((size_t)10240, len_succ);
+            std::vector<uint8_t> head_succ(head_len);
+            memcpy(head_succ.data(), file_data + start_succ, head_len);
+            debugLog("Got succ data");
 
             // Compute alone_bits
             cm::CM<8, false> cm_alone(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
@@ -616,6 +678,9 @@ int OracleChildMain() {
         }
         debugLog("after writing results");
         debugLog("OracleChildMain end");
+        UnmapViewOfFile(pView);
+        CloseHandle(hMapping);
+        CloseHandle(hFile);
         return 0;
     } catch (const std::bad_alloc& e) {
         return 1;
@@ -630,8 +695,15 @@ int OracleChildMain() {
     }
 }
 
-int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& file_data, const std::vector<std::pair<size_t, size_t>>& valid_segments, const std::map<size_t, std::vector<size_t>>& pred_to_succ, std::vector<std::vector<std::pair<size_t, double>>>& pred_costs) {
+int run_oracle_multiprocess(const char* exe_path, const char* in_file, const std::vector<uint8_t>& file_data, const std::vector<std::pair<size_t, size_t>>& valid_segments, const std::map<size_t, std::vector<size_t>>& pred_to_succ, std::vector<std::vector<std::pair<size_t, double>>>& pred_costs) {
     debugLog("run_oracle_multiprocess start");
+    // Get full path
+    char full_path[MAX_PATH];
+    if (!GetFullPathNameA(in_file, MAX_PATH, full_path, NULL)) {
+        std::cerr << "Failed to get full path for " << in_file << std::endl;
+        return 1;
+    }
+    std::string full_in_file = full_path;
     // Detect number of CPUs
     SYSTEM_INFO sysinfo;
     GetSystemInfo(&sysinfo);
@@ -695,7 +767,7 @@ int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& fi
             si.hStdError = hChildStderrWrite;
 
             PROCESS_INFORMATION pi;
-            std::string cmd = "mcm.exe -oracle-child";
+            std::string cmd = std::string(exe_path) + " -oracle-child " + std::to_string(pred) + " " + std::to_string(file_data.size()) + " " + full_in_file + " " + in_file + ".segments";
             if (!CreateProcess(NULL, const_cast<char*>(cmd.c_str()), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
                 std::cerr << "Failed to create process for pred " << pred << std::endl;
                 CloseHandle(hChildStdinRead);
@@ -715,17 +787,6 @@ int run_oracle_multiprocess(const char* exe_path, const std::vector<uint8_t>& fi
 
             // Write data to child's stdin
             DWORD written;
-            uint64_t file_size = file_data.size();
-            WriteFile(hChildStdinWrite, &file_size, sizeof(uint64_t), &written, NULL);
-            WriteFile(hChildStdinWrite, file_data.data(), file_data.size(), &written, NULL);
-
-            uint64_t num_seg = valid_segments.size();
-            WriteFile(hChildStdinWrite, &num_seg, sizeof(uint64_t), &written, NULL);
-            for (const auto& seg : valid_segments) {
-                WriteFile(hChildStdinWrite, &seg.first, sizeof(size_t), &written, NULL);
-                WriteFile(hChildStdinWrite, &seg.second, sizeof(size_t), &written, NULL);
-            }
-
             WriteFile(hChildStdinWrite, &pred, sizeof(size_t), &written, NULL);
 
             uint64_t num_succ = succ_list.size();
@@ -826,7 +887,7 @@ int main(int argc, char* argv[]) {
   }
   switch (options.mode) {
   case Options::kModeOracleChild:
-    return OracleChildMain();
+    return OracleChildMain(argc, argv);
   case Options::kModeMemTest: {
     constexpr size_t kCompIterations = kIsDebugBuild ? 1 : 1;
     constexpr size_t kDecompIterations = kIsDebugBuild ? 1 : 25;
@@ -1419,9 +1480,9 @@ int main(int argc, char* argv[]) {
       std::cerr << "Usage: mcm -oracle <original_file>" << std::endl;
       return 1;
     }
-    std::string in_file = std::string(argv[2]) + ".segments";
+    std::string in_file = argv[2];
     std::cout << "in_file: " << in_file << std::endl;
-    std::ifstream ifs(in_file + ".candidates");
+    std::ifstream ifs(in_file + ".segments.candidates");
     std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
     ifs.close();
     content.erase(std::remove(content.begin(), content.end(), '\r'), content.end());
@@ -1454,7 +1515,7 @@ int main(int argc, char* argv[]) {
     if (candidates.size() > 0) std::cout << "candidates[0].size() = " << candidates[0].size() << std::endl;
 
     // Determine segments file
-    std::string segments_file = in_file; // remove .candidates
+    std::string segments_file = in_file + ".segments";
     std::cout << "segments_file: " << segments_file << std::endl;
     std::ifstream seg_ifs(segments_file);
     if (!seg_ifs) {
@@ -1470,7 +1531,7 @@ int main(int argc, char* argv[]) {
     seg_ifs.close();
 
     // Load original file
-    std::string original_file = in_file.substr(0, in_file.find_last_of('.'));
+    std::string original_file = in_file;
     std::cout << "original_file: " << original_file << std::endl;
     std::ifstream fin(original_file, std::ios::binary);
     if (!fin) {
@@ -1523,7 +1584,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Number of pred to process: " << pred_to_succ.size() << std::endl << std::flush;
 
     // Use multi-process approach
-    int ret = run_oracle_multiprocess(argv[0], file_data, valid_segments, pred_to_succ, pred_costs);
+    int ret = run_oracle_multiprocess(argv[0], in_file.c_str(), file_data, valid_segments, pred_to_succ, pred_costs);
     if (ret != 0) {
       std::cerr << "Multi-process oracle failed" << std::endl;
       return ret;

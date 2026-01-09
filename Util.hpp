@@ -586,4 +586,9 @@ inline void debugLog(const std::string& msg) {
     file << msg << std::endl;
 }
 
+inline void debugError(const std::string& msg) {
+    static std::ofstream file("debug_error.txt", std::ios::app);
+    file << msg << std::endl;
+}
+
 #endif
