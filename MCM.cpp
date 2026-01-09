@@ -1353,51 +1353,8 @@ int main(int argc, char* argv[]) {
     for (float e : entropies) global_avg += e;
     global_avg /= num_bytes;
     std::vector<size_t> to_remove;
-    // --- ATOMIC FUSION (Re-Enabled) ---
-    std::cout << "Running Atomic Fusion (Hot/Cold Check)..." << std::endl;
-    
-    // We need a compressor instance for "Cold" checks
-    // Using a lighter profile for speed, as we just need relative entropy
-    cm::CM<8, false> cold_comp(FrequencyCounter<256>(), options.options_.mem_usage_, false, Detector::kProfileSimple);
-    
-    for (size_t i = 1; i < boundaries.size() - 1; ++i) {
-      size_t start_b = boundaries[i];
-      size_t end_b = boundaries[i + 1];
-      size_t len_b = end_b - start_b;
-      
-      // 1. Calculate "Hot" Cost (Entropy from the continuous Observer run)
-      float hot_sum = 0;
-      for (size_t j = start_b; j < end_b; ++j) hot_sum += entropies[j];
-      
-      // 2. Calculate "Cold" Cost (Compressing this segment in isolation)
-      // Read segment bytes
-      std::vector<uint8_t> segment_bytes(len_b);
-      fin.seekg(start_b);
-      fin.read(reinterpret_cast<char*>(segment_bytes.data()), len_b);
-      
-      cold_comp.init(); // Reset state
-      MemoryReadStream rms_seg(segment_bytes);
-      VoidWriteStream vws_seg;
-      cold_comp.compress(&rms_seg, &vws_seg, len_b);
-      
-      // Entropy estimate in bits (file size * 8)
-      double cold_bits = vws_seg.tell() * 8.0;
-
-      // 3. The Fusion Decision
-      // If independent compression (Cold) is significantly WORSE (>5%) than 
-      // continuous compression (Hot), then the cut BROKE the context.
-      // We should DELETE this boundary (Merge).
-      if (cold_bits > hot_sum * 1.05f) {
-        to_remove.push_back(i);
-      }
-      
-      if (i % 100 == 0) std::cout << "\rFusion Check: " << i << "/" << boundaries.size() << std::flush;
-    }
-    
-    // Remove boundaries (fuse)
-    for (auto it = to_remove.rbegin(); it != to_remove.rend(); ++it) {
-      boundaries.erase(boundaries.begin() + *it);
-    }
+// --- ATOMIC FUSION (Disabled - Using Raw Segmentation) ---
+    std::cout << "Skipping Atomic Fusion (Using Raw Centered Window Segmentation)..." << std::endl;
 
     // Output segments
     std::string out_file = in_file + ".segments";
