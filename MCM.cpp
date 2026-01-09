@@ -1842,10 +1842,12 @@ int main(int argc, char* argv[]) {
     std::vector<std::pair<double, size_t>> top_donors;
     for (size_t i = 0; i < num_segments; ++i) top_donors.push_back({donor_scores[i], i});
     std::sort(top_donors.begin(), top_donors.end()); // Ascending (most negative first)
-    std::cout << "Top 3 Donors: " 
-              << top_donors[0].second << " (" << top_donors[0].first << "), "
-              << top_donors[1].second << " (" << top_donors[1].first << "), "
-              << top_donors[2].second << " (" << top_donors[2].first << ")" << std::endl;
+    if (top_donors.size() >= 3) {
+        std::cout << "Top 3 Donors: " 
+                  << top_donors[0].second << " (" << top_donors[0].first << "), "
+                  << top_donors[1].second << " (" << top_donors[1].first << "), "
+                  << top_donors[2].second << " (" << top_donors[2].first << ")" << std::endl;
+    }
 
     // Beam Search Parameters
     const size_t BEAM_WIDTH = 2000;
