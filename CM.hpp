@@ -729,7 +729,7 @@ namespace cm {
 				dcheck(bit < 2);
 
 				bool ret = false;
-				if (!observer_mode) {
+				{
 					const size_t kLimit = kMaxLearn - 1;
 					const size_t kDelta = 5;
 					// Returns false if we skipped the update due to a low error, should happen moderately frequently on highly compressible files.
@@ -764,7 +764,7 @@ namespace cm {
 						if (kInputs > 15) *sp15 = NextState(sp15 - hash_table_, s15, bit, updater, 15, kOptP ? opts_[15] : 9);
 					}
 				}
-				if (!observer_mode) {
+				{
 					if (kUseLZP) {
 						if (kUseLZPSSE) {
 							if (kBitType == kBitTypeLZP) {
