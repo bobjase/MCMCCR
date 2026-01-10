@@ -1308,7 +1308,7 @@ int main(int argc, char* argv[]) {
     double stdev = std::sqrt(sq_sum / smoothed.size());
 
     // 3. AUTO-TUNE THRESHOLD
-    double k_factor = 1.5; 
+    double k_factor = 0.7; 
     double dynamic_threshold = mean + (k_factor * stdev);
     
     // Safety: Ensure we catch strong edges even if the file is very flat
@@ -1320,20 +1320,72 @@ int main(int argc, char* argv[]) {
               << " -> Dynamic Threshold=" << dynamic_threshold 
               << " (Max Smoothed=" << max_smoothed << ")" << std::endl;
 
-    // Boundary detection: find points where smoothed entropy > threshold
+    // Boundary detection: find local maxima in smoothed entropy where > threshold
     const double threshold = dynamic_threshold;  // Auto-tuned threshold
     const size_t min_segment = options.segment_min_segment;
     const size_t max_segment = options.segment_max_segment;
     std::vector<size_t> boundaries;
     boundaries.push_back(0);
-    for (size_t i = 1; i < num_bytes; ++i) {
-      if (i - boundaries.back() >= max_segment || (smoothed[i] > threshold && i - boundaries.back() >= min_segment)) {
+    for (size_t i = 1; i < num_bytes - 1; ++i) {
+      if (i - boundaries.back() >= max_segment || ((smoothed[i] > smoothed[i-1] && smoothed[i] > smoothed[i+1] && smoothed[i] > threshold) && i - boundaries.back() >= min_segment)) {
         boundaries.push_back(i);
       }
     }
     boundaries.push_back(num_bytes);
 
     std::cout << "Boundaries size: " << boundaries.size() << std::endl;
+
+    // --- STEP 4: EDGE REFINEMENT (The "Beat Detector") ---
+    // The smoothing window gives us the "Neighborhood", but blurs the "Address".
+    // We now use a "Matched Filter" (Step Function) to snap to the exact transition.
+    
+    std::cout << "Refining " << boundaries.size() << " boundaries..." << std::endl;
+    // Parameters for the Matched Filter
+    const int kSearchRadius = 1024; // Look +/- 1024 bytes around the rough cut
+    const int kKernelSize = 64;    // Compare Avg of 64 bytes Future vs 64 bytes Past
+
+    for (size_t i = 1; i < boundaries.size() - 1; ++i) {
+        size_t rough_idx = boundaries[i];
+        
+        // Define search range (clamped to file bounds)
+        size_t search_start = (rough_idx > kSearchRadius) ? rough_idx - kSearchRadius : 0;
+        size_t search_end = std::min((size_t)num_bytes, rough_idx + kSearchRadius);
+        
+        double max_contrast = -1.0;
+        size_t best_idx = rough_idx;
+
+        // Scan the neighborhood to maximize Contrast
+        for (size_t curr = search_start; curr < search_end; ++curr) {
+            // Safety check: ensure kernel fits inside the file
+            if (curr < kKernelSize || curr + kKernelSize >= num_bytes) continue;
+
+            // Calculate "Contrast" (Difference between Future and Past Entropy)
+            // This acts as a "Step Edge" detector.
+            double sum_left = 0.0;
+            double sum_right = 0.0;
+            
+            // Note: Using raw 'entropies' here, NOT 'smoothed', for maximum precision.
+            for (int k = 1; k <= kKernelSize; ++k) {
+                sum_left += entropies[curr - k];  // Past
+                sum_right += entropies[curr + k]; // Future
+            }
+            
+            double contrast = std::abs(sum_right - sum_left);
+            
+            // Peak Detection
+            if (contrast > max_contrast) {
+                max_contrast = contrast;
+                best_idx = curr;
+            }
+        }
+        
+        // Snap to the sharpest edge
+        if (best_idx != rough_idx) {
+             // Optional debug: if (abs((int)best_idx - (int)rough_idx) > 5) std::cout << "Snapped " << rough_idx << " -> " << best_idx << std::endl;
+             boundaries[i] = best_idx;
+        }
+    }
+    std::cout << "Boundaries refined (Snapped to Entropy Cliffs)." << std::endl;
 
     // Atomic Fusion: Hot/Cold Dependency Check
     std::string original_file = std::string(argv[2]);
