@@ -899,7 +899,10 @@ int run_oracle_multiprocess(const char* exe_path, const char* in_file, const std
             const auto& pair = pred_list[pred_index];
             size_t pred = pair.first;
             const std::vector<size_t>& succ_list = pair.second;
-            std::cout << "Launching pred " << pred << " with " << succ_list.size() << " succ" << std::endl;
+            // Progress indicator
+            double progress = (pred_index + 1.0) / pred_list.size() * 100.0;
+            std::cout << "\rLaunching: " << std::fixed << std::setprecision(1) << progress 
+                      << "% (" << (pred_index + 1) << "/" << pred_list.size() << " preds)" << std::flush;
 
             // Create pipes for child's stdin
             HANDLE hChildStdinRead, hChildStdinWrite;
@@ -1884,6 +1887,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Wrote oracle results to " << out_file << std::endl << std::flush;
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;
+    std::cout << std::endl;  // Clear progress line
     std::cout << "Oracle processing completed in " << elapsed.count() << " seconds" << std::endl;
     break;
   }
