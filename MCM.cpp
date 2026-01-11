@@ -2655,18 +2655,19 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     if (!reordered_segments.empty()) {
-      size_t current = reordered_segments[0];
+      size_t current_start = reordered_segments[0]; // Renamed for clarity
       size_t count = 1;
       for (size_t i = 1; i < reordered_segments.size(); ++i) {
-        if (reordered_segments[i] == current) {
+        // CHECK SEQUENTIALITY: Is this segment exactly 1 greater than the previous?
+        if (reordered_segments[i] == current_start + count) {
           count++;
         } else {
-          iofs << current << "," << count << std::endl;
-          current = reordered_segments[i];
+          iofs << current_start << "," << count << std::endl;
+          current_start = reordered_segments[i];
           count = 1;
         }
       }
-      iofs << current << "," << count << std::endl;
+      iofs << current_start << "," << count << std::endl;
     }
     iofs.close();
     std::cout << "Wrote RLE index to " << index_file << std::endl;
