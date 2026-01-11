@@ -2091,6 +2091,14 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    // Beam Search Parameters
+    const size_t BEAM_WIDTH = 2000;
+    const double ORPHAN_PENALTY = 1000.0;
+    
+    // RED TEAM FIX: Threshold is in TOTAL BITS. 
+    // 2.0 was too small. We require ~64 bytes (512 bits) of savings to justify a jump.
+    const double FUSION_THRESHOLD = 512.0;
+    
     // Debug: Print top donors
     std::vector<std::pair<double, size_t>> top_donors;
     for (size_t i = 0; i < num_segments; ++i) top_donors.push_back({donor_scores[i], i});
@@ -2102,13 +2110,31 @@ int main(int argc, char* argv[]) {
                   << top_donors[2].second << " (" << top_donors[2].first << ")" << std::endl;
     }
 
-    // Beam Search Parameters
-    const size_t BEAM_WIDTH = 2000;
-    const double ORPHAN_PENALTY = 1000.0;
-    
+    // --- GRAPH OPTIMIZATION: Pre-compute allowed fusions with adjusted costs ---
+    std::vector<std::vector<Edge>> allowed_fusions(num_segments);
+    for (size_t pred = 0; pred < num_segments; ++pred) {
+      for (const auto& edge : candidates[pred]) {
+        size_t succ = edge.to;
+        double cost = edge.cost;
+        bool is_natural = (succ == pred + 1);
+        double adjusted_cost = cost;
+        
+        if (is_natural) {
+          // Apply incumbency bonus
+          double bonus = (cost < 0) ? (cost * 0.10) : -500.0;
+          adjusted_cost += bonus;
+        } else {
+          // For non-natural, only allow if significant savings
+          if (cost > -FUSION_THRESHOLD) continue;
+        }
+        
+        allowed_fusions[pred].push_back({succ, adjusted_cost});
+      }
+    }
+    std::cout << "Pre-computed allowed fusions for graph optimization" << std::endl;
+
     // RED TEAM FIX: Threshold is in TOTAL BITS. 
     // 2.0 was too small. We require ~64 bytes (512 bits) of savings to justify a jump.
-    const double FUSION_THRESHOLD = 512.0;
 
     // Natural Baseline Fusion: Calculate natural order cost baseline
     double natural_cost = 0.0;
@@ -2146,20 +2172,12 @@ int main(int argc, char* argv[]) {
           next_beam_candidates.push_back(std::move(new_state));
         }
         
-        // Option 2: Try linking to candidates (Smart Fusion)
-        for (const auto& edge : candidates[current_node]) {
+        // Option 2: Try linking to allowed fusions (pre-filtered and adjusted)
+        for (const auto& edge : allowed_fusions[current_node]) {
           size_t succ = edge.to;
           double cost = edge.cost;
           
-          // Natural Baseline Fusion: Only fuse if significant improvement over natural
-          // For natural transitions (current_node + 1 == succ), always allow
-          // For non-natural transitions, require >0.5 bits/byte improvement
-          bool is_natural = (succ == current_node + 1);
-          if (!is_natural && cost > -FUSION_THRESHOLD) {
-            continue;  // Skip fusions that don't provide enough benefit
-          }
-          
-          // Check validity
+          // Check validity (pre-computed fusions are already valid candidates)
           if (state.prev_segment[succ] != -1) continue;  // succ already has predecessor
           if (state.find_set(current_node) == state.find_set(succ)) continue;  // would create cycle
           
@@ -2168,15 +2186,6 @@ int main(int argc, char* argv[]) {
           new_state.next_segment[current_node] = succ;
           new_state.prev_segment[succ] = current_node;
           new_state.union_sets(current_node, succ);
-
-          // INCUMBENCY BONUS: Strongly reward keeping the file continuous.
-          if (is_natural) {
-              // Bonus: Free 10% savings + 500 bits constant reward
-              // (Assuming cost is negative savings)
-              double bonus = (cost < 0) ? (cost * 0.10) : -500.0;
-              cost += bonus;
-          }
-
           new_state.total_cost += cost;
           next_beam_candidates.push_back(std::move(new_state));
         }
