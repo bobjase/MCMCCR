@@ -62,6 +62,8 @@ std::vector<T> ReadBinary(const std::string& filename) {
 #include <string>
 #include <sstream>
 #include <thread>
+#include <atomic>
+#include <mutex>
 #include <cmath>
 #include <numeric>
 
@@ -634,12 +636,12 @@ int OracleChildMain(int argc, char* argv[]) {
     HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD written;
     try {
-        if (argc < 6) {
-            debugLog("Error: argc < 6");
+        if (argc < 4) {
+            debugLog("Error: argc < 4");
             return 1;
         }
-        std::string original_file = argv[4];
-        std::string segments_file = argv[5];
+        std::string original_file = argv[2];
+        std::string segments_file = argv[3];
 
         // Memory map segments file
         HANDLE hSegFile = CreateFileA(segments_file.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -690,6 +692,14 @@ int OracleChildMain(int argc, char* argv[]) {
             return 1;
         }
 
+        LARGE_INTEGER fileSize;
+        if (!GetFileSizeEx(hFile, &fileSize)) {
+            debugError("GetFileSizeEx failed");
+            CloseHandle(hFile);
+            return 1;
+        }
+        size_t file_size = fileSize.QuadPart;
+
         HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
         if (hMapping == NULL) {
             debugError("CreateFileMapping failed");
@@ -706,53 +716,16 @@ int OracleChildMain(int argc, char* argv[]) {
         }
         char* file_data = (char*)pView;
 
-        // Read pred_id
-        size_t pred_id;
-        if (fread(&pred_id, sizeof(size_t), 1, stdin) != 1) {
-            debugLog("Failed to read pred_id");
-            UnmapViewOfFile(pView);
-            CloseHandle(hMapping);
-            CloseHandle(hFile);
-            return 1;
+        // Adjust valid_segments for file size
+        for (auto& p : valid_segments) {
+            size_t start = p.first;
+            size_t len = p.second;
+            if (start >= file_size || len == 0) continue;
+            if (start + len > file_size) {
+                len = file_size - start;
+                p.second = len;
+            }
         }
-        debugLog("read pred_id: " + std::to_string(pred_id));
-        if (pred_id >= valid_segments.size()) {
-            debugLog("Invalid pred_id");
-            UnmapViewOfFile(pView);
-            CloseHandle(hMapping);
-            CloseHandle(hFile);
-            return 1;  // Invalid pred_id
-        }
-
-        // Read succ_list
-        uint64_t num_succ;
-        if (fread(&num_succ, sizeof(uint64_t), 1, stdin) != 1) {
-            debugLog("Failed to read num_succ");
-            UnmapViewOfFile(pView);
-            CloseHandle(hMapping);
-            CloseHandle(hFile);
-            return 1;
-        }
-        debugLog("read num_succ: " + std::to_string(num_succ));
-        std::vector<size_t> succ_list(num_succ);
-        if (num_succ > 0 && fread(succ_list.data(), sizeof(size_t), num_succ, stdin) != num_succ) {
-            debugLog("Failed to read succ_list");
-            UnmapViewOfFile(pView);
-            CloseHandle(hMapping);
-            CloseHandle(hFile);
-            return 1;
-        }
-        debugLog("read succ_list");
-
-        // Process the pred
-        std::map<size_t, std::vector<std::pair<size_t, double>>> succ_costs;
-
-        // Get pred data
-        size_t start_pred = valid_segments[pred_id].first;
-        size_t len_pred = valid_segments[pred_id].second;
-        std::vector<uint8_t> data_pred(len_pred);
-        memcpy(data_pred.data(), file_data + start_pred, len_pred);
-        debugLog("Got pred data");
 
         // Define CM objects ONCE (performance optimization)
         cm::CM<8, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
@@ -775,84 +748,130 @@ int OracleChildMain(int argc, char* argv[]) {
         cm_alone.cur_profile_.SetMinLZPLen(10);
         cm_alone.observer_mode = true;
 
-        // For each succ
-        for (size_t succ : succ_list) {
-            if (succ >= valid_segments.size()) continue;  // Invalid succ
-            debugLog("Processing succ " + std::to_string(succ) + " for pred " + std::to_string(pred_id));
-
-            // Fast Reset (performance optimization)
-            cm.init();
-            cm.skip_init = true;
-
-            // Get succ data
-            debugLog("Getting succ data for " + std::to_string(succ));
-            size_t start_succ = valid_segments[succ].first;
-            size_t len_succ = valid_segments[succ].second;
-            size_t head_len = std::min((size_t)10240, len_succ);
-            std::vector<uint8_t> head_succ(head_len);
-            memcpy(head_succ.data(), file_data + start_succ, head_len);
-            debugLog("Got succ data");
-
-            // Compute alone_bits
-            // Fast Reset (performance optimization)
-            cm_alone.init();
-            cm_alone.skip_init = true;
-            MemoryReadStream in_alone(head_succ);
-            VoidWriteStream out_alone;
-            cm_alone.compress(&in_alone, &out_alone, head_succ.size());
-            double alone_bits = 0.0;
-            for (double e : cm_alone.entropies) alone_bits += e;
-
-            // Compress pred data
-            MemoryReadStream in_pred(data_pred);
-            VoidWriteStream out_pred;
-            cm.compress(&in_pred, &out_pred, data_pred.size());
-            double pred_entropy_sum = 0.0;
-            for (double e : cm.entropies) pred_entropy_sum += e;
-
-            // Compress head
-            debugLog("Compressing head for succ " + std::to_string(succ));
-            MemoryReadStream in_head(head_succ);
-            VoidWriteStream out_head;
-            double cost = 0.0;
-            debugLog("head_succ.size() = " + std::to_string(head_succ.size()));
-            try {
-                cm.compress(&in_head, &out_head, head_succ.size());
-                debugLog("compress done for succ " + std::to_string(succ));
-                double total_entropy_sum = 0.0;
-                for (double e : cm.entropies) total_entropy_sum += e;
-                double transition_cost = total_entropy_sum - pred_entropy_sum;
-                debugLog("transition_cost: " + std::to_string(transition_cost) + " for succ " + std::to_string(succ));
-                // Compute cost as savings: transition_cost - alone_bits
-                cost = transition_cost - alone_bits;
-                debugLog("cost: " + std::to_string(cost) + " for succ " + std::to_string(succ));
-            } catch (...) {
-                debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
-                cost = 1e9;  // High cost to avoid selecting
+        // Worker loop
+        while (true) {
+            // Read pred_id
+            size_t pred_id;
+            if (fread(&pred_id, sizeof(size_t), 1, stdin) != 1) {
+                debugLog("Failed to read pred_id, exiting");
+                break;
+            }
+            debugLog("read pred_id: " + std::to_string(pred_id));
+            if (pred_id >= valid_segments.size()) {
+                debugLog("Invalid pred_id");
+                continue;
             }
 
-            succ_costs[succ].emplace_back(pred_id, cost);
-            debugLog("emplaced for succ " + std::to_string(succ));
-            debugLog("Emplaced cost for succ " + std::to_string(succ));
-        }
-
-        debugLog("loop end");
-        // Channel separation: stdout for data, stderr for debug
-        debugLog("before writing results");
-        uint64_t num_results = succ_costs.size();
-        WriteFile(hStdout, &num_results, sizeof(uint64_t), &written, NULL);
-        for (const auto& succ_pair : succ_costs) {
-            size_t succ = succ_pair.first;
-            const auto& costs = succ_pair.second;
-            WriteFile(hStdout, &succ, sizeof(size_t), &written, NULL);
-            uint64_t num_costs = costs.size();
-            WriteFile(hStdout, &num_costs, sizeof(uint64_t), &written, NULL);
-            for (const auto& cost_pair : costs) {
-                WriteFile(hStdout, &cost_pair.first, sizeof(size_t), &written, NULL);
-                WriteFile(hStdout, &cost_pair.second, sizeof(double), &written, NULL);
+            // Read succ_list
+            uint64_t num_succ;
+            if (fread(&num_succ, sizeof(uint64_t), 1, stdin) != 1) {
+                debugLog("Failed to read num_succ");
+                break;
             }
+            debugLog("read num_succ: " + std::to_string(num_succ));
+            std::vector<size_t> succ_list(num_succ);
+            if (num_succ > 0 && fread(succ_list.data(), sizeof(size_t), num_succ, stdin) != num_succ) {
+                debugLog("Failed to read succ_list");
+                break;
+            }
+            debugLog("read succ_list");
+
+            // Read alone_costs
+            std::vector<double> alone_costs(num_succ);
+            if (num_succ > 0 && fread(alone_costs.data(), sizeof(double), num_succ, stdin) != num_succ) {
+                debugLog("Failed to read alone_costs");
+                break;
+            }
+            debugLog("read alone_costs");
+
+            // Process the pred
+            std::map<size_t, std::vector<std::pair<size_t, double>>> succ_costs;
+
+            // Get pred data
+            size_t start_pred = valid_segments[pred_id].first;
+            size_t len_pred = valid_segments[pred_id].second;
+            std::vector<uint8_t> data_pred(len_pred);
+            memcpy(data_pred.data(), file_data + start_pred, len_pred);
+            debugLog("Got pred data");
+
+            // For each succ
+            for (size_t i = 0; i < succ_list.size(); ++i) {
+                size_t succ = succ_list[i];
+                if (succ >= valid_segments.size()) continue;  // Invalid succ
+                debugLog("Processing succ " + std::to_string(succ) + " for pred " + std::to_string(pred_id));
+
+                // Fast Reset (performance optimization)
+                cm.init();
+                cm.skip_init = true;
+
+                // Get succ data
+                debugLog("Getting succ data for " + std::to_string(succ));
+                size_t start_succ = valid_segments[succ].first;
+                size_t len_succ = valid_segments[succ].second;
+                size_t head_len = std::min((size_t)10240, len_succ);
+                std::vector<uint8_t> head_succ(head_len);
+                memcpy(head_succ.data(), file_data + start_succ, head_len);
+                debugLog("Got succ data");
+
+                // Use provided alone_bits
+                double alone_bits = alone_costs[i];
+
+                // Compress pred data
+                MemoryReadStream in_pred(data_pred);
+                VoidWriteStream out_pred;
+                cm.compress(&in_pred, &out_pred, data_pred.size());
+                double pred_entropy_sum = 0.0;
+                for (double e : cm.entropies) pred_entropy_sum += e;
+
+                // Compress head
+                debugLog("Compressing head for succ " + std::to_string(succ));
+                MemoryReadStream in_head(head_succ);
+                VoidWriteStream out_head;
+                double cost = 0.0;
+                debugLog("head_succ.size() = " + std::to_string(head_succ.size()));
+                try {
+                    cm.compress(&in_head, &out_head, head_succ.size());
+                    debugLog("compress done for succ " + std::to_string(succ));
+                    double total_entropy_sum = 0.0;
+                    for (double e : cm.entropies) total_entropy_sum += e;
+                    double transition_cost = total_entropy_sum - pred_entropy_sum;
+                    debugLog("transition_cost: " + std::to_string(transition_cost) + " for succ " + std::to_string(succ));
+                    // Compute cost as savings: transition_cost - alone_bits
+                    cost = transition_cost - alone_bits;
+                    debugLog("cost: " + std::to_string(cost) + " for succ " + std::to_string(succ));
+                } catch (...) {
+                    debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
+                    cost = 1e9;  // High cost to avoid selecting
+                }
+
+                succ_costs[succ].emplace_back(pred_id, cost);
+                debugLog("emplaced for succ " + std::to_string(succ));
+                debugLog("Emplaced cost for succ " + std::to_string(succ));
+            }
+
+            debugLog("loop end");
+            // Channel separation: stdout for data, stderr for debug
+            debugLog("before writing results");
+            uint64_t num_results = succ_costs.size();
+            WriteFile(hStdout, &num_results, sizeof(uint64_t), &written, NULL);
+            FlushFileBuffers(hStdout);
+            for (const auto& succ_pair : succ_costs) {
+                size_t succ = succ_pair.first;
+                const auto& costs = succ_pair.second;
+                WriteFile(hStdout, &succ, sizeof(size_t), &written, NULL);
+                FlushFileBuffers(hStdout);
+                uint64_t num_costs = costs.size();
+                WriteFile(hStdout, &num_costs, sizeof(uint64_t), &written, NULL);
+                FlushFileBuffers(hStdout);
+                for (const auto& cost_pair : costs) {
+                    WriteFile(hStdout, &cost_pair.first, sizeof(size_t), &written, NULL);
+                    FlushFileBuffers(hStdout);
+                    WriteFile(hStdout, &cost_pair.second, sizeof(double), &written, NULL);
+                    FlushFileBuffers(hStdout);
+                }
+            }
+            debugLog("after writing results");
         }
-        debugLog("after writing results");
         debugLog("OracleChildMain end");
         UnmapViewOfFile(pView);
         CloseHandle(hMapping);
@@ -1855,12 +1874,146 @@ int main(int argc, char* argv[]) {
     std::vector<std::vector<std::pair<size_t, double>>> pred_costs(num_segments);  // for each pred, list of (succ, cost)
     std::cout << "Number of pred to process: " << pred_to_succ.size() << std::endl << std::flush;
 
-    // Use multi-process approach
-    int ret = run_oracle_multiprocess(argv[0], in_file.c_str(), file_data, valid_segments, pred_to_succ, pred_costs);
-    if (ret != 0) {
-      std::cerr << "Multi-process oracle failed" << std::endl;
-      return ret;
+    // 1. Pre-compute Alone Costs
+    std::cout << "Pre-computing Alone Costs: 0.0% (0/" << num_segments << " segments)" << std::flush;
+    std::vector<double> global_alone_costs(num_segments);
+    // Use serial for now
+    for (size_t i = 0; i < num_segments; ++i) {
+        // Get segment data
+        size_t start = valid_segments[i].first;
+        size_t len = valid_segments[i].second;
+        size_t head_len = std::min((size_t)10240, len);
+        std::vector<uint8_t> head_data(head_len);
+        memcpy(head_data.data(), file_data.data() + start, head_len);
+
+        // Compress alone
+        cm::CM<8, false> cm_alone(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
+        cm_alone.cur_profile_ = cm::CMProfile();
+        for (int j = 0; j < static_cast<int>(cm::kModelCount); ++j) {
+            cm_alone.cur_profile_.EnableModel(static_cast<cm::ModelType>(j));
+        }
+        cm_alone.cur_profile_.SetMatchModelOrder(12);
+        cm_alone.cur_profile_.SetMinLZPLen(10);
+        cm_alone.observer_mode = true;
+        cm_alone.init();
+        MemoryReadStream in_alone(head_data);
+        VoidWriteStream out_alone;
+        cm_alone.compress(&in_alone, &out_alone, head_data.size());
+        double alone_bits = 0.0;
+        for (double e : cm_alone.entropies) alone_bits += e;
+        global_alone_costs[i] = alone_bits;
+
+        // Progress
+        double percent = 100.0 * (i + 1) / num_segments;
+        std::cout << "\rPre-computing Alone Costs: " << std::fixed << std::setprecision(1) << percent << "% (" << (i + 1) << "/" << num_segments << " segments)" << std::flush;
     }
+    std::cout << std::endl;
+    std::cout << "Pre-computed alone costs for " << num_segments << " segments" << std::endl;
+
+    // 2. Swarm Logic
+    std::vector<std::pair<size_t, std::vector<size_t>>> pred_list;
+    for (const auto& p : pred_to_succ) {
+        pred_list.emplace_back(p.first, p.second);
+    }
+    size_t total_preds = pred_list.size();
+    std::atomic<size_t> global_idx(0);
+    std::mutex results_mutex;
+    std::atomic<size_t> processed_preds(0);
+    std::mutex output_mutex;
+    const int BATCH_SIZE = 10;
+
+    auto worker_func = [&]() {
+        while (true) {
+            size_t idx = global_idx.load();
+            if (idx >= total_preds) return;
+
+            // Spawn Process
+            char exe_path[MAX_PATH];
+            GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+            std::string cmd = std::string(exe_path) + " -oracle-child \"" + original_file + "\" \"" + segments_file + "\"";
+            STARTUPINFOA si = {sizeof(STARTUPINFOA)};
+            si.dwFlags = STARTF_USESTDHANDLES;
+            PROCESS_INFORMATION pi;
+            HANDLE hChildInRead, hChildInWrite, hChildOutRead, hChildOutWrite;
+            SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+            CreatePipe(&hChildInRead, &hChildInWrite, &sa, 0);
+            CreatePipe(&hChildOutRead, &hChildOutWrite, &sa, 0);
+            si.hStdInput = hChildInRead;
+            si.hStdOutput = hChildOutWrite;
+            si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+            SetHandleInformation(hChildInWrite, HANDLE_FLAG_INHERIT, 0);
+            SetHandleInformation(hChildOutRead, HANDLE_FLAG_INHERIT, 0);
+            if (!CreateProcessA(NULL, const_cast<char*>(cmd.c_str()), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+                std::cerr << "Failed to create child process" << std::endl;
+                return;
+            }
+            CloseHandle(hChildInRead);
+            CloseHandle(hChildOutWrite);
+
+            // Process Batch
+            int processed_in_batch = 0;
+            for (int b = 0; b < BATCH_SIZE; ++b) {
+                size_t current_idx = global_idx.fetch_add(1);
+                if (current_idx >= total_preds) break;
+
+                // Prepare Data
+                size_t pred_id = pred_list[current_idx].first;
+                const auto& succs = pred_list[current_idx].second;
+                std::vector<double> succ_alone_costs;
+                for (size_t s : succs) succ_alone_costs.push_back(global_alone_costs[s]);
+
+                // Write to Child
+                DWORD written;
+                WriteFile(hChildInWrite, &pred_id, sizeof(size_t), &written, NULL);
+                uint64_t num_succs = succs.size();
+                WriteFile(hChildInWrite, &num_succs, sizeof(uint64_t), &written, NULL);
+                if (!succs.empty()) WriteFile(hChildInWrite, succs.data(), sizeof(size_t) * succs.size(), &written, NULL);
+                if (!succ_alone_costs.empty()) WriteFile(hChildInWrite, succ_alone_costs.data(), sizeof(double) * succ_alone_costs.size(), &written, NULL);
+                FlushFileBuffers(hChildInWrite);
+
+                // Read from Child
+                uint64_t num_results;
+                ReadFile(hChildOutRead, &num_results, sizeof(uint64_t), &written, NULL);
+                for (uint64_t r = 0; r < num_results; ++r) {
+                    size_t succ;
+                    ReadFile(hChildOutRead, &succ, sizeof(size_t), &written, NULL);
+                    uint64_t num_costs;
+                    ReadFile(hChildOutRead, &num_costs, sizeof(uint64_t), &written, NULL);
+                    for (uint64_t c = 0; c < num_costs; ++c) {
+                        size_t p;
+                        double cost;
+                        ReadFile(hChildOutRead, &p, sizeof(size_t), &written, NULL);
+                        ReadFile(hChildOutRead, &cost, sizeof(double), &written, NULL);
+                        std::lock_guard<std::mutex> lock(results_mutex);
+                        pred_costs[p].emplace_back(succ, cost);
+                    }
+                }
+                processed_in_batch++;
+            }
+
+            processed_preds += processed_in_batch;
+            {
+                std::lock_guard<std::mutex> lock(output_mutex);
+                double percent = 100.0 * processed_preds.load() / total_preds;
+                std::cout << "\rProcessing: " << std::fixed << std::setprecision(1) << percent << "% (" << processed_preds.load() << "/" << total_preds << " preds)" << std::flush;
+            }
+
+            // Kill/Close Child
+            CloseHandle(hChildInWrite);
+            CloseHandle(hChildOutRead);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+    };
+
+    // Launch Threads
+    int num_cpus = std::thread::hardware_concurrency();
+    if (num_cpus == 0) num_cpus = 4;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_cpus; ++i) threads.emplace_back(worker_func);
+    for (auto& t : threads) t.join();
+    std::cout << std::endl;
 
     std::cout << "Finished processing all pred" << std::endl << std::flush;
 
