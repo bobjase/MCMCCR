@@ -652,20 +652,19 @@ int OracleChildMain(int argc, char* argv[]) {
         }
 
         debugLog("loop end");
-        // Write results to stderr using WriteFile
-        // Write results to stderr using WriteFile
+        // Channel separation: stdout for data, stderr for debug
         debugLog("before writing results");
         uint64_t num_results = succ_costs.size();
-        WriteFile(hStderr, &num_results, sizeof(uint64_t), &written, NULL);
+        WriteFile(hStdout, &num_results, sizeof(uint64_t), &written, NULL);
         for (const auto& succ_pair : succ_costs) {
             size_t succ = succ_pair.first;
             const auto& costs = succ_pair.second;
-            WriteFile(hStderr, &succ, sizeof(size_t), &written, NULL);
+            WriteFile(hStdout, &succ, sizeof(size_t), &written, NULL);
             uint64_t num_costs = costs.size();
-            WriteFile(hStderr, &num_costs, sizeof(uint64_t), &written, NULL);
+            WriteFile(hStdout, &num_costs, sizeof(uint64_t), &written, NULL);
             for (const auto& cost_pair : costs) {
-                WriteFile(hStderr, &cost_pair.first, sizeof(size_t), &written, NULL);
-                WriteFile(hStderr, &cost_pair.second, sizeof(double), &written, NULL);
+                WriteFile(hStdout, &cost_pair.first, sizeof(size_t), &written, NULL);
+                WriteFile(hStdout, &cost_pair.second, sizeof(double), &written, NULL);
             }
         }
         debugLog("after writing results");
@@ -813,33 +812,33 @@ int run_oracle_multiprocess(const char* exe_path, const char* in_file, const std
                     std::cerr << "Child process for pred " << current_preds[completed_index] << " failed with exit code " << exit_code << ", skipping" << std::endl;
                     // pred_costs[pred] remains empty
                 } else {
-                    // Read results from stderr pipe
+                    // Channel separation: read results from stdout pipe
                     DWORD bytesRead;
                     uint64_t num_results;
-                    if (!ReadFile(completed_stderr, &num_results, sizeof(uint64_t), &bytesRead, NULL) || bytesRead != sizeof(uint64_t)) {
+                    if (!ReadFile(completed_stdout, &num_results, sizeof(uint64_t), &bytesRead, NULL) || bytesRead != sizeof(uint64_t)) {
                         std::cerr << "Failed to read num_results from pipe for pred " << current_preds[completed_index] << std::endl;
                         // pred_costs[pred] remains empty
                     } else {
                         std::cout << "Read num_results: " << num_results << " for pred " << current_preds[completed_index] << std::endl;
                         for (uint64_t i = 0; i < num_results; ++i) {
                             size_t succ;
-                            if (!ReadFile(completed_stderr, &succ, sizeof(size_t), &bytesRead, NULL) || bytesRead != sizeof(size_t)) {
+                            if (!ReadFile(completed_stdout, &succ, sizeof(size_t), &bytesRead, NULL) || bytesRead != sizeof(size_t)) {
                                 std::cerr << "Failed to read succ from pipe" << std::endl;
                                 break;
                             }
                             uint64_t num_costs;
-                            if (!ReadFile(completed_stderr, &num_costs, sizeof(uint64_t), &bytesRead, NULL) || bytesRead != sizeof(uint64_t)) {
+                            if (!ReadFile(completed_stdout, &num_costs, sizeof(uint64_t), &bytesRead, NULL) || bytesRead != sizeof(uint64_t)) {
                                 std::cerr << "Failed to read num_costs from pipe" << std::endl;
                                 break;
                             }
                             for (uint64_t j = 0; j < num_costs; ++j) {
                                 size_t pred_read;
                                 double cost;
-                                if (!ReadFile(completed_stderr, &pred_read, sizeof(size_t), &bytesRead, NULL) || bytesRead != sizeof(size_t)) {
+                                if (!ReadFile(completed_stdout, &pred_read, sizeof(size_t), &bytesRead, NULL) || bytesRead != sizeof(size_t)) {
                                     std::cerr << "Failed to read pred_read from pipe" << std::endl;
                                     break;
                                 }
-                                if (!ReadFile(completed_stderr, &cost, sizeof(double), &bytesRead, NULL) || bytesRead != sizeof(double)) {
+                                if (!ReadFile(completed_stdout, &cost, sizeof(double), &bytesRead, NULL) || bytesRead != sizeof(double)) {
                                     std::cerr << "Failed to read cost from pipe" << std::endl;
                                     break;
                                 }
@@ -1635,10 +1634,18 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "pred_to_succ size: " << pred_to_succ.size() << std::endl << std::flush;
 
-    // For testing, only process pred=1 with succ=0
-    // std::map<size_t, std::vector<size_t>> test_pred_to_succ;
-    // if (pred_to_succ.count(1)) {
-    //     auto& succs = pred_to_succ[1];
+    // Natural Baseline Fusion: Inject natural predecessors (pred+1)
+    for (size_t pred = 0; pred < num_segments - 1; ++pred) {
+      size_t natural_succ = pred + 1;
+      if (pred_to_succ.find(pred) == pred_to_succ.end()) {
+        pred_to_succ[pred] = std::vector<size_t>();
+      }
+      // Only add if not already present
+      if (std::find(pred_to_succ[pred].begin(), pred_to_succ[pred].end(), natural_succ) == pred_to_succ[pred].end()) {
+        pred_to_succ[pred].push_back(natural_succ);
+      }
+    }
+    std::cout << "Injected natural predecessors, pred_to_succ size now: " << pred_to_succ.size() << std::endl << std::flush;
     //     if (std::find(succs.begin(), succs.end(), 0) != succs.end()) {
     //         test_pred_to_succ[1] = {0};
     //     }
@@ -1875,6 +1882,26 @@ int main(int argc, char* argv[]) {
     // Beam Search Parameters
     const size_t BEAM_WIDTH = 2000;
     const double ORPHAN_PENALTY = 1000.0;  // Heuristic penalty for leaving nodes unconnected
+    const double FUSION_THRESHOLD = 0.5;   // Only fuse if improvement > 0.5 bits/byte over natural
+
+    // Natural Baseline Fusion: Calculate natural order cost baseline
+    double natural_cost = 0.0;
+    for (size_t i = 0; i < num_segments - 1; ++i) {
+      // Find the cost of natural transition i -> i+1
+      bool found_natural = false;
+      for (const auto& edge : candidates[i]) {
+        if (edge.to == i + 1) {
+          natural_cost += edge.cost;
+          found_natural = true;
+          break;
+        }
+      }
+      if (!found_natural) {
+        // If no natural transition found, use orphan penalty as baseline
+        natural_cost += ORPHAN_PENALTY;
+      }
+    }
+    std::cout << "Natural order baseline cost: " << natural_cost << std::endl;
 
     // Initialize beam with one empty state
     std::vector<BeamState> current_beam;
@@ -1893,10 +1920,18 @@ int main(int argc, char* argv[]) {
           next_beam_candidates.push_back(std::move(new_state));
         }
         
-        // Option 2: Try linking to candidates
+        // Option 2: Try linking to candidates (Smart Fusion)
         for (const auto& edge : candidates[current_node]) {
           size_t succ = edge.to;
           double cost = edge.cost;
+          
+          // Natural Baseline Fusion: Only fuse if significant improvement over natural
+          // For natural transitions (current_node + 1 == succ), always allow
+          // For non-natural transitions, require >0.5 bits/byte improvement
+          bool is_natural = (succ == current_node + 1);
+          if (!is_natural && cost > -FUSION_THRESHOLD) {
+            continue;  // Skip fusions that don't provide enough benefit
+          }
           
           // Check validity
           if (state.prev_segment[succ] != -1) continue;  // succ already has predecessor
