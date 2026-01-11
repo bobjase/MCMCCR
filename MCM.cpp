@@ -2149,33 +2149,73 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Completed Greedy Construction" << std::endl;
 
-    // Phase 3: Iterative Refinement (2 passes)
-    for (int pass = 0; pass < 2; ++pass) {
-      for (size_t u = 0; u < num_segments; ++u) {
-        for (const auto& edge : candidates[u]) {
-          size_t v = edge.to;
-          double cost = edge.cost;
-          // Action A: Stitching
-          if (next_seg[u] == -1 && prev_seg[v] == -1 && dsu.find(u) != dsu.find(v) && cost < RESET_PENALTY) {
-            next_seg[u] = v;
-            prev_seg[v] = u;
-            dsu.unite(u, v);
-          }
-          // Action B: Rerouting/Stealing
-          else if (next_seg[u] == -1 && prev_seg[v] != -1) {
-            int old_pred = prev_seg[v];
-            if (cost < candidates[old_pred][0].cost) { // Assuming sorted, first is best
-              // Disconnect old
-              next_seg[old_pred] = -1;
-              // Connect new
-              next_seg[u] = v;
-              prev_seg[v] = u;
-              // DSU: Use old DSU for safety, no update
+    // Phase 3 & 4: Deep Iterative Refinement
+    // Run until convergence or max passes
+    bool improved = true;
+    int pass = 0;
+    const int MAX_PASSES = 20; 
+
+    while (improved && pass < MAX_PASSES) {
+        improved = false;
+        pass++;
+        size_t changes = 0;
+
+        for (size_t u = 0; u < num_segments; ++u) {
+            for (const auto& edge : candidates[u]) {
+                size_t v = edge.to;
+                double cost = edge.cost;
+
+                // 1. STANDARD STITCH (Tail -> Head)
+                if (next_seg[u] == -1 && prev_seg[v] == -1) {
+                    if (dsu.find(u) != dsu.find(v)) {
+                         if (cost < RESET_PENALTY) {
+                             next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v);
+                             improved = true; changes++;
+                         }
+                    }
+                }
+                // 2. AGGRESSIVE STEAL (Target Busy)
+                // We want u -> v, but v has old_pred.
+                // Condition: u is Tail (free), v is Busy.
+                else if (next_seg[u] == -1 && prev_seg[v] != -1) {
+                    int old_pred = prev_seg[v];
+                    // Find cost of old_pred -> v
+                    double old_cost = 1e9;
+                    for(auto& e : candidates[old_pred]) if(e.to == v) { old_cost = e.cost; break; }
+                    
+                    if (dsu.find(u) != dsu.find(v) && cost < old_cost) {
+                        next_seg[old_pred] = -1; // Break old
+                        next_seg[u] = v; prev_seg[v] = u; // Link new
+                        improved = true; changes++;
+                    }
+                }
+                // 3. AGGRESSIVE BREAK (Source Busy)
+                // We want u -> v, but u has old_next.
+                // Condition: u is Busy, v is Head (free).
+                else if (next_seg[u] != -1 && prev_seg[v] == -1) {
+                    int old_next = next_seg[u];
+                    if (dsu.find(u) != dsu.find(v)) {
+                         double old_cost = 1e9;
+                         for(auto& e : candidates[u]) if(e.to == old_next) { old_cost = e.cost; break; }
+
+                         if (cost < old_cost) {
+                             prev_seg[old_next] = -1; // Break old
+                             next_seg[u] = v; prev_seg[v] = u; // Link new
+                             improved = true; changes++;
+                         }
+                    }
+                }
             }
-          }
         }
-      }
-      std::cout << "Completed Refinement Pass " << (pass + 1) << std::endl;
+
+        // Rebuild DSU if we made structural changes (links broken)
+        if (improved) {
+            dsu = UnionFind(num_segments);
+            for(size_t i=0; i<num_segments; ++i) {
+                if (next_seg[i] != -1) dsu.unite(i, next_seg[i]);
+            }
+            std::cout << "Pass " << pass << ": " << changes << " optimizations applied." << std::endl;
+        }
     }
 
     // --- Output Generation ---
