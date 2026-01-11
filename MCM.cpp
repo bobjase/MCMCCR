@@ -115,6 +115,8 @@ static constexpr bool kReleaseBuild = true;
 static constexpr bool kReleaseBuild = false;
 #endif
 
+static constexpr bool calibration_mode = false;
+
 struct MarkovMatrix {
   float transitions[8][8];
 };
@@ -877,15 +879,17 @@ int OracleChildMain(int argc, char* argv[]) {
                 }
 
                 // Log to calibration dataset
-                double oracle_savings = -cost;
-                if (oracle_savings > -100.0) {
-                    DWORD pid = GetCurrentProcessId();
-                    std::string filename = "calibration_" + std::to_string(pid) + ".csv";
-                    std::ofstream csv(filename, std::ios::app);
-                    if (csv) {
-                        csv << pred_id << "," << succ << "," << dists.vocab;
-                        for (float w : dists.wht) csv << "," << w;
-                        csv << "," << dists.gcd << "," << dists.vol << "," << oracle_savings << "\n";
+                if (calibration_mode) {
+                    double oracle_savings = -cost;
+                    if (oracle_savings > -100.0) {
+                        DWORD pid = GetCurrentProcessId();
+                        std::string filename = "calibration_" + std::to_string(pid) + ".csv";
+                        std::ofstream csv(filename, std::ios::app);
+                        if (csv) {
+                            csv << pred_id << "," << succ << "," << dists.vocab;
+                            for (float w : dists.wht) csv << "," << w;
+                            csv << "," << dists.gcd << "," << dists.vol << "," << oracle_savings << "\n";
+                        }
                     }
                 }
 
