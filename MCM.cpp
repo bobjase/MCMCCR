@@ -28,6 +28,7 @@
 #include <eh.h>
 #include <deque>
 #include <vector>
+#include <array>
 #include <io.h>
 #include <fcntl.h>
 #include <cctype>
@@ -1459,162 +1460,139 @@ int main(int argc, char* argv[]) {
   }
   case Options::kModeSegment: {
     printHeader();
-    std::cout << "Running Segmentation Mode" << std::endl;
-    // Read .entropy file
-    std::vector<FileInfo> files = options.files;
-    std::string in_file = files[0].getName();
-    std::ifstream ifs(in_file + ".entropy", std::ios::binary);
-    if (!ifs) {
-      std::cerr << "Error opening entropy file: " << in_file + ".entropy" << std::endl;
-      return 1;
-    }
-    uint64_t num_bytes;
-    ifs.read(reinterpret_cast<char*>(&num_bytes), sizeof(num_bytes));
-    uint64_t stock_size;
-    ifs.read(reinterpret_cast<char*>(&stock_size), sizeof(stock_size));
-    std::vector<double> entropies(num_bytes);
-    ifs.read(reinterpret_cast<char*>(entropies.data()), num_bytes * sizeof(double));
-    ifs.close();
-    std::cout << "Read " << formatNumber(num_bytes) << " entropy values, stock size " << formatNumber(stock_size) << std::endl;
+    std::cout << "Running PELT Segmentation Mode" << std::endl;
 
-    // 1. PERFORM SMOOTHING (Centered Window Fix - eliminates phase lag)
-    const size_t window = options.segment_window;
-    size_t half_window = window / 2;
-    std::vector<double> smoothed(num_bytes);
+    // Configuration
+    size_t BLOCK_SIZE = std::max<size_t>(1, (size_t)options.segment_window);
+    double PENALTY_FACTOR = 0.5;  // Tuned for reasonable segmentation
+    std::cout << "BLOCK_SIZE: " << BLOCK_SIZE << ", PENALTY_FACTOR: " << PENALTY_FACTOR << std::endl;
 
-    // Step 1: Calculate Trailing Average (existing logic)
-    std::vector<double> trailing(num_bytes);
-    double r_sum = 0;
-    for (size_t i = 0; i < num_bytes; ++i) {
-        r_sum += entropies[i];
-        if (i >= window) r_sum -= entropies[i - window];
-        size_t count = std::min(i + 1, window);
-        trailing[i] = r_sum / count;
-    }
-
-    // Step 2: Shift to Fix Phase Lag - center the smoothing window
-    // smoothed[i] takes the value from trailing[i + half_window]
-    for (size_t i = 0; i < num_bytes; ++i) {
-        if (i + half_window < num_bytes) {
-            smoothed[i] = trailing[i + half_window];
-        } else {
-            smoothed[i] = trailing[num_bytes - 1]; // Clamp end
-        }
-    }
-
-    // 2. CALCULATE STATS ON SMOOTHED DATA (not raw entropies)
-    double sum = 0.0;
-    for (double v : smoothed) sum += v;
-    double mean = sum / smoothed.size();
-
-    double sq_sum = 0.0;
-    for (double v : smoothed) {
-        sq_sum += (v - mean) * (v - mean);
-    }
-    double stdev = std::sqrt(sq_sum / smoothed.size());
-
-    // 3. AUTO-TUNE THRESHOLD
-    double k_factor = 0.7; 
-    double dynamic_threshold = mean + (k_factor * stdev);
-    
-    // Safety: Ensure we catch strong edges even if the file is very flat
-    // But don't make it unreachable (reduced from 0.5 to 0.2)
-    dynamic_threshold = std::max(dynamic_threshold, mean + 0.2);
-
-    double max_smoothed = *std::max_element(smoothed.begin(), smoothed.end());
-    std::cout << "Auto-Tuning (Smoothed): Mean=" << mean << " StDev=" << stdev 
-              << " -> Dynamic Threshold=" << dynamic_threshold 
-              << " (Max Smoothed=" << max_smoothed << ")" << std::endl;
-
-    // Boundary detection: find local maxima in smoothed entropy where > threshold
-    const double threshold = dynamic_threshold;  // Auto-tuned threshold
-    const size_t min_segment = options.segment_min_segment;
-    const size_t max_segment = options.segment_max_segment;
-    std::vector<size_t> boundaries;
-    boundaries.push_back(0);
-    for (size_t i = 1; i < num_bytes - 1; ++i) {
-      if (i - boundaries.back() >= max_segment || ((smoothed[i] > smoothed[i-1] && smoothed[i] > smoothed[i+1] && smoothed[i] > threshold) && i - boundaries.back() >= min_segment)) {
-        boundaries.push_back(i);
-      }
-    }
-    boundaries.push_back(num_bytes);
-
-    std::cout << "Boundaries size: " << boundaries.size() << std::endl;
-
-    // --- STEP 4: EDGE REFINEMENT (The "Beat Detector") ---
-    // The smoothing window gives us the "Neighborhood", but blurs the "Address".
-    // We now use a "Matched Filter" (Step Function) to snap to the exact transition.
-    
-    std::cout << "Refining " << boundaries.size() << " boundaries..." << std::endl;
-    // Parameters for the Matched Filter
-    const int kSearchRadius = 1024; // Look +/- 1024 bytes around the rough cut
-    const int kKernelSize = 64;    // Compare Avg of 64 bytes Future vs 64 bytes Past
-
-    for (size_t i = 1; i < boundaries.size() - 1; ++i) {
-        size_t rough_idx = boundaries[i];
-        
-        // Define search range (clamped to file bounds)
-        size_t search_start = (rough_idx > kSearchRadius) ? rough_idx - kSearchRadius : 0;
-        size_t search_end = std::min((size_t)num_bytes, rough_idx + kSearchRadius);
-        
-        double max_contrast = -1.0;
-        size_t best_idx = rough_idx;
-
-        // Scan the neighborhood to maximize Contrast
-        for (size_t curr = search_start; curr < search_end; ++curr) {
-            // Safety check: ensure kernel fits inside the file
-            if (curr < kKernelSize || curr + kKernelSize >= num_bytes) continue;
-
-            // Calculate "Contrast" (Difference between Future and Past Entropy)
-            // This acts as a "Step Edge" detector.
-            double sum_left = 0.0;
-            double sum_right = 0.0;
-            
-            // Note: Using raw 'entropies' here, NOT 'smoothed', for maximum precision.
-            for (int k = 1; k <= kKernelSize; ++k) {
-                sum_left += entropies[curr - k];  // Past
-                sum_right += entropies[curr + k]; // Future
-            }
-            
-            double contrast = std::abs(sum_right - sum_left);
-            
-            // Peak Detection
-            if (contrast > max_contrast) {
-                max_contrast = contrast;
-                best_idx = curr;
-            }
-        }
-        
-        // Snap to the sharpest edge
-        if (best_idx != rough_idx) {
-             // Optional debug: if (abs((int)best_idx - (int)rough_idx) > 5) std::cout << "Snapped " << rough_idx << " -> " << best_idx << std::endl;
-             boundaries[i] = best_idx;
-        }
-    }
-    std::cout << "Boundaries refined (Snapped to Entropy Cliffs)." << std::endl;
-
-    // Atomic Fusion: Hot/Cold Dependency Check
+    // Open original file
     std::string original_file = std::string(argv[2]);
-    std::ifstream fin(original_file, std::ios::binary);
+    std::ifstream fin(original_file, std::ios::binary | std::ios::ate);
     if (!fin) {
       std::cerr << "Error opening original file: " << original_file << std::endl;
       return 1;
     }
-    fin.seekg(0, std::ios::end);
-    uint64_t file_size = fin.tellg();
-    fin.seekg(0, std::ios::beg);
-    if (num_bytes > file_size) {
-      num_bytes = file_size;
-      entropies.resize(num_bytes);
+    size_t file_size = fin.tellg();
+    fin.seekg(0);
+    std::cout << "File size: " << formatNumber(file_size) << " bytes" << std::endl;
+
+    // Compute number of blocks
+    size_t num_blocks = (file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    std::cout << "Number of blocks: " << num_blocks << std::endl;
+
+    // Build prefix histograms
+    std::vector<std::vector<uint32_t>> prefix_counts(num_blocks + 1, std::vector<uint32_t>(256, 0));
+
+    std::vector<uint8_t> buffer(BLOCK_SIZE);
+    for (size_t b = 0; b < num_blocks; ++b) {
+      size_t bytes_to_read = std::min(BLOCK_SIZE, file_size - b * BLOCK_SIZE);
+      fin.read(reinterpret_cast<char*>(buffer.data()), bytes_to_read);
+      // Copy previous
+      prefix_counts[b + 1] = prefix_counts[b];
+      // Add current block
+      for (size_t i = 0; i < bytes_to_read; ++i) {
+        prefix_counts[b + 1][buffer[i]]++;
+      }
     }
-    float global_avg = 0;
-    for (float e : entropies) global_avg += e;
-    global_avg /= num_bytes;
-    std::vector<size_t> to_remove;
-// --- ATOMIC FUSION (Disabled - Using Raw Segmentation) ---
-    std::cout << "Skipping Atomic Fusion (Using Raw Centered Window Segmentation)..." << std::endl;
+    fin.close();
+    std::cout << "Built prefix histograms" << std::endl;
+
+    // Pre-compute x_log_x table
+    std::vector<double> x_log_x(BLOCK_SIZE + 1);
+    for (size_t x = 0; x <= BLOCK_SIZE; ++x) {
+      x_log_x[x] = (x == 0) ? 0.0 : x * std::log2(x);
+    }
+
+    // Cost function
+    auto CalculateCost = [&](size_t start_block, size_t end_block) -> double {
+      std::vector<uint32_t> counts(256);
+      for (int b = 0; b < 256; ++b) {
+        counts[b] = prefix_counts[end_block][b] - prefix_counts[start_block][b];
+      }
+      size_t length;
+      if (end_block < num_blocks) {
+        length = (end_block - start_block) * BLOCK_SIZE;
+      } else {
+        size_t full_blocks = end_block - start_block - 1;
+        size_t last_size = file_size - (num_blocks - 1) * BLOCK_SIZE;
+        length = full_blocks * BLOCK_SIZE + last_size;
+      }
+      if (length == 0) return 0.0;
+
+      double entropy = std::log2(length);
+      double sum_x_log_x = 0.0;
+      for (int b = 0; b < 256; ++b) {
+        if (counts[b] > 0) {
+          if (counts[b] <= BLOCK_SIZE) {
+            sum_x_log_x += x_log_x[counts[b]];
+          } else {
+            sum_x_log_x += counts[b] * std::log2(counts[b]);
+          }
+        }
+      }
+      entropy -= (1.0 / length) * sum_x_log_x;
+      return length * entropy;
+    };
+
+    // PELT Algorithm
+    std::vector<double> F(num_blocks + 1, std::numeric_limits<double>::infinity());
+    std::vector<size_t> bp(num_blocks + 1, 0);
+    std::vector<size_t> candidates = {0};
+    double penalty = 0.5 * 255 * std::log2(file_size) * PENALTY_FACTOR;
+    F[0] = -penalty;
+
+    for (size_t t = 1; t <= num_blocks; ++t) {
+      double best_cost = std::numeric_limits<double>::infinity();
+      for (size_t tau : candidates) {
+        double seg_cost = CalculateCost(tau, t);
+        double total_cost = F[tau] + seg_cost + penalty;
+        if (total_cost < best_cost) {
+          best_cost = total_cost;
+          bp[t] = tau;
+        }
+      }
+      F[t] = best_cost;
+
+      // Prune
+      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+        [&](size_t tau) {
+          double prune_cost = F[tau] + CalculateCost(tau, t) + penalty;
+          return prune_cost > F[t];
+        }), candidates.end());
+
+      // Add
+      candidates.push_back(t);
+
+      // Logging
+      if (t % 1000 == 0) {
+        std::cout << "Block " << t << "/" << num_blocks << " | Active Candidates: " << candidates.size() << std::endl;
+      }
+    }
+
+    // Backtrack to get segments
+    std::vector<size_t> block_cuts;
+    size_t current = num_blocks;
+    while (current > 0) {
+      size_t prev = bp[current];
+      block_cuts.push_back(prev);
+      current = prev;
+    }
+    std::reverse(block_cuts.begin(), block_cuts.end());
+
+    // Convert to byte boundaries
+    std::vector<size_t> boundaries;
+    boundaries.push_back(0);
+    for (size_t block : block_cuts) {
+      if (block > 0) {
+        boundaries.push_back(block * BLOCK_SIZE);
+      }
+    }
+    boundaries.push_back(file_size);
 
     // Output segments
+    std::string in_file = std::string(argv[2]);
     std::string out_file = in_file + ".segments";
     std::ofstream ofs(out_file);
     if (!ofs) {
@@ -1625,7 +1603,7 @@ int main(int argc, char* argv[]) {
     ofs << num_segments << std::endl;
     for (size_t i = 0; i < num_segments; ++i) {
       uint64_t start = boundaries[i];
-      uint64_t length = boundaries[i+1] - boundaries[i];
+      uint64_t length = boundaries[i + 1] - boundaries[i];
       ofs << start << " " << length << std::endl;
     }
     ofs.close();
