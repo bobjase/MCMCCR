@@ -29,6 +29,7 @@
 #include <deque>
 #include <vector>
 #include <array>
+#include <algorithm>
 #include <io.h>
 #include <fcntl.h>
 #include <cctype>
@@ -1599,15 +1600,98 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Final: " << (best_cuts.size() - 1) << " segments." << std::endl;
 
+    // Convert to byte boundaries
+    std::vector<size_t> boundaries;
+    boundaries.push_back(0);
+    for (size_t block : best_cuts) {
+      if (block > 0) {
+        boundaries.push_back(block * BLOCK_SIZE);
+      }
+    }
+    boundaries.push_back(file_size);
+
+    // Boundary Refinement Phase ("Inductive Boundary Snap")
+    std::cout << "Refining " << boundaries.size() << " boundaries..." << std::endl;
+    std::string original_file = in_file;
+    std::ifstream fin_refine(original_file, std::ios::binary);
+    if (fin_refine) {
+      const size_t SEARCH_RADIUS = BLOCK_SIZE / 2;
+      for (size_t i = 1; i < boundaries.size() - 1; ++i) {
+        size_t coarse_cut = boundaries[i];
+        size_t search_start = (coarse_cut > SEARCH_RADIUS) ? coarse_cut - SEARCH_RADIUS : 0;
+        size_t search_end = std::min(file_size, coarse_cut + SEARCH_RADIUS);
+        
+        // Constrain to neighbors to preserve segment order
+        if (search_start <= boundaries[i - 1]) search_start = boundaries[i - 1] + 1;
+        if (search_end >= boundaries[i + 1]) search_end = boundaries[i + 1] - 1;
+        
+        size_t window_len = search_end - search_start;
+        if (window_len < 2) continue;
+        std::vector<uint8_t> window(window_len);
+        fin_refine.seekg(search_start);
+        fin_refine.read(reinterpret_cast<char*>(window.data()), window_len);
+
+        // Initialize Histograms
+        std::array<uint32_t, 256> right_counts = {0};
+        std::array<uint32_t, 256> left_counts = {0};
+        double right_sum = 0.0;
+        double left_sum = 0.0;
+
+        // Start with everything in the Right partition
+        for (uint8_t b : window) {
+          if (right_counts[b] > 0) right_sum -= x_log_x[right_counts[b]];
+          right_counts[b]++;
+          right_sum += x_log_x[right_counts[b]];
+        }
+
+        double min_local_cost = std::numeric_limits<double>::infinity();
+        size_t best_local_offset = 0;
+
+        // Sweep the cut point from Left to Right
+        for (size_t k = 0; k < window_len - 1; ++k) {
+          uint8_t b = window[k];
+          
+          // Move byte 'b' from Right to Left
+          right_sum -= x_log_x[right_counts[b]];
+          right_counts[b]--;
+          if (right_counts[b] > 0) right_sum += x_log_x[right_counts[b]];
+
+          if (left_counts[b] > 0) left_sum -= x_log_x[left_counts[b]];
+          left_counts[b]++;
+          left_sum += x_log_x[left_counts[b]];
+
+          size_t len_l = k + 1;
+          size_t len_r = window_len - len_l;
+          
+          // Calculate Entropy Cost: L*log(L) - sum(c*log(c))
+          double cost_l = x_log_x[len_l] - left_sum;
+          double cost_r = x_log_x[len_r] - right_sum;
+          double total = cost_l + cost_r;
+
+          if (total < min_local_cost) {
+            min_local_cost = total;
+            best_local_offset = k + 1;
+          }
+        }
+        
+        // Update to the optimal byte-perfect boundary
+        boundaries[i] = search_start + best_local_offset;
+      }
+      fin_refine.close();
+      std::cout << "Refinement Complete." << std::endl;
+    } else {
+      std::cerr << "Warning: Could not reopen file for refinement" << std::endl;
+    }
+
     // 6. Write Output
     std::string out_file = in_file + ".segments";
     std::ofstream ofs(out_file);
     if (!ofs) return 1;
-    ofs << (best_cuts.size() - 1) << std::endl;
-    for (size_t i = 0; i < best_cuts.size() - 1; ++i) {
-        size_t start = best_cuts[i] * BLOCK_SIZE;
-        size_t end = (best_cuts[i+1] == num_blocks) ? file_size : (best_cuts[i+1] * BLOCK_SIZE);
-        ofs << start << " " << (end - start) << std::endl;
+    ofs << (boundaries.size() - 1) << std::endl;
+    for (size_t i = 0; i < boundaries.size() - 1; ++i) {
+        size_t start = boundaries[i];
+        size_t len = boundaries[i+1] - boundaries[i];
+        ofs << start << " " << len << std::endl;
     }
     ofs.close();
     std::cout << "Wrote segments to " << out_file << std::endl;
