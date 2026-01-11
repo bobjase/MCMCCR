@@ -977,7 +977,7 @@ int run_oracle_multiprocess(const char* exe_path, const char* in_file, const std
             child_stderr_reads.push_back(hChildStderrRead);
             current_preds.push_back(pred);
 
-            std::cout << "Launched process for pred = " << pred << std::endl;
+            //std::cout << "Launched process for pred = " << pred << std::endl;
             ++pred_index;
         }
 
@@ -1004,7 +1004,7 @@ int run_oracle_multiprocess(const char* exe_path, const char* in_file, const std
                         std::cerr << "Failed to read num_results from pipe for pred " << current_preds[completed_index] << std::endl;
                         // pred_costs[pred] remains empty
                     } else {
-                        std::cout << "Read num_results: " << num_results << " for pred " << current_preds[completed_index] << std::endl;
+                        //std::cout << "Read num_results: " << num_results << " for pred " << current_preds[completed_index] << std::endl;
                         for (uint64_t i = 0; i < num_results; ++i) {
                             size_t succ;
                             if (!ReadFile(completed_stdout, &succ, sizeof(size_t), &bytesRead, NULL) || bytesRead != sizeof(size_t)) {
@@ -2073,7 +2073,7 @@ int main(int argc, char* argv[]) {
     // Beam Search Parameters
     const size_t BEAM_WIDTH = 2000;
     const double ORPHAN_PENALTY = 1000.0;  // Heuristic penalty for leaving nodes unconnected
-    const double FUSION_THRESHOLD = 0.5;   // Only fuse if improvement > 0.5 bits/byte over natural
+    const double FUSION_THRESHOLD = 2.0;   // Only fuse if improvement > 0.5 bits/byte over natural
 
     // Natural Baseline Fusion: Calculate natural order cost baseline
     double natural_cost = 0.0;
@@ -2133,6 +2133,15 @@ int main(int argc, char* argv[]) {
           new_state.next_segment[current_node] = succ;
           new_state.prev_segment[succ] = current_node;
           new_state.union_sets(current_node, succ);
+
+          // INCUMBENCY BONUS: Strongly reward keeping the file continuous.
+          if (is_natural) {
+              // Bonus: Free 10% savings + 500 bits constant reward
+              // (Assuming cost is negative savings)
+              double bonus = (cost < 0) ? (cost * 0.10) : -500.0;
+              cost += bonus;
+          }
+
           new_state.total_cost += cost;
           next_beam_candidates.push_back(std::move(new_state));
         }
