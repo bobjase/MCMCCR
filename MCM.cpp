@@ -1725,6 +1725,11 @@ int main(int argc, char* argv[]) {
     }
     ofs.close();
     std::cout << "Wrote candidate lists for " << num_valid << " segments to " << out_file << std::endl;
+
+    // Save fingerprint data for reuse in oracle mode
+    std::string fingerprint_file = in_file + ".segments.fingerprints";
+    WriteBinary(fingerprint_file, fingerprints);
+    std::cout << "Saved " << num_valid << " fingerprint structures to " << fingerprint_file << std::endl;
     break;
   }
   {
@@ -2034,11 +2039,38 @@ int main(int argc, char* argv[]) {
         double cost = std::stod(cost_str);
         candidates[pred_id].push_back({succ_id, cost});
       }
-      // Sort and keep top 32
+      // Sort by cost ascending (savings)
       std::sort(candidates[pred_id].begin(), candidates[pred_id].end(), 
                 [](const Edge& a, const Edge& b) { return a.cost < b.cost; });
+
+      // RED TEAM FIX: Protect Natural Predecessor from eviction
+      // If we resize to 32, we MUST ensure the natural edge (pred_id + 1) stays.
       if (candidates[pred_id].size() > 32) {
-        candidates[pred_id].resize(32);
+        size_t natural_succ = pred_id + 1;
+        bool natural_found = false;
+        size_t natural_idx = -1;
+        
+        // Check if natural successor is in the list
+        for (size_t k = 0; k < candidates[pred_id].size(); ++k) {
+            if (candidates[pred_id][k].to == natural_succ) {
+                natural_found = true;
+                natural_idx = k;
+                break;
+            }
+        }
+
+        // Resize to 31 to leave room if we need to force-keep natural
+        // or resize to 32 if natural is already safe in top 32
+        if (natural_found && natural_idx < 32) {
+             candidates[pred_id].resize(32);
+        } else if (natural_found && natural_idx >= 32) {
+             // Natural was found but is about to be cut. Save it.
+             Edge natural_edge = candidates[pred_id][natural_idx];
+             candidates[pred_id].resize(31);
+             candidates[pred_id].push_back(natural_edge); // Put it back
+        } else {
+             candidates[pred_id].resize(32); // Natural not in list at all
+        }
       }
     }
     oracle_ifs.close();
@@ -2072,8 +2104,11 @@ int main(int argc, char* argv[]) {
 
     // Beam Search Parameters
     const size_t BEAM_WIDTH = 2000;
-    const double ORPHAN_PENALTY = 1000.0;  // Heuristic penalty for leaving nodes unconnected
-    const double FUSION_THRESHOLD = 2.0;   // Only fuse if improvement > 0.5 bits/byte over natural
+    const double ORPHAN_PENALTY = 1000.0;
+    
+    // RED TEAM FIX: Threshold is in TOTAL BITS. 
+    // 2.0 was too small. We require ~64 bytes (512 bits) of savings to justify a jump.
+    const double FUSION_THRESHOLD = 512.0;
 
     // Natural Baseline Fusion: Calculate natural order cost baseline
     double natural_cost = 0.0;
