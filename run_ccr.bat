@@ -29,7 +29,11 @@ echo Phase 5: Pathcover
 "%MCM_EXE%" -pathcover "%INPUT%"
 
 echo Compressing original file
-"%MCM_EXE%" -x11 "%INPUT%" "%BASE%.mcm"
+if not exist "%BASE%.mcm" (
+    "%MCM_EXE%" -x11 "%INPUT%" "%BASE%.mcm"
+) else (
+    echo Skipping original compression - %BASE%.mcm already exists
+)
 
 echo Compressing reordered file
 "%MCM_EXE%" -x11 "%INPUT%.reordered" "%BASE%.reordered.mcm"
