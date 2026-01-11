@@ -356,14 +356,30 @@ DistanceComponents compute_raw_dist(const Fingerprint& donor, const Fingerprint&
 
 float hybrid_distance(const Fingerprint& donor, const Fingerprint& recv) {
     DistanceComponents dists = compute_raw_dist(donor, recv);
-    // Combined Score
-    // Vocabulary is King (0.6 weight).
-    // Structure ensures we don't mix Code/Image.
-    // Volatility ensures stability.
-    float wht_dist = 0.0f;
-    for (float d : dists.wht) wht_dist += d * d;
-    wht_dist = std::sqrt(wht_dist);
-    return (dists.vocab * 0.6f) + (wht_dist * 0.2f) + dists.gcd + dists.vol;
+
+    // --- Calibrated Weights (enwik8 Deep Dive) ---
+    // WHT Weights: Derived from 550k sample regression.
+    // Vocab Weight: Manually boosted to 0.25 to ensure content matching 
+    //               remains active within the structural safety zones.
+    
+    float w_vocab = 0.2500f; // Boosted from 0.007
+    float w_gcd   = 0.0000f;
+    float w_vol   = 0.0000f;
+    
+    // Band 0 dominates (1.0) to prevent Binary/Text mixing.
+    // Band 1 (0.36) detects high-freq texture.
+    const float w_wht[] = {
+        1.0000f, 0.3643f, 0.0185f, 0.0690f,
+        0.0179f, 0.0246f, 0.0177f, 0.0298f,
+        0.0195f, 0.0183f, 0.0183f, 0.0002f
+    };
+
+    float wht_score = 0.0f;
+    for(size_t k=0; k<12; ++k) {
+        wht_score += dists.wht[k] * w_wht[k];
+    }
+
+    return (dists.vocab * w_vocab) + wht_score + (dists.gcd * w_gcd) + (dists.vol * w_vol);
 }
 
 static void printHeader() {
@@ -2515,16 +2531,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Built " << chains.size() << " chains and found " << orphans.size() << " orphans" << std::endl;
 
-    // --- STEP 2: Sort Chains by Donor Priority ---
-    std::sort(chains.begin(), chains.end(), [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
-        double score_a = 0.0;
-        double score_b = 0.0;
-        for (size_t seg : a) score_a += donor_scores[seg];
-        for (size_t seg : b) score_b += donor_scores[seg];
-        return score_a > score_b; // Descending (Best donors first)
-    });
-    std::cout << "Sorted " << chains.size() << " chains by Donor Priority." << std::endl;
-
     // Handle orphans: sort by entropy cost ascending
     auto get_cost = [&](size_t seg) -> double {
       if (!entropies.empty()) {
@@ -2539,6 +2545,48 @@ int main(int argc, char* argv[]) {
         return segments[seg].second; // length as proxy
       }
     };
+
+    // --- STEP 2: Sort Chains by Cleanliness & Priority ---
+    std::cout << "Sorting chains by Toxicity and Donor Score..." << std::endl;
+    std::sort(chains.begin(), chains.end(), [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
+        // 1. Calculate Toxicity (Average Entropy)
+        auto chain_entropy = [&](const std::vector<size_t>& chain) {
+            double total = 0.0;
+            for (size_t s : chain) total += get_cost(s);
+            // If get_cost returns total bits, divide by length. 
+            // Here get_cost returns entropy*len or just len. 
+            // We need Bits-Per-Byte approximation. 
+            // Assuming get_cost approx equals compressed size in bits:
+            double len = 0.0;
+            for (size_t s : chain) len += segments[s].second;
+            return (len > 0) ? (total / len) : 8.0; 
+        };
+
+        // Note: get_cost currently returns "Approximate Bits". 
+        // We need to normalize if we want true "Bits Per Byte".
+        // However, for sorting, "Total Entropy" (Cost) is a reasonable proxy for difficulty 
+        // if segments are roughly same size.
+        
+        // Strategy: "Toxic Deferral"
+        // If a chain is "Hard" (High Entropy), push it to the end.
+        // We use a simplified check: Compare average per-segment cost.
+        double cost_a = 0.0; for(auto s : a) cost_a += get_cost(s);
+        double cost_b = 0.0; for(auto s : b) cost_b += get_cost(s);
+        double avg_a = cost_a / a.size();
+        double avg_b = cost_b / b.size();
+
+        // Heuristic: If one is significantly "Harder" (> 20% diff), sort by difficulty (Easy First)
+        // "Easy First" means Low Cost First.
+        if (std::abs(avg_a - avg_b) > (std::min(avg_a, avg_b) * 0.2)) {
+            return avg_a < avg_b;
+        }
+
+        // 2. Otherwise (similar difficulty), sort by Donor Score (Helpfulness)
+        double score_a = 0.0; for (size_t seg : a) score_a += donor_scores[seg];
+        double score_b = 0.0; for (size_t seg : b) score_b += donor_scores[seg];
+        return score_a > score_b; // Descending (Best donors first)
+    });
+    std::cout << "Sorted " << chains.size() << " chains." << std::endl;
     // --- STEP 3: Smart Orphan Sort ---
     std::sort(orphans.begin(), orphans.end(), [&](size_t a, size_t b) {
         if (std::abs(donor_scores[a] - donor_scores[b]) > 1e-4) {
