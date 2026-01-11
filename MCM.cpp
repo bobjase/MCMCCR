@@ -158,6 +158,191 @@ float hellinger_distance(const MarkovMatrix& m1, const MarkovMatrix& m2) {
   return sqrtf(dist);
 }
 
+// --- Hybrid Holographic Fingerprinting Structures ---
+
+struct Fingerprint {
+    // Tier 1: Vocabulary (Asymmetric Containment)
+    std::vector<uint32_t> minhashes; // Bottom-256 hashes
+
+    // Tier 2A: Structural Energy (WHT Spectrum)
+    std::vector<float> wht_energy;   // Energy in 16 dyadic bands
+
+    // Tier 2B: Structural Alignment (GCD Signature)
+    std::vector<int> gcd_peaks;      // Top 3 common divisors of symbol gaps
+
+    // Tier 3: State Volatility
+    float volatility;                // Entropy estimate
+};
+
+// --- Helper: Fast Rolling Hash (Cyclic Polynomial) ---
+inline uint32_t hash_ngram(const uint8_t* data, size_t len) {
+    uint32_t h = 0;
+    for (size_t i = 0; i < len; ++i) {
+        h = (h << 5) ^ (h >> 27) ^ data[i]; // Fast rotate-XOR mix
+    }
+    return h;
+}
+
+// --- Helper: Fast Walsh-Hadamard Transform (In-Place) ---
+void fwht(std::vector<float>& data) {
+    size_t n = data.size();
+    for (size_t h = 1; h < n; h <<= 1) {
+        for (size_t i = 0; i < n; i += h * 2) {
+            for (size_t j = i; j < i + h; ++j) {
+                float x = data[j];
+                float y = data[j + h];
+                data[j] = x + y;
+                data[j + h] = x - y;
+            }
+        }
+    }
+}
+
+// --- Helper: Euclidean GCD ---
+int gcd(int a, int b) {
+    while (b != 0) {
+        int t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+// --- Helper: GCD of Gaps ---
+int compute_gcd_signature(const std::vector<uint8_t>& data) {
+    // Track gaps for the most frequent byte
+    size_t counts[256] = {0};
+    for (uint8_t b : data) counts[b]++;
+
+    uint8_t top_byte = 0;
+    size_t max_count = 0;
+    for (int i=0; i<256; ++i) if(counts[i] > max_count) { max_count = counts[i]; top_byte = i; }
+
+    if (max_count < 5) return 1; // Not enough data
+
+    int current_gcd = 0;
+    int last_pos = -1;
+
+    for (size_t i = 0; i < data.size(); ++i) {
+        if (data[i] == top_byte) {
+            if (last_pos != -1) {
+                int gap = i - last_pos;
+                if (current_gcd == 0) current_gcd = gap;
+                else current_gcd = gcd(current_gcd, gap);
+                // Optimization: If GCD decays to 1, stop early
+                if (current_gcd == 1) return 1;
+            }
+            last_pos = i;
+        }
+    }
+    return current_gcd;
+}
+
+// --- Feature Extraction ---
+Fingerprint compute_fingerprint(const std::vector<uint8_t>& segment) {
+    Fingerprint f;
+
+    // 1. MinHash (Vocabulary)
+    std::set<uint32_t> hashes;
+    const size_t kNgram = 4;
+    for (size_t i = 0; i + kNgram <= segment.size(); ++i) {
+        uint32_t h = hash_ngram(&segment[i], kNgram);
+        if (hashes.size() < 256) hashes.insert(h);
+        else if (h < *hashes.rbegin()) {
+            hashes.erase(std::prev(hashes.end()));
+            hashes.insert(h);
+        }
+    }
+    f.minhashes.assign(hashes.begin(), hashes.end());
+
+    // 2. WHT Spectrum (Structure)
+    // Analyze first 4096 bytes (power of 2 required for WHT)
+    size_t wht_len = 4096;
+    std::vector<float> wht_buf(wht_len, 0.0f);
+    size_t limit = std::min(segment.size(), wht_len);
+    for (size_t i = 0; i < limit; ++i) wht_buf[i] = (segment[i] > 127) ? 1.0f : -1.0f; // Binarize
+
+    fwht(wht_buf);
+
+    // Bin Energy into Dyadic Bands (Sequency 1, 2..3, 4..7, etc.)
+    f.wht_energy.resize(12, 0.0f); // log2(4096) = 12 bands
+    for (size_t i = 1; i < wht_len; ++i) {
+        int band = 0;
+        size_t temp = i;
+        while (temp >>= 1) band++; // log2(i)
+        if (band < 12) f.wht_energy[band] += std::abs(wht_buf[i]);
+    }
+    // Normalize Energy
+    float total_e = 0.0f;
+    for(float e : f.wht_energy) total_e += e;
+    if(total_e > 0) for(float& e : f.wht_energy) e /= total_e;
+
+    // 3. GCD (Alignment)
+    f.gcd_peaks.push_back(compute_gcd_signature(segment)); // Only primary GCD for speed
+
+    // 4. Volatility (Entropy Proxy)
+    // Use Shannon Entropy of Histogram as robust proxy
+    float hist[256] = {0};
+    for(uint8_t b : segment) hist[b]++;
+    float ent = 0;
+    float inv_len = 1.0f / segment.size();
+    for(int i=0; i<256; ++i) {
+        if(hist[i] > 0) {
+            float p = hist[i] * inv_len;
+            ent -= p * std::log2(p);
+        }
+    }
+    f.volatility = ent;
+
+    return f;
+}
+
+// --- Distance Metric ---
+float hybrid_distance(const Fingerprint& donor, const Fingerprint& recv) {
+    // 1. Asymmetric Containment (Vocabulary)
+    // Score = |Intersection| / |Recv|
+    // "How much of Recv's dictionary does Donor have?"
+    size_t matches = 0;
+    size_t i=0, j=0;
+    while(i < donor.minhashes.size() && j < recv.minhashes.size()) {
+        if (donor.minhashes[i] < recv.minhashes[j]) i++;
+        else if (donor.minhashes[i] > recv.minhashes[j]) j++;
+        else { matches++; i++; j++; }
+    }
+    float containment = (recv.minhashes.empty()) ? 0.0f : (float)matches / recv.minhashes.size();
+    float vocab_dist = 1.0f - containment; // 0.0 = Perfect Containment
+
+    // 2. Structural Distance (WHT)
+    float wht_dist = 0.0f;
+    for(size_t k=0; k<donor.wht_energy.size(); ++k) {
+        float d = donor.wht_energy[k] - recv.wht_energy[k];
+        wht_dist += d*d;
+    }
+    wht_dist = std::sqrt(wht_dist);
+
+    // 3. Alignment Mismatch (GCD)
+    // Penalty if they have different non-trivial GCDs
+    float gcd_penalty = 0.0f;
+    int g1 = donor.gcd_peaks[0];
+    int g2 = recv.gcd_peaks[0];
+    if (g1 > 1 && g2 > 1 && g1 != g2 && (g1 % g2 != 0) && (g2 % g1 != 0)) {
+        gcd_penalty = 0.5f; // Strong penalty for mismatched grids
+    }
+
+    // 4. Volatility Gradient (Cooling Schedule)
+    // Penalize: Structured (Low Ent) -> Noisy (High Ent)
+    float vol_penalty = 0.0f;
+    if (recv.volatility > donor.volatility + 0.5f) {
+        vol_penalty = (recv.volatility - donor.volatility) * 0.5f;
+    }
+
+    // Combined Score
+    // Vocabulary is King (0.6 weight).
+    // Structure ensures we don't mix Code/Image.
+    // Volatility ensures stability.
+    return (vocab_dist * 0.6f) + (wht_dist * 0.2f) + gcd_penalty + vol_penalty;
+}
+
 static void printHeader() {
   std::cout << "MCM compressor" << std::endl;
 }
@@ -1427,7 +1612,7 @@ int main(int argc, char* argv[]) {
   }
   case Options::kModeFingerprint: {
     printHeader();
-    std::cout << "Running Fingerprinting Mode" << std::endl;
+    std::cout << "Running Hybrid Holographic Fingerprinting Mode" << std::endl;
     // Read .segments file
     if (argc != 3) {
       std::cerr << "Usage: mcm -fingerprint <original_file>" << std::endl;
@@ -1461,7 +1646,7 @@ int main(int argc, char* argv[]) {
     fin.read(&file_data[0], fin.length());
     fin.close();
 
-    // Compute matrices
+    // Filter valid segments
     std::vector<std::pair<size_t, size_t>> valid_segments;
     for (auto& seg : segments) {
       size_t start = seg.first;
@@ -1473,33 +1658,41 @@ int main(int argc, char* argv[]) {
       valid_segments.push_back({start, len});
     }
     size_t num_valid = valid_segments.size();
-    std::vector<MarkovMatrix> matrices(num_valid);
-    for (size_t i = 0; i < num_valid; ++i) {
+
+    // Compute Hybrid Fingerprints
+    std::vector<Fingerprint> fingerprints(num_valid);
+    std::cout << "Computing Hybrid Holographic Fingerprints..." << std::endl;
+
+    // #pragma omp parallel for
+    for (int i = 0; i < (int)num_valid; ++i) {
       size_t start = valid_segments[i].first;
       size_t len = valid_segments[i].second;
-      std::vector<uint8_t> segment_data(file_data.begin() + start, file_data.begin() + start + len);
-      matrices[i] = compute_matrix(segment_data);
+      // Clamp len for feature extraction speed (first 16KB is usually enough for signature)
+      size_t scan_len = std::min(len, (size_t)16384);
+      std::vector<uint8_t> segment_data(file_data.begin() + start, file_data.begin() + start + scan_len);
+      fingerprints[i] = compute_fingerprint(segment_data);
+      if (i % 100 == 0) std::cout << "\rScan: " << i << "/" << num_valid << std::flush;
     }
+    std::cout << std::endl;
 
-    // Compute distances and find top-k
+    // Matching Loop (Asymmetric)
     size_t top_k = options.fingerprint_top_k;
     std::vector<std::vector<size_t>> candidates(num_valid);
 
-    std::cout << "Fingerprinting " << num_valid << " segments..." << std::endl;
-
-    // PARALLEL LOOP
-    // #pragma omp parallel for schedule(dynamic)
+    // #pragma omp parallel for
     for (int i = 0; i < (int)num_valid; ++i) {
       std::vector<std::pair<float, size_t>> distances;
       distances.reserve(num_valid);
-      
+
       for (size_t j = 0; j < num_valid; ++j) {
         if (i == j) continue;
-        float dist = hellinger_distance(matrices[i], matrices[j]);
+
+        // Note: Distance(Donor=j, Recv=i)
+        // We are looking for the best PREDECESSOR (j) for current segment (i)
+        float dist = hybrid_distance(fingerprints[j], fingerprints[i]);
         distances.emplace_back(dist, j);
       }
-      
-      // Partial Sort (faster than full sort for just Top-K)
+
       if (distances.size() > top_k) {
           std::partial_sort(distances.begin(), distances.begin() + top_k, distances.end());
           distances.resize(top_k);
@@ -1510,10 +1703,8 @@ int main(int argc, char* argv[]) {
       for (const auto& pair : distances) {
         candidates[i].push_back(pair.second);
       }
-      
-      if (i % 100 == 0) {
-          std::cout << "\rProgress: " << i << "/" << num_valid << std::flush;
-      }
+
+      if (i % 10 == 0) std::cout << "\rMatch: " << i << "/" << num_valid << std::flush;
     }
     std::cout << std::endl;
 
