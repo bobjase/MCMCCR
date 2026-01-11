@@ -1887,53 +1887,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Oracle processing completed in " << elapsed.count() << " seconds" << std::endl;
     break;
   }
-  struct BeamState {
-    double total_cost;  // Lower is better (entropy)
-    
-    // Graph Connectivity State
-    std::vector<int> next_segment; // [i] = successor of i (or -1)
-    std::vector<int> prev_segment; // [i] = predecessor of i (or -1)
-    
-    // Cycle Detection (Union-Find / DSU)
-    std::vector<int> dsu_parent;
-    
-    // Constructor
-    BeamState(size_t num_segments) : total_cost(0.0) {
-      next_segment.assign(num_segments, -1);
-      prev_segment.assign(num_segments, -1);
-      dsu_parent.resize(num_segments);
-      std::iota(dsu_parent.begin(), dsu_parent.end(), 0);
-    }
-    
-    // Helper: Find Representative (Path Compression)
-    int find_set(int v) {
-      if (v == dsu_parent[v]) return v;
-      return dsu_parent[v] = find_set(dsu_parent[v]);
-    }
-    
-    // Const version without path compression
-    int find_set(int v) const {
-      if (v == dsu_parent[v]) return v;
-      return find_set(dsu_parent[v]);
-    }
-    
-    // Helper: Union Sets
-    void union_sets(int a, int b) {
-      a = find_set(a);
-      b = find_set(b);
-      if (a != b) dsu_parent[b] = a;
-    }
-    
-    // Clone for beam expansion
-    BeamState clone() const {
-      BeamState copy(next_segment.size());
-      copy.total_cost = total_cost;
-      copy.next_segment = next_segment;
-      copy.prev_segment = prev_segment;
-      copy.dsu_parent = dsu_parent;
-      return copy;
-    }
-  };
   case Options::kModePathCover: {
     printHeader();
     std::cout << "Running PathCover Mode" << std::endl;
@@ -2133,105 +2086,117 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Pre-computed allowed fusions for graph optimization" << std::endl;
 
-    // RED TEAM FIX: Threshold is in TOTAL BITS. 
-    // 2.0 was too small. We require ~64 bytes (512 bits) of savings to justify a jump.
+    // --- GGCA-IR Algorithm ---
 
-    // Natural Baseline Fusion: Calculate natural order cost baseline
-    double natural_cost = 0.0;
-    for (size_t i = 0; i < num_segments - 1; ++i) {
-      // Find the cost of natural transition i -> i+1
-      bool found_natural = false;
-      for (const auto& edge : candidates[i]) {
-        if (edge.to == i + 1) {
-          natural_cost += edge.cost;
-          found_natural = true;
-          break;
-        }
+    // Data Structures
+    struct UnionFind {
+      std::vector<int> parent;
+      UnionFind(size_t n) {
+        parent.resize(n);
+        std::iota(parent.begin(), parent.end(), 0);
       }
-      if (!found_natural) {
-        // If no natural transition found, use orphan penalty as baseline
-        natural_cost += ORPHAN_PENALTY;
+      int find(int v) {
+        if (v == parent[v]) return v;
+        return parent[v] = find(parent[v]);
+      }
+      void unite(int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a != b) parent[b] = a;
+      }
+    };
+
+    struct EdgeSavings {
+      uint32_t u, v;
+      double savings;
+    };
+
+    std::vector<int> next_seg(num_segments, -1);
+    std::vector<int> prev_seg(num_segments, -1);
+    UnionFind dsu(num_segments);
+
+    // Phase 1: Global Edge Collection & Sorting
+    const double RESET_PENALTY = 2000.0;
+    std::vector<EdgeSavings> all_edges;
+    for (size_t pred = 0; pred < num_segments; ++pred) {
+      for (const auto& edge : candidates[pred]) {
+        size_t succ = edge.to;
+        double cost = edge.cost;
+        double savings = RESET_PENALTY - cost;
+        bool is_natural = (succ == pred + 1);
+        if (is_natural) {
+          savings += 0.1 * std::abs(cost);
+        }
+        if (savings > 0) {
+          all_edges.push_back({static_cast<uint32_t>(pred), static_cast<uint32_t>(succ), savings});
+        }
       }
     }
-    std::cout << "Natural order baseline cost: " << natural_cost << std::endl;
+    std::sort(all_edges.begin(), all_edges.end(), [](const EdgeSavings& a, const EdgeSavings& b) {
+      return a.savings > b.savings; // Descending
+    });
+    std::cout << "Collected " << all_edges.size() << " edges for GGCA-IR" << std::endl;
 
-    // Initialize beam with one empty state
-    std::vector<BeamState> current_beam;
-    current_beam.emplace_back(num_segments);
+    // Phase 2: Greedy Construction (Kruskal Pass)
+    for (const auto& edge : all_edges) {
+      uint32_t u = edge.u;
+      uint32_t v = edge.v;
+      if (next_seg[u] == -1 && prev_seg[v] == -1 && dsu.find(u) != dsu.find(v)) {
+        next_seg[u] = v;
+        prev_seg[v] = u;
+        dsu.unite(u, v);
+      }
+    }
+    std::cout << "Completed Greedy Construction" << std::endl;
 
-    // Process segments in order
-    for (size_t current_node = 0; current_node < num_segments; ++current_node) {
-      std::vector<BeamState> next_beam_candidates;
-      
-      // Expand each state in current beam
-      for (const auto& state : current_beam) {
-        // Option 1: Skip current_node (leave as orphan)
-        {
-          BeamState new_state = state.clone();
-          new_state.total_cost += ORPHAN_PENALTY;  // Penalty for orphan
-          next_beam_candidates.push_back(std::move(new_state));
-        }
-        
-        // Option 2: Try linking to allowed fusions (pre-filtered and adjusted)
-        for (const auto& edge : allowed_fusions[current_node]) {
-          size_t succ = edge.to;
+    // Phase 3: Iterative Refinement (2 passes)
+    for (int pass = 0; pass < 2; ++pass) {
+      for (size_t u = 0; u < num_segments; ++u) {
+        for (const auto& edge : candidates[u]) {
+          size_t v = edge.to;
           double cost = edge.cost;
-          
-          // Check validity (pre-computed fusions are already valid candidates)
-          if (state.prev_segment[succ] != -1) continue;  // succ already has predecessor
-          if (state.find_set(current_node) == state.find_set(succ)) continue;  // would create cycle
-          
-          // Valid: create new state
-          BeamState new_state = state.clone();
-          new_state.next_segment[current_node] = succ;
-          new_state.prev_segment[succ] = current_node;
-          new_state.union_sets(current_node, succ);
-          new_state.total_cost += cost;
-          next_beam_candidates.push_back(std::move(new_state));
+          // Action A: Stitching
+          if (next_seg[u] == -1 && prev_seg[v] == -1 && dsu.find(u) != dsu.find(v) && cost < RESET_PENALTY) {
+            next_seg[u] = v;
+            prev_seg[v] = u;
+            dsu.unite(u, v);
+          }
+          // Action B: Rerouting/Stealing
+          else if (next_seg[u] == -1 && prev_seg[v] != -1) {
+            int old_pred = prev_seg[v];
+            if (cost < candidates[old_pred][0].cost) { // Assuming sorted, first is best
+              // Disconnect old
+              next_seg[old_pred] = -1;
+              // Connect new
+              next_seg[u] = v;
+              prev_seg[v] = u;
+              // DSU: Use old DSU for safety, no update
+            }
+          }
         }
       }
-      
-      // Prune to top BEAM_WIDTH by cost
-      std::sort(next_beam_candidates.begin(), next_beam_candidates.end(), 
-                [](const BeamState& a, const BeamState& b) {
-                  return a.total_cost < b.total_cost;
-                });
-      if (next_beam_candidates.size() > BEAM_WIDTH) {
-        next_beam_candidates.erase(next_beam_candidates.begin() + BEAM_WIDTH, next_beam_candidates.end());
-      }
-      current_beam = std::move(next_beam_candidates);
-      
-      // Progress indicator: overwrite same line with percentage
-      double progress = (current_node + 1.0) / num_segments * 100.0;
-      std::cout << "\rProgress: " << std::fixed << std::setprecision(1) << progress 
-                << "% (node " << (current_node + 1) << "/" << num_segments << ")" << std::flush;
+      std::cout << "Completed Refinement Pass " << (pass + 1) << std::endl;
     }
 
-    // Clear progress line and show completion
-    std::cout << "\rProgress: 100.0% (node " << num_segments << "/" << num_segments << ")" << std::endl;
-
-    // Select best state
-    const BeamState& best_state = current_beam[0];
-    std::cout << "Best state cost: " << best_state.total_cost << std::endl;
-
-    // Build chains from best state
+    // --- Output Generation ---
+    // Build chains from next_seg
     std::vector<std::vector<size_t>> chains;
     std::vector<bool> visited(num_segments, false);
     for (size_t i = 0; i < num_segments; ++i) {
-      if (!visited[i] && best_state.prev_segment[i] == -1) {
+      if (!visited[i] && prev_seg[i] == -1) {
         // Start of a chain
         std::vector<size_t> chain;
         size_t current = i;
         while (current != static_cast<size_t>(-1)) {
           visited[current] = true;
           chain.push_back(current);
-          current = best_state.next_segment[current];
+          current = next_seg[current];
         }
         chains.push_back(chain);
       }
     }
 
-    // Collect orphans (segments not in any chain)
+    // Collect orphans
     std::vector<size_t> orphans;
     for (size_t i = 0; i < num_segments; ++i) {
       if (!visited[i]) {
@@ -2242,14 +2207,12 @@ int main(int argc, char* argv[]) {
     std::cout << "Built " << chains.size() << " chains and found " << orphans.size() << " orphans" << std::endl;
 
     // --- STEP 2: Sort Chains by Donor Priority ---
-    // We want chains that start with strong donors to be placed earlier in the file.
-    // Score of a chain = Sum of donor scores of all segments in the chain.
     std::sort(chains.begin(), chains.end(), [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
         double score_a = 0.0;
         double score_b = 0.0;
         for (size_t seg : a) score_a += donor_scores[seg];
         for (size_t seg : b) score_b += donor_scores[seg];
-        return score_a < score_b; // Ascending (Most negative/savings first)
+        return score_a > score_b; // Descending (Best donors first)
     });
     std::cout << "Sorted " << chains.size() << " chains by Donor Priority." << std::endl;
 
@@ -2268,15 +2231,10 @@ int main(int argc, char* argv[]) {
       }
     };
     // --- STEP 3: Smart Orphan Sort ---
-    // Primary Key: Donor Score (Ascending) -> Put useful segments first.
-    // Secondary Key: Entropy Cost (Ascending) -> Put "Safe" segments before "Noise".
     std::sort(orphans.begin(), orphans.end(), [&](size_t a, size_t b) {
-        // 1. Primary: Donor Score
-        // Use a small epsilon for float comparison if needed, or just raw verify
         if (std::abs(donor_scores[a] - donor_scores[b]) > 1e-4) {
-             return donor_scores[a] < donor_scores[b]; // Stronger donor first
+             return donor_scores[a] > donor_scores[b]; // Stronger donor first
         }
-        // 2. Secondary: Entropy (The existing 'get_cost' logic)
         return get_cost(a) < get_cost(b);
     });
     std::cout << "Sorted orphans by Donor Score -> Entropy." << std::endl;
