@@ -400,7 +400,7 @@ public:
   std::string dict_file;
   // Segmentation parameters
   size_t segment_window = 512;
-  float segment_threshold = 16.0f;
+  float segment_threshold = 0.0f;
   size_t segment_min_segment = 4096;
   size_t segment_max_segment = 65536;  // 64KB max segment size
   size_t segment_lookback = 1024;  // Fingerprinting parameters
@@ -1460,154 +1460,157 @@ int main(int argc, char* argv[]) {
   }
   case Options::kModeSegment: {
     printHeader();
-    std::cout << "Running PELT Segmentation Mode" << std::endl;
+    std::cout << "Running Auto-Tuned MDL-PELT Segmentation" << std::endl;
 
-    // Configuration
-    size_t BLOCK_SIZE = std::max<size_t>(1, (size_t)options.segment_window);
-    double PENALTY_FACTOR = 0.5;  // Tuned for reasonable segmentation
-    std::cout << "BLOCK_SIZE: " << BLOCK_SIZE << ", PENALTY_FACTOR: " << PENALTY_FACTOR << std::endl;
-
-    // Open original file
-    std::string original_file = std::string(argv[2]);
-    std::ifstream fin(original_file, std::ios::binary | std::ios::ate);
-    if (!fin) {
-      std::cerr << "Error opening original file: " << original_file << std::endl;
-      return 1;
-    }
+    // 1. Configuration
+    const size_t BLOCK_SIZE = (options.segment_window > 0) ? options.segment_window : 512;
+    std::string in_file = options.files[0].getName();
+    
+    // 2. Load Data & Build Prefix Histograms (Heavy Lift - Do Once)
+    std::ifstream fin(in_file, std::ios::binary | std::ios::ate);
+    if (!fin) { std::cerr << "Error: " << in_file << std::endl; return 1; }
     size_t file_size = fin.tellg();
     fin.seekg(0);
-    std::cout << "File size: " << formatNumber(file_size) << " bytes" << std::endl;
-
-    // Compute number of blocks
     size_t num_blocks = (file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    std::cout << "Number of blocks: " << num_blocks << std::endl;
-
-    // Build prefix histograms
-    std::vector<std::vector<uint32_t>> prefix_counts(num_blocks + 1, std::vector<uint32_t>(256, 0));
+    
+    std::cout << "File: " << formatNumber(file_size) << " bytes | Blocks: " << num_blocks << std::endl;
+    std::cout << "Building Histograms..." << std::flush;
 
     std::vector<uint8_t> buffer(BLOCK_SIZE);
-    for (size_t b = 0; b < num_blocks; ++b) {
-      size_t bytes_to_read = std::min(BLOCK_SIZE, file_size - b * BLOCK_SIZE);
-      fin.read(reinterpret_cast<char*>(buffer.data()), bytes_to_read);
-      // Copy previous
-      prefix_counts[b + 1] = prefix_counts[b];
-      // Add current block
-      for (size_t i = 0; i < bytes_to_read; ++i) {
-        prefix_counts[b + 1][buffer[i]]++;
-      }
+    // Use uint32_t to save RAM (4 bytes vs 8 bytes) 
+    std::vector<std::array<uint32_t, 256>> prefix_counts;
+    prefix_counts.reserve(num_blocks + 1);
+    prefix_counts.push_back({}); // 0-th is empty
+    std::fill(prefix_counts[0].begin(), prefix_counts[0].end(), 0);
+
+    std::array<uint32_t, 256> current_counts = {0};
+    for (size_t i = 0; i < num_blocks; ++i) {
+        size_t read_size = std::min(BLOCK_SIZE, file_size - (i * BLOCK_SIZE));
+        fin.read(reinterpret_cast<char*>(buffer.data()), read_size);
+        for (size_t k = 0; k < read_size; ++k) current_counts[buffer[k]]++;
+        prefix_counts.push_back(current_counts);
     }
     fin.close();
-    std::cout << "Built prefix histograms" << std::endl;
+    std::cout << " Done." << std::endl;
 
-    // Pre-compute x_log_x table
-    std::vector<double> x_log_x(BLOCK_SIZE + 1);
-    for (size_t x = 0; x <= BLOCK_SIZE; ++x) {
-      x_log_x[x] = (x == 0) ? 0.0 : x * std::log2(x);
-    }
+    // 3. Pre-compute Log Table
+    const size_t LOG_TABLE_SIZE = 65536; 
+    std::vector<double> x_log_x(LOG_TABLE_SIZE);
+    x_log_x[0] = 0.0;
+    for (size_t i = 1; i < LOG_TABLE_SIZE; ++i) x_log_x[i] = i * std::log2(i);
 
-    // Cost function
-    auto CalculateCost = [&](size_t start_block, size_t end_block) -> double {
-      std::vector<uint32_t> counts(256);
-      for (int b = 0; b < 256; ++b) {
-        counts[b] = prefix_counts[end_block][b] - prefix_counts[start_block][b];
-      }
-      size_t length;
-      if (end_block < num_blocks) {
-        length = (end_block - start_block) * BLOCK_SIZE;
-      } else {
-        size_t full_blocks = end_block - start_block - 1;
-        size_t last_size = file_size - (num_blocks - 1) * BLOCK_SIZE;
-        length = full_blocks * BLOCK_SIZE + last_size;
-      }
-      if (length == 0) return 0.0;
+    // 4. The PELT Solver (Reusable Lambda)
+    const double log_N = std::log2(file_size);
+    const double K = 255.0; 
 
-      double entropy = std::log2(length);
-      double sum_x_log_x = 0.0;
-      for (int b = 0; b < 256; ++b) {
-        if (counts[b] > 0) {
-          if (counts[b] <= BLOCK_SIZE) {
-            sum_x_log_x += x_log_x[counts[b]];
-          } else {
-            sum_x_log_x += counts[b] * std::log2(counts[b]);
-          }
+    // Helper to calc cost between blocks
+    auto GetSegCost = [&](size_t start, size_t end, double penalty) -> double {
+        const auto& c_end = prefix_counts[end];
+        const auto& c_start = prefix_counts[start];
+        size_t len = (end == num_blocks) ? (file_size - start * BLOCK_SIZE) : ((end - start) * BLOCK_SIZE);
+        if (len == 0) return 0.0;
+
+        double sum_c_log_c = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            uint32_t count = c_end[i] - c_start[i];
+            if (count > 0) {
+                if (count < LOG_TABLE_SIZE) sum_c_log_c += x_log_x[count];
+                else sum_c_log_c += count * std::log2(count);
+            }
         }
-      }
-      entropy -= (1.0 / length) * sum_x_log_x;
-      return length * entropy;
+        double term_L_log_L = (len < LOG_TABLE_SIZE) ? x_log_x[len] : (len * std::log2(len));
+        return (term_L_log_L - sum_c_log_c) + penalty;
     };
 
-    // PELT Algorithm
-    std::vector<double> F(num_blocks + 1, std::numeric_limits<double>::infinity());
-    std::vector<size_t> bp(num_blocks + 1, 0);
-    std::vector<size_t> candidates = {0};
-    double penalty = 0.5 * 255 * std::log2(file_size) * PENALTY_FACTOR;
-    F[0] = -penalty;
+    auto RunPELT = [&](double factor) -> std::vector<size_t> {
+        double penalty = 0.5 * K * log_N * factor;
+        std::vector<double> F(num_blocks + 1, 1e18);
+        std::vector<int> bp(num_blocks + 1, -1);
+        std::vector<size_t> candidates = {0};
+        F[0] = -penalty; 
 
-    for (size_t t = 1; t <= num_blocks; ++t) {
-      double best_cost = std::numeric_limits<double>::infinity();
-      for (size_t tau : candidates) {
-        double seg_cost = CalculateCost(tau, t);
-        double total_cost = F[tau] + seg_cost + penalty;
-        if (total_cost < best_cost) {
-          best_cost = total_cost;
-          bp[t] = tau;
+        for (size_t t = 1; t <= num_blocks; ++t) {
+            double min_cost = 1e18;
+            int best_tau = -1;
+            
+            // Update
+            for (size_t tau : candidates) {
+                double c = F[tau] + GetSegCost(tau, t, penalty);
+                if (c < min_cost) { min_cost = c; best_tau = tau; }
+            }
+            F[t] = min_cost;
+            bp[t] = best_tau;
+
+            // Prune
+            auto it = std::remove_if(candidates.begin(), candidates.end(), [&](size_t tau) {
+                return (F[tau] + GetSegCost(tau, t, penalty)) > F[t];
+            });
+            candidates.erase(it, candidates.end());
+            candidates.push_back(t);
         }
-      }
-      F[t] = best_cost;
 
-      // Prune
-      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-        [&](size_t tau) {
-          double prune_cost = F[tau] + CalculateCost(tau, t) + penalty;
-          return prune_cost > F[t];
-        }), candidates.end());
+        // Backtrack
+        std::vector<size_t> cuts;
+        size_t curr = num_blocks;
+        while (curr > 0) {
+            cuts.push_back(curr);
+            curr = bp[curr];
+        }
+        cuts.push_back(0);
+        std::reverse(cuts.begin(), cuts.end());
+        return cuts;
+    };
 
-      // Add
-      candidates.push_back(t);
+    // 5. Auto-Tuning Loop
+    // Target: Avg segment size ~16KB (Adjustable)
+    size_t target_count = file_size / 16384; 
+    if (target_count < 50) target_count = 50; // Minimum sanity
+    if (target_count > 50000) target_count = 50000; // Cap
 
-      // Logging
-      if (t % 1000 == 0) {
-        std::cout << "Block " << t << "/" << num_blocks << " | Active Candidates: " << candidates.size() << std::endl;
-      }
+    double low = 0.05, high = 5.0;
+    double best_factor = 1.2;
+    std::vector<size_t> best_cuts;
+    
+    // Or use user override if provided
+    if (options.segment_threshold > 0.0) {
+        std::cout << "Using manual threshold: " << options.segment_threshold << std::endl;
+        best_cuts = RunPELT(options.segment_threshold);
+    } else {
+        std::cout << "Auto-Tuning for ~" << target_count << " segments..." << std::endl;
+        for (int i = 0; i < 10; ++i) {
+            double mid = (low + high) / 2.0;
+            auto cuts = RunPELT(mid);
+            size_t count = cuts.size() - 1;
+            
+            std::cout << "  Iter " << i << ": Factor=" << mid << " -> " << count << " segs" << std::endl;
+            
+            if (abs((long)count - (long)target_count) < (target_count * 0.1)) {
+                best_cuts = std::move(cuts);
+                best_factor = mid;
+                break; // Close enough
+            }
+            
+            if (count < target_count) high = mid; // Too few -> Lower penalty
+            else low = mid; // Too many -> Raise penalty
+            
+            if (i == 9) best_cuts = std::move(cuts); // Take last result
+        }
     }
 
-    // Backtrack to get segments
-    std::vector<size_t> block_cuts;
-    size_t current = num_blocks;
-    while (current > 0) {
-      size_t prev = bp[current];
-      block_cuts.push_back(prev);
-      current = prev;
-    }
-    std::reverse(block_cuts.begin(), block_cuts.end());
+    std::cout << "Final: " << (best_cuts.size() - 1) << " segments." << std::endl;
 
-    // Convert to byte boundaries
-    std::vector<size_t> boundaries;
-    boundaries.push_back(0);
-    for (size_t block : block_cuts) {
-      if (block > 0) {
-        boundaries.push_back(block * BLOCK_SIZE);
-      }
-    }
-    boundaries.push_back(file_size);
-
-    // Output segments
-    std::string in_file = std::string(argv[2]);
+    // 6. Write Output
     std::string out_file = in_file + ".segments";
     std::ofstream ofs(out_file);
-    if (!ofs) {
-      std::cerr << "Error opening output file: " << out_file << std::endl;
-      return 1;
-    }
-    uint64_t num_segments = boundaries.size() - 1;
-    ofs << num_segments << std::endl;
-    for (size_t i = 0; i < num_segments; ++i) {
-      uint64_t start = boundaries[i];
-      uint64_t length = boundaries[i + 1] - boundaries[i];
-      ofs << start << " " << length << std::endl;
+    if (!ofs) return 1;
+    ofs << (best_cuts.size() - 1) << std::endl;
+    for (size_t i = 0; i < best_cuts.size() - 1; ++i) {
+        size_t start = best_cuts[i] * BLOCK_SIZE;
+        size_t end = (best_cuts[i+1] == num_blocks) ? file_size : (best_cuts[i+1] * BLOCK_SIZE);
+        ofs << start << " " << (end - start) << std::endl;
     }
     ofs.close();
-    std::cout << "Wrote " << formatNumber(num_segments) << " segments to " << out_file << std::endl;
+    std::cout << "Wrote segments to " << out_file << std::endl;
     break;
   }
   case Options::kModeFingerprint: {
