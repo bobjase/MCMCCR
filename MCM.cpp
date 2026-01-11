@@ -2192,8 +2192,14 @@ int main(int argc, char* argv[]) {
       }
       current_beam = std::move(next_beam_candidates);
       
-      std::cout << "Processed node " << current_node << ", beam size: " << current_beam.size() << std::endl;
+      // Progress indicator: overwrite same line with percentage
+      double progress = (current_node + 1.0) / num_segments * 100.0;
+      std::cout << "\rProgress: " << std::fixed << std::setprecision(1) << progress 
+                << "% (node " << (current_node + 1) << "/" << num_segments << ")" << std::flush;
     }
+
+    // Clear progress line and show completion
+    std::cout << "\rProgress: 100.0% (node " << num_segments << "/" << num_segments << ")" << std::endl;
 
     // Select best state
     const BeamState& best_state = current_beam[0];
