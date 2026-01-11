@@ -178,6 +178,13 @@ struct Fingerprint {
     float volatility;                // Entropy estimate
 };
 
+struct DistanceComponents {
+    float vocab;
+    std::vector<float> wht;
+    float gcd;
+    float vol;
+};
+
 // --- Helper: Fast Rolling Hash (Cyclic Polynomial) ---
 inline uint32_t hash_ngram(const uint8_t* data, size_t len) {
     uint32_t h = 0;
@@ -302,7 +309,9 @@ Fingerprint compute_fingerprint(const std::vector<uint8_t>& segment) {
 }
 
 // --- Distance Metric ---
-float hybrid_distance(const Fingerprint& donor, const Fingerprint& recv) {
+DistanceComponents compute_raw_dist(const Fingerprint& donor, const Fingerprint& recv) {
+    DistanceComponents dists = {0.0f, std::vector<float>(12, 0.0f), 0.0f, 0.0f};
+
     // 1. Asymmetric Containment (Vocabulary)
     // Score = |Intersection| / |Recv|
     // "How much of Recv's dictionary does Donor have?"
@@ -314,15 +323,13 @@ float hybrid_distance(const Fingerprint& donor, const Fingerprint& recv) {
         else { matches++; i++; j++; }
     }
     float containment = (recv.minhashes.empty()) ? 0.0f : (float)matches / recv.minhashes.size();
-    float vocab_dist = 1.0f - containment; // 0.0 = Perfect Containment
+    dists.vocab = 1.0f - containment; // 0.0 = Perfect Containment
 
     // 2. Structural Distance (WHT)
-    float wht_dist = 0.0f;
-    for(size_t k=0; k<donor.wht_energy.size(); ++k) {
-        float d = donor.wht_energy[k] - recv.wht_energy[k];
-        wht_dist += d*d;
+    dists.wht.resize(12);
+    for(size_t k=0; k<12; ++k) {
+        dists.wht[k] = std::abs(donor.wht_energy[k] - recv.wht_energy[k]);
     }
-    wht_dist = std::sqrt(wht_dist);
 
     // 3. Alignment Mismatch (GCD)
     // Penalty if they have different non-trivial GCDs
@@ -332,6 +339,7 @@ float hybrid_distance(const Fingerprint& donor, const Fingerprint& recv) {
     if (g1 > 1 && g2 > 1 && g1 != g2 && (g1 % g2 != 0) && (g2 % g1 != 0)) {
         gcd_penalty = 0.5f; // Strong penalty for mismatched grids
     }
+    dists.gcd = gcd_penalty;
 
     // 4. Volatility Gradient (Cooling Schedule)
     // Penalize: Structured (Low Ent) -> Noisy (High Ent)
@@ -339,12 +347,21 @@ float hybrid_distance(const Fingerprint& donor, const Fingerprint& recv) {
     if (recv.volatility > donor.volatility + 0.5f) {
         vol_penalty = (recv.volatility - donor.volatility) * 0.5f;
     }
+    dists.vol = vol_penalty;
 
+    return dists;
+}
+
+float hybrid_distance(const Fingerprint& donor, const Fingerprint& recv) {
+    DistanceComponents dists = compute_raw_dist(donor, recv);
     // Combined Score
     // Vocabulary is King (0.6 weight).
     // Structure ensures we don't mix Code/Image.
     // Volatility ensures stability.
-    return (vocab_dist * 0.6f) + (wht_dist * 0.2f) + gcd_penalty + vol_penalty;
+    float wht_dist = 0.0f;
+    for (float d : dists.wht) wht_dist += d * d;
+    wht_dist = std::sqrt(wht_dist);
+    return (dists.vocab * 0.6f) + (wht_dist * 0.2f) + dists.gcd + dists.vol;
 }
 
 static void printHeader() {
@@ -796,6 +813,9 @@ int OracleChildMain(int argc, char* argv[]) {
             memcpy(data_pred.data(), file_data + start_pred, len_pred);
             debugLog("Got pred data");
 
+            // Compute fingerprint for pred
+            Fingerprint fp_pred = compute_fingerprint(data_pred);
+
             // For each succ
             for (size_t i = 0; i < succ_list.size(); ++i) {
                 size_t succ = succ_list[i];
@@ -810,6 +830,16 @@ int OracleChildMain(int argc, char* argv[]) {
                 debugLog("Getting succ data for " + std::to_string(succ));
                 size_t start_succ = valid_segments[succ].first;
                 size_t len_succ = valid_segments[succ].second;
+
+                // Compute fingerprint for succ (use first 16384 bytes)
+                size_t fp_len_succ = std::min(len_succ, (size_t)16384);
+                std::vector<uint8_t> fp_data_succ(fp_len_succ);
+                memcpy(fp_data_succ.data(), file_data + start_succ, fp_len_succ);
+                Fingerprint fp_succ = compute_fingerprint(fp_data_succ);
+
+                // Compute raw distances
+                DistanceComponents dists = compute_raw_dist(fp_pred, fp_succ);
+
                 size_t head_len = std::min((size_t)10240, len_succ);
                 std::vector<uint8_t> head_succ(head_len);
                 memcpy(head_succ.data(), file_data + start_succ, head_len);
@@ -844,6 +874,19 @@ int OracleChildMain(int argc, char* argv[]) {
                 } catch (...) {
                     debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
                     cost = 1e9;  // High cost to avoid selecting
+                }
+
+                // Log to calibration dataset
+                double oracle_savings = -cost;
+                if (oracle_savings > -100.0) {
+                    DWORD pid = GetCurrentProcessId();
+                    std::string filename = "calibration_" + std::to_string(pid) + ".csv";
+                    std::ofstream csv(filename, std::ios::app);
+                    if (csv) {
+                        csv << pred_id << "," << succ << "," << dists.vocab;
+                        for (float w : dists.wht) csv << "," << w;
+                        csv << "," << dists.gcd << "," << dists.vol << "," << oracle_savings << "\n";
+                    }
                 }
 
                 succ_costs[succ].emplace_back(pred_id, cost);
