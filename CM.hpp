@@ -138,6 +138,25 @@ namespace cm {
           }
           pages_[page_idx][index & kPageMask] = val;
       }
+
+      // FAST RESET: Clears pages but keeps the directory structure allocated.
+      // Call this to reuse the object for a new candidate.
+      void Reset() {
+          if (!pages_) return;
+          
+          // 1. Free all allocated 4KB pages
+          for (size_t i = 0; i < num_pages_; ++i) {
+              if (pages_[i]) {
+                  free(pages_[i]);
+                  pages_[i] = nullptr;
+              }
+          }
+          // 2. Zero the directory (Fastest way to clear pointers)
+          // Note: calloc already zeroed it initially, but we need to ensure it's clean.
+          // Since we set pointers to null in the loop above, we strictly don't need memset 
+          // IF we iterate everything. But memset is safer/faster for sparse checks if we optimize the loop.
+          // Optimization: Only iterate known dirty pages if we tracked them, but for now simple loop is safe.
+      }
   };
 
   class CMProfile {
@@ -473,7 +492,10 @@ namespace cm {
       current_entropy = snap.current_entropy_snapshot;
       entropies = snap.entropies_snapshot;
       buffer_.SetPos(snap.buffer_pos_snapshot);
-      memset(base_hash_table_, 0, hash_alloc_size_);
+      
+      // CRITICAL FIX: Do NOT wipe the base table!
+      // In Tournament mode, this table holds the frozen Predecessor state.
+      // memset(base_hash_table_, 0, hash_alloc_size_);
     }
 
     double getAccumulatedEntropy() const {

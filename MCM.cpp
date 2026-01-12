@@ -674,7 +674,7 @@ int OracleChildMain(int argc, char* argv[]) {
     DWORD written;
     try {
         if (argc < 4) {
-            debugLog("Error: argc < 4");
+            debugError("Error: argc < 4");
             return 1;
         }
         std::string original_file = argv[2];
@@ -790,25 +790,25 @@ int OracleChildMain(int argc, char* argv[]) {
             // Read pred_id
             size_t pred_id;
             if (fread(&pred_id, sizeof(size_t), 1, stdin) != 1) {
-                debugLog("Failed to read pred_id, exiting");
+                debugError("Failed to read pred_id, exiting");
                 break;
             }
             debugLog("read pred_id: " + std::to_string(pred_id));
             if (pred_id >= valid_segments.size()) {
-                debugLog("Invalid pred_id");
+                debugError("Invalid pred_id");
                 continue;
             }
 
             // Read succ_list
             uint64_t num_succ;
             if (fread(&num_succ, sizeof(uint64_t), 1, stdin) != 1) {
-                debugLog("Failed to read num_succ");
+                debugError("Failed to read num_succ");
                 break;
             }
             debugLog("read num_succ: " + std::to_string(num_succ));
             std::vector<size_t> succ_list(num_succ);
             if (num_succ > 0 && fread(succ_list.data(), sizeof(size_t), num_succ, stdin) != num_succ) {
-                debugLog("Failed to read succ_list");
+                debugError("Failed to read succ_list");
                 break;
             }
             debugLog("read succ_list");
@@ -816,10 +816,16 @@ int OracleChildMain(int argc, char* argv[]) {
             // Read alone_costs
             std::vector<double> alone_costs(num_succ);
             if (num_succ > 0 && fread(alone_costs.data(), sizeof(double), num_succ, stdin) != num_succ) {
-                debugLog("Failed to read alone_costs");
+                debugError("Failed to read alone_costs");
                 break;
             }
             debugLog("read alone_costs");
+
+            // Create succ to alone cost map
+            std::vector<double> succ_alone_costs(valid_segments.size(), 0.0);
+            for (size_t i = 0; i < succ_list.size(); ++i) {
+                succ_alone_costs[succ_list[i]] = alone_costs[i];
+            }
 
             // Process the pred
             std::map<size_t, std::vector<std::pair<size_t, double>>> succ_costs;
@@ -834,85 +840,162 @@ int OracleChildMain(int argc, char* argv[]) {
             // Compute fingerprint for pred
             Fingerprint fp_pred = compute_fingerprint(data_pred);
 
-            // For each succ
-            for (size_t i = 0; i < succ_list.size(); ++i) {
-                size_t succ = succ_list[i];
-                if (succ >= valid_segments.size()) continue;  // Invalid succ
-                debugLog("Processing succ " + std::to_string(succ) + " for pred " + std::to_string(pred_id));
+            // Take pred snapshot for tournament
+            auto pred_snapshot = cm.takeSnapshot();
+            double pred_cost = cm.getAccumulatedEntropy(); 
 
-                // Fast Reset (performance optimization)
-                cm.init();
-                cm.skip_init = true;
+            // this is always outputting 0 -- seems like a bug
+            debugError("Pred cost: " + std::to_string(pred_cost));
 
-                // Get succ data
-                debugLog("Getting succ data for " + std::to_string(succ));
-                size_t start_succ = valid_segments[succ].first;
-                size_t len_succ = valid_segments[succ].second;
+            // 2. TOURNAMENT ROSTER (Fixed Capacity)
+            struct Candidate {
+                size_t id;
+                cm::PagedOverlay* overlay;
+                double savings_rate;
+            };
+            std::vector<Candidate> roster;
+            roster.reserve(33); // Keep it small!
 
-                // Compute fingerprint for succ (use first 16384 bytes)
-                size_t fp_len_succ = std::min(len_succ, (size_t)16384);
-                std::vector<uint8_t> fp_data_succ(fp_len_succ);
-                memcpy(fp_data_succ.data(), file_data + start_succ, fp_len_succ);
-                Fingerprint fp_succ = compute_fingerprint(fp_data_succ);
+            // The "Working" Overlay (Recycled)
+            cm::PagedOverlay* worker_ov = new cm::PagedOverlay(cm.base_hash_table_, cm.hash_alloc_size_);
+            
+            // Reusable Chunk Buffer
+            std::vector<uint8_t> chunk_buf;
+            chunk_buf.reserve(4096); 
 
-                // Compute raw distances
-                DistanceComponents dists = compute_raw_dist(fp_pred, fp_succ);
+            // Void output stream for compression
+            VoidWriteStream out_pred;
 
-                size_t head_len = std::min((size_t)10240, len_succ);
-                std::vector<uint8_t> head_succ(head_len);
-                memcpy(head_succ.data(), file_data + start_succ, head_len);
-                debugLog("Got succ data");
 
-                // Use provided alone_bits
-                double alone_bits = alone_costs[i];
-
-                // Compress pred data
-                MemoryReadStream in_pred(data_pred);
-                VoidWriteStream out_pred;
-                cm.compress(&in_pred, &out_pred, data_pred.size());
-                double pred_entropy_sum = 0.0;
-                for (double e : cm.entropies) pred_entropy_sum += e;
-
-                // Compress head
-                debugLog("Compressing head for succ " + std::to_string(succ));
-                MemoryReadStream in_head(head_succ);
-                VoidWriteStream out_head;
-                double cost = 0.0;
-                debugLog("head_succ.size() = " + std::to_string(head_succ.size()));
-                try {
-                    cm.compress(&in_head, &out_head, head_succ.size());
-                    debugLog("compress done for succ " + std::to_string(succ));
-                    double total_entropy_sum = 0.0;
-                    for (double e : cm.entropies) total_entropy_sum += e;
-                    double transition_cost = total_entropy_sum - pred_entropy_sum;
-                    debugLog("transition_cost: " + std::to_string(transition_cost) + " for succ " + std::to_string(succ));
-                    // Compute cost as savings: transition_cost - alone_bits
-                    cost = transition_cost - alone_bits;
-                    debugLog("cost: " + std::to_string(cost) + " for succ " + std::to_string(succ));
-                } catch (...) {
-                    debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
-                    cost = 1e9;  // High cost to avoid selecting
+            // --- ROUND 1: QUALIFIERS (Streaming & Recycling) ---
+            for (size_t succ : succ_list) {
+                if (succ >= valid_segments.size()) {
+                  debugError("Invalid succ segment size");
+                  continue;
                 }
 
-                // Log to calibration dataset
-                if (calibration_mode) {
-                    double oracle_savings = -cost;
-                    if (oracle_savings > -100.0) {
-                        DWORD pid = GetCurrentProcessId();
-                        std::string filename = "calibration_" + std::to_string(pid) + ".csv";
-                        std::ofstream csv(filename, std::ios::app);
-                        if (csv) {
-                            csv << pred_id << "," << succ << "," << dists.vocab;
-                            for (float w : dists.wht) csv << "," << w;
-                            csv << "," << dists.gcd << "," << dists.vol << "," << oracle_savings << "\n";
-                        }
+                // 1. Setup Chunk
+                size_t start = valid_segments[succ].first;
+                size_t len = valid_segments[succ].second;
+                size_t scan_len = std::min((size_t)256, len);
+
+                // 2. Reset Worker (Reuse memory)
+                worker_ov->Reset(); 
+
+                // 3. Run Compression (ZERO COPY)
+                cm.SetOverlay(worker_ov);
+                cm.restoreSnapshot(pred_snapshot);
+                cm.byte_index = 0;
+
+                // Point directly to the memory-mapped file
+                const uint8_t* ptr_start = (const uint8_t*)(file_data + start);
+                ReadMemoryStream in_chunk(ptr_start, ptr_start + scan_len); // Uses Memory.hpp class
+                
+                debugError("Starting compression for succ " + std::to_string(succ));
+
+                cm.compress(&in_chunk, &out_pred, scan_len);
+
+                debugError("Finished compression for succ " + std::to_string(succ));
+
+                // 4. Score
+                double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
+                double alone_cost = succ_alone_costs[succ];
+                
+                double savings_rate = (alone_cost - joint_delta) / scan_len;
+
+                // 5. King of the Hill Logic
+                if (roster.size() < 32) {
+                    // Always accept if we have room
+                    roster.push_back({succ, worker_ov, savings_rate});
+                    // Allocate a NEW worker for next turn (since we kept the old one)
+                    worker_ov = new cm::PagedOverlay(cm.base_hash_table_, cm.hash_alloc_size_);
+                } else {
+                    // Find worst in roster
+                    auto min_it = std::min_element(roster.begin(), roster.end(), 
+                        [](const Candidate& a, const Candidate& b){ return a.savings_rate < b.savings_rate; });
+                    
+                    if (savings_rate > min_it->savings_rate) {
+                        // We beat the worst! 
+                        // Swap overlays: We take the roster spot, and the loser becomes the new worker.
+                        cm::PagedOverlay* recycled_ov = min_it->overlay;
+                        
+                        *min_it = {succ, worker_ov, savings_rate}; // Replace entry
+                        
+                        worker_ov = recycled_ov; // Recycle the loser
+                    } else {
+                        // We lost. worker_ov remains the worker (will be Reset next loop).
                     }
                 }
-
-                succ_costs[succ].emplace_back(pred_id, cost);
-                debugLog("emplaced for succ " + std::to_string(succ));
-                debugLog("Emplaced cost for succ " + std::to_string(succ));
+                debugError("Processed succ " + std::to_string(succ) + " for pred " + std::to_string(pred_id) + ", roster size: " + std::to_string(roster.size()));
             }
+            
+            // Cleanup the extra worker
+            delete worker_ov;
+
+            // Sort the final 32
+            std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
+
+            // --- ROUND 2: SEMI-FINALS (2048 Bytes) ---
+            for (auto& cand : roster) {
+                size_t len = valid_segments[cand.id].second;
+                if (len <= 256) continue; // Already fully scanned
+                
+                size_t limit = 2048;
+                size_t scan_len = std::min(len, limit);
+                size_t start = valid_segments[cand.id].first;
+                
+                std::vector<uint8_t> chunk(scan_len);
+                memcpy(chunk.data(), file_data + start, scan_len);
+
+                // Reuse Overlay (it contains the hash writes from Round 1)
+                cm.SetOverlay(cand.overlay);
+                cm.restoreSnapshot(pred_snapshot); // Reset Mixers to start
+                cm.byte_index = 0;
+                
+                // RESTART Scan (0 -> 2048)
+                // Why restart? Because the Overlay preserved the Hash Table, but we reset the Mixers.
+                // Re-running the first 256 bytes is negligible cost.
+                MemoryReadStream in_chunk(chunk);
+                cm.compress(&in_chunk, &out_pred, scan_len);
+
+                double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
+                double alone_cost = succ_alone_costs[cand.id];
+                
+                cand.savings_rate = (alone_cost - joint_delta) / scan_len;
+            }
+
+            // Prune: Sort & Keep Top 16
+            std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
+            
+            size_t cut_2 = std::min(roster.size(), (size_t)16);
+            for (size_t k = cut_2; k < roster.size(); ++k) delete roster[k].overlay;
+            roster.resize(cut_2);
+
+            // --- ROUND 3: FINALS (Full Run / 10KB Cap) ---
+            for (const auto& cand : roster) {
+                size_t len = valid_segments[cand.id].second;
+                size_t scan_len = std::min(len, (size_t)10240); // Cap at 10KB
+                
+                std::vector<uint8_t> chunk(scan_len);
+                memcpy(chunk.data(), file_data + valid_segments[cand.id].first, scan_len);
+
+                cm.SetOverlay(cand.overlay);
+                cm.restoreSnapshot(pred_snapshot);
+                cm.byte_index = 0;
+                
+                MemoryReadStream in_chunk(chunk);
+                cm.compress(&in_chunk, &out_pred, scan_len);
+
+                double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
+                double alone_cost = succ_alone_costs[cand.id];
+                
+                // Result: Negative Cost = Savings
+                double final_cost = joint_delta - alone_cost; 
+                succ_costs[cand.id].emplace_back(pred_id, final_cost);
+                
+                delete cand.overlay; // Done with this candidate
+            }
+            cm.SetOverlay(nullptr); // Safety reset
 
             debugLog("loop end");
             // Channel separation: stdout for data, stderr for debug
