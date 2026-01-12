@@ -435,12 +435,12 @@ public:
   const std::string kOutDictArg = "-out-dict=";
   std::string dict_file;
   // Segmentation parameters
-  size_t segment_window = 128;
+  size_t segment_window = 256;
   float segment_threshold = 0.0f;
   size_t segment_min_segment = 4096;
   size_t segment_max_segment = 65536;  // 64KB max segment size
   size_t segment_lookback = 1024;  // Fingerprinting parameters
-  size_t fingerprint_top_k = 256;
+  size_t fingerprint_top_k = 4096;
   int usage(const std::string& name) {
     printHeader();
     std::cout
@@ -840,12 +840,28 @@ int OracleChildMain(int argc, char* argv[]) {
             // Compute fingerprint for pred
             Fingerprint fp_pred = compute_fingerprint(data_pred);
 
+            // --- FIX 1: RUN PREDECESSOR ---
+            // We must populate the compressor state with the Predecessor's context
+            
+            // 1. Clear the Hash Table (Since we disabled the automatic wipe in restoreSnapshot)
+            memset(cm.base_hash_table_, 0, cm.hash_alloc_size_);
+            
+            // 2. Init & Compress
+            cm.init(); 
+            cm.skip_init = true; 
+            cm.SetOverlay(nullptr); 
+            
+            ReadMemoryStream in_pred(data_pred.data(), data_pred.data() + data_pred.size());
+            VoidWriteStream out_pred; // <--- ADD THIS LINE HERE
+            
+            cm.compress(&in_pred, &out_pred, data_pred.size());
+
             // Take pred snapshot for tournament
             auto pred_snapshot = cm.takeSnapshot();
-            double pred_cost = cm.getAccumulatedEntropy(); 
+            double pred_cost = cm.getAccumulatedEntropy();
 
             // this is always outputting 0 -- seems like a bug
-            debugError("Pred cost: " + std::to_string(pred_cost));
+            //debugError("Pred cost: " + std::to_string(pred_cost));
 
             // 2. TOURNAMENT ROSTER (Fixed Capacity)
             struct Candidate {
@@ -854,7 +870,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 double savings_rate;
             };
             std::vector<Candidate> roster;
-            roster.reserve(33); // Keep it small!
+            roster.reserve(129); // Keep it small!
 
             // The "Working" Overlay (Recycled)
             cm::PagedOverlay* worker_ov = new cm::PagedOverlay(cm.base_hash_table_, cm.hash_alloc_size_);
@@ -864,9 +880,9 @@ int OracleChildMain(int argc, char* argv[]) {
             chunk_buf.reserve(4096); 
 
             // Void output stream for compression
-            VoidWriteStream out_pred;
+            //VoidWriteStream out_pred;
 
-
+            size_t roundOneSize = 256;
             // --- ROUND 1: QUALIFIERS (Streaming & Recycling) ---
             for (size_t succ : succ_list) {
                 if (succ >= valid_segments.size()) {
@@ -877,7 +893,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 // 1. Setup Chunk
                 size_t start = valid_segments[succ].first;
                 size_t len = valid_segments[succ].second;
-                size_t scan_len = std::min((size_t)256, len);
+                size_t scan_len = std::min((size_t)roundOneSize, len);
 
                 // 2. Reset Worker (Reuse memory)
                 worker_ov->Reset(); 
@@ -891,7 +907,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 const uint8_t* ptr_start = (const uint8_t*)(file_data + start);
                 ReadMemoryStream in_chunk(ptr_start, ptr_start + scan_len); // Uses Memory.hpp class
                 
-                debugError("Starting compression for succ " + std::to_string(succ));
+                //debugError("Starting compression for succ " + std::to_string(succ));
 
                 cm.compress(&in_chunk, &out_pred, scan_len);
 
@@ -904,7 +920,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 double savings_rate = (alone_cost - joint_delta) / scan_len;
 
                 // 5. King of the Hill Logic
-                if (roster.size() < 32) {
+                if (roster.size() < 128) {
                     // Always accept if we have room
                     roster.push_back({succ, worker_ov, savings_rate});
                     // Allocate a NEW worker for next turn (since we kept the old one)
@@ -938,7 +954,7 @@ int OracleChildMain(int argc, char* argv[]) {
             // --- ROUND 2: SEMI-FINALS (2048 Bytes) ---
             for (auto& cand : roster) {
                 size_t len = valid_segments[cand.id].second;
-                if (len <= 256) continue; // Already fully scanned
+                if (len <= roundOneSize) continue; // Already fully scanned
                 
                 size_t limit = 2048;
                 size_t scan_len = std::min(len, limit);
@@ -967,7 +983,7 @@ int OracleChildMain(int argc, char* argv[]) {
             // Prune: Sort & Keep Top 16
             std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
             
-            size_t cut_2 = std::min(roster.size(), (size_t)16);
+            size_t cut_2 = std::min(roster.size(), (size_t)64);
             for (size_t k = cut_2; k < roster.size(); ++k) delete roster[k].overlay;
             roster.resize(cut_2);
 

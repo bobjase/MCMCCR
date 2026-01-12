@@ -95,9 +95,11 @@ namespace cm {
       uint8_t* base_table_;       // Read-Only Reference to PRED state
       uint8_t** pages_;           // Sparse Directory of Overlay Pages
       size_t num_pages_;
+      size_t total_size_;         // ADDED: To prevent reading past end
 
   public:
-      PagedOverlay(uint8_t* base_ptr, size_t total_size) : base_table_(base_ptr) {
+      PagedOverlay(uint8_t* base_ptr, size_t total_size) 
+          : base_table_(base_ptr), total_size_(total_size) { // Store size
           num_pages_ = (total_size + kPageSize - 1) >> kPageBits;
           // Allocate directory (small: ~75KB for 300MB table)
           pages_ = (uint8_t**)calloc(num_pages_, sizeof(uint8_t*));
@@ -112,8 +114,17 @@ namespace cm {
           }
       }
 
-      // VIRTUAL READ
-      // "If value is in overlay, use it. Else look in base."
+      // FAST RESET (For Tournament Recycling)
+      void Reset() {
+          if (!pages_) return;
+          for (size_t i = 0; i < num_pages_; ++i) {
+              if (pages_[i]) {
+                  free(pages_[i]);
+                  pages_[i] = nullptr;
+              }
+          }
+      }
+
       ALWAYS_INLINE uint8_t Get(size_t index) const {
           size_t page_idx = index >> kPageBits;
           if (pages_[page_idx]) {
@@ -122,40 +133,24 @@ namespace cm {
           return base_table_[index];
       }
 
-      // LAZY WRITE
-      // "If page missing, malloc & copy 4KB from base. Then write."
+      // LAZY WRITE (With Bounds Check Fix)
       ALWAYS_INLINE void Set(size_t index, uint8_t val) {
           size_t page_idx = index >> kPageBits;
           if (!pages_[page_idx]) {
-              // ALLOCATE & CLONE PAGE (The only memcpy, just 4KB)
               uint8_t* new_page = (uint8_t*)malloc(kPageSize);
               size_t base_offset = page_idx << kPageBits;
-              // We must copy base data so we don't see "zeros" in unwritten parts of the page
-              // Note: Ensure we don't read past end of base_table_ if total_size isn't page aligned.
-              // For simplicity in CM, hash_alloc_size_ usually has padding, so this is safe.
-              memcpy(new_page, base_table_ + base_offset, kPageSize); 
+              
+              // --- CRITICAL FIX: Clamp copy size ---
+              size_t available = (base_offset < total_size_) ? (total_size_ - base_offset) : 0;
+              size_t to_copy = (available < kPageSize) ? available : kPageSize;
+              
+              if (to_copy > 0) memcpy(new_page, base_table_ + base_offset, to_copy);
+              // Zero the rest of the page if we are at the edge (safety)
+              if (to_copy < kPageSize) memset(new_page + to_copy, 0, kPageSize - to_copy);
+              
               pages_[page_idx] = new_page;
           }
           pages_[page_idx][index & kPageMask] = val;
-      }
-
-      // FAST RESET: Clears pages but keeps the directory structure allocated.
-      // Call this to reuse the object for a new candidate.
-      void Reset() {
-          if (!pages_) return;
-          
-          // 1. Free all allocated 4KB pages
-          for (size_t i = 0; i < num_pages_; ++i) {
-              if (pages_[i]) {
-                  free(pages_[i]);
-                  pages_[i] = nullptr;
-              }
-          }
-          // 2. Zero the directory (Fastest way to clear pointers)
-          // Note: calloc already zeroed it initially, but we need to ensure it's clean.
-          // Since we set pointers to null in the loop above, we strictly don't need memset 
-          // IF we iterate everything. But memset is safer/faster for sparse checks if we optimize the loop.
-          // Optimization: Only iterate known dirty pages if we tracked them, but for now simple loop is safe.
       }
   };
 
@@ -492,7 +487,7 @@ namespace cm {
       current_entropy = snap.current_entropy_snapshot;
       entropies = snap.entropies_snapshot;
       buffer_.SetPos(snap.buffer_pos_snapshot);
-      
+
       // CRITICAL FIX: Do NOT wipe the base table!
       // In Tournament mode, this table holds the frozen Predecessor state.
       // memset(base_hash_table_, 0, hash_alloc_size_);
