@@ -663,6 +663,11 @@ void se_translator(unsigned int code, EXCEPTION_POINTERS* ep) {
     throw std::runtime_error("SEH exception");
 }
 
+struct SegmentProfile {
+    double total_cost;
+    std::vector<float> checkpoints; // Cost at 256, 512, 768...
+};
+
 // --- Oracle Child Process Function ---
 int OracleChildMain(int argc, char* argv[]) {
     _setmode(_fileno(stdin), _O_BINARY);

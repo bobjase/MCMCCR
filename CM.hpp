@@ -501,7 +501,7 @@ namespace cm {
     uint64_t fast_bytes_;
 
     // --- SPRT State ---
-    std::array<float, 100> sprt_profile_;    // Baseline cost (Alone) checkpoints
+    std::vector<float> sprt_profile_;    // Baseline cost (Alone) checkpoints
     double sprt_baseline_ = 0.0;         // Pred cost (starting offset)
     double sprt_best_rate_ = -1.0;       // Target savings rate to beat
     double sprt_accumulated_ = 0.0;      // Current run total cost
@@ -1184,7 +1184,8 @@ namespace cm {
             if ((byte_index & 0xFF) == 0 && byte_index >= 512) {
                 size_t check_idx = (byte_index >> 8); 
                 
-                if (check_idx < 100) {
+                // CRITICAL FIX: Check against dynamic size, not hardcoded 100
+                if (check_idx < sprt_profile_.size()) {
                     double n = (double)byte_index;
                     
                     // A. Calculate Sigma (Standard Deviation)
@@ -1321,7 +1322,7 @@ namespace cm {
     }
 
     // Configure the Breaker
-    void armSPRT(const std::array<float, 100>& profile, double best_rate_so_far) {
+    void armSPRT(const std::vector<float>& profile, double best_rate_so_far) {
         sprt_profile_ = profile;
         sprt_baseline_ = 0; // We reset accumulated for the succ part, so baseline is 0 relative to start of succ
         sprt_best_rate_ = best_rate_so_far;
