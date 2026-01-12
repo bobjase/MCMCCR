@@ -85,6 +85,61 @@ namespace cm {
     kModelCount,
   };
 
+  // --- PAGED OVERLAY (Virtual Context) ---
+  // Manages a sparse, copy-on-write view of the 300MB Hash Table.
+  class PagedOverlay {
+      static constexpr size_t kPageBits = 12; // 4KB Pages
+      static constexpr size_t kPageSize = 1 << kPageBits;
+      static constexpr size_t kPageMask = kPageSize - 1;
+
+      uint8_t* base_table_;       // Read-Only Reference to PRED state
+      uint8_t** pages_;           // Sparse Directory of Overlay Pages
+      size_t num_pages_;
+
+  public:
+      PagedOverlay(uint8_t* base_ptr, size_t total_size) : base_table_(base_ptr) {
+          num_pages_ = (total_size + kPageSize - 1) >> kPageBits;
+          // Allocate directory (small: ~75KB for 300MB table)
+          pages_ = (uint8_t**)calloc(num_pages_, sizeof(uint8_t*));
+      }
+
+      ~PagedOverlay() {
+          if (pages_) {
+              for (size_t i = 0; i < num_pages_; ++i) {
+                  if (pages_[i]) free(pages_[i]);
+              }
+              free(pages_);
+          }
+      }
+
+      // VIRTUAL READ
+      // "If value is in overlay, use it. Else look in base."
+      ALWAYS_INLINE uint8_t Get(size_t index) const {
+          size_t page_idx = index >> kPageBits;
+          if (pages_[page_idx]) {
+              return pages_[page_idx][index & kPageMask];
+          }
+          return base_table_[index];
+      }
+
+      // LAZY WRITE
+      // "If page missing, malloc & copy 4KB from base. Then write."
+      ALWAYS_INLINE void Set(size_t index, uint8_t val) {
+          size_t page_idx = index >> kPageBits;
+          if (!pages_[page_idx]) {
+              // ALLOCATE & CLONE PAGE (The only memcpy, just 4KB)
+              uint8_t* new_page = (uint8_t*)malloc(kPageSize);
+              size_t base_offset = page_idx << kPageBits;
+              // We must copy base data so we don't see "zeros" in unwritten parts of the page
+              // Note: Ensure we don't read past end of base_table_ if total_size isn't page aligned.
+              // For simplicity in CM, hash_alloc_size_ usually has padding, so this is safe.
+              memcpy(new_page, base_table_ + base_offset, kPageSize); 
+              pages_[page_idx] = new_page;
+          }
+          pages_[page_idx][index & kPageMask] = val;
+      }
+  };
+
   class CMProfile {
     static constexpr size_t kMaxOrder = 12;
   public:
@@ -293,7 +348,8 @@ namespace cm {
     size_t hash_mask_;
     size_t hash_alloc_size_;
     MemMap hash_storage_;
-    uint8_t *hash_table_;
+    uint8_t *base_hash_table_;
+    PagedOverlay* overlay_ = nullptr;
 
     // If LZP, need extra bit for the 256 ^ o0 ctx
     static const uint32_t o0size = 0x100 * (kUseLZP ? 2 : 1);
@@ -417,8 +473,25 @@ namespace cm {
       current_entropy = snap.current_entropy_snapshot;
       entropies = snap.entropies_snapshot;
       buffer_.SetPos(snap.buffer_pos_snapshot);
-      memset(hash_table_, 0, hash_alloc_size_);
+      memset(base_hash_table_, 0, hash_alloc_size_);
     }
+
+    // --- VIRTUAL ACCESSORS ---
+    ALWAYS_INLINE uint8_t GetState(size_t index) const {
+        if (overlay_) return overlay_->Get(index);
+        return base_hash_table_[index];
+    }
+
+    ALWAYS_INLINE void SetState(size_t index, uint8_t val) {
+        if (overlay_) {
+            overlay_->Set(index, val);
+        } else {
+            base_hash_table_[index] = val; // Direct write (only during Pred setup)
+        }
+    }
+    
+    // For switching candidates
+    void SetOverlay(PagedOverlay* ov) { overlay_ = ov; }
 
     // If force profile is true then we dont use a detector.
     bool force_profile_;
@@ -503,9 +576,9 @@ namespace cm {
       const uint32_t ret = hash + kHashStart;
       if (prefetch_addr && kUsePrefetch) {
         if (opt_var_ & 1) {
-          Prefetch(hash_table_ + ret);
+          Prefetch(base_hash_table_ + ret);
         } else {
-          Prefetch(hash_table_ + (ret & ~(kCacheLineSize - 1)));
+          Prefetch(base_hash_table_ + (ret & ~(kCacheLineSize - 1)));
         }
       }
       return ret;
@@ -622,13 +695,18 @@ namespace cm {
 					s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0,
 					s8 = 0, s9 = 0, s10 = 0, s11 = 0, s12 = 0, s13 = 0, s14 = 0, s15 = 0;
 
+				// Note: We use INDICES (size_t) now, not Pointers (uint8_t*)
+				size_t idx0=0, idx1=0, idx2=0, idx3=0, idx4=0, idx5=0, idx6=0, idx7=0;
+				size_t idx8=0, idx9=0, idx10=0, idx11=0, idx12=0, idx13=0, idx14=0, idx15=0;
+
 				uint32_t p;
 				int32_t
 					p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0,
 					p8 = 0, p9 = 0, p10 = 0, p11 = 0, p12 = 0, p13 = 0, p14 = 0, p15 = 0;
 				constexpr bool kUseAdd = false;
 				auto ctx_xor = kUseAdd ? 0 : ctx;
-				auto ht = kUseAdd ? hash_table_ + ctx : hash_table_;
+				
+				// CALCULATE INDICES & READ STATES
 				if (kBitType == kBitTypeLZP) {
 					if (kInputs > 0) {
 						if (kFixedMatchProbs) {
@@ -639,8 +717,8 @@ namespace cm {
 					}
 				} else if (mm_l == 0) {
 					if (kInputs > 0) {
-						sp0 = &ht[base_contexts[0] ^ ctx_xor];
-						s0 = *sp0;
+						idx0 = base_contexts[0] ^ ctx_xor;
+						s0 = GetState(idx0);
 						p0 = GetSTP(s0, 0);
 					}
 				} else {
@@ -652,21 +730,22 @@ namespace cm {
 						}
 					}
 				}
-				if (kInputs > 1) s1 = *(sp1 = &ht[base_contexts[1] ^ ctx_xor]);
-				if (kInputs > 2) s2 = *(sp2 = &ht[base_contexts[2] ^ ctx_xor]);
-				if (kInputs > 3) s3 = *(sp3 = &ht[base_contexts[3] ^ ctx_xor]);
-				if (kInputs > 4) s4 = *(sp4 = &ht[base_contexts[4] ^ ctx_xor]);
-				if (kInputs > 5) s5 = *(sp5 = &ht[base_contexts[5] ^ ctx_xor]);
-				if (kInputs > 6) s6 = *(sp6 = &ht[base_contexts[6] ^ ctx_xor]);
-				if (kInputs > 7) s7 = *(sp7 = &ht[base_contexts[7] ^ ctx_xor]);
-				if (kInputs > 8) s8 = *(sp8 = &ht[base_contexts[8] ^ ctx_xor]);
-				if (kInputs > 9) s9 = *(sp9 = &ht[base_contexts[9] ^ ctx_xor]);
-				if (kInputs > 10) s10 = *(sp10 = &ht[base_contexts[10] ^ ctx_xor]);
-				if (kInputs > 11) s11 = *(sp11 = &ht[base_contexts[11] ^ ctx_xor]);
-				if (kInputs > 12) s12 = *(sp12 = &ht[base_contexts[12] ^ ctx_xor]);
-				if (kInputs > 13) s13 = *(sp13 = &ht[base_contexts[13] ^ ctx_xor]);
-				if (kInputs > 14) s14 = *(sp14 = &ht[base_contexts[14] ^ ctx_xor]);
-				if (kInputs > 15) s15 = *(sp15 = &ht[base_contexts[15] ^ ctx_xor]);
+				
+				if (kInputs > 1) s1 = GetState(idx1 = (base_contexts[1] ^ ctx_xor));
+				if (kInputs > 2) s2 = GetState(idx2 = (base_contexts[2] ^ ctx_xor));
+				if (kInputs > 3) s3 = GetState(idx3 = (base_contexts[3] ^ ctx_xor));
+				if (kInputs > 4) s4 = GetState(idx4 = (base_contexts[4] ^ ctx_xor));
+				if (kInputs > 5) s5 = GetState(idx5 = (base_contexts[5] ^ ctx_xor));
+				if (kInputs > 6) s6 = GetState(idx6 = (base_contexts[6] ^ ctx_xor));
+				if (kInputs > 7) s7 = GetState(idx7 = (base_contexts[7] ^ ctx_xor));
+				if (kInputs > 8) s8 = GetState(idx8 = (base_contexts[8] ^ ctx_xor));
+				if (kInputs > 9) s9 = GetState(idx9 = (base_contexts[9] ^ ctx_xor));
+				if (kInputs > 10) s10 = GetState(idx10 = (base_contexts[10] ^ ctx_xor));
+				if (kInputs > 11) s11 = GetState(idx11 = (base_contexts[11] ^ ctx_xor));
+				if (kInputs > 12) s12 = GetState(idx12 = (base_contexts[12] ^ ctx_xor));
+				if (kInputs > 13) s13 = GetState(idx13 = (base_contexts[13] ^ ctx_xor));
+				if (kInputs > 14) s14 = GetState(idx14 = (base_contexts[14] ^ ctx_xor));
+				if (kInputs > 15) s15 = GetState(idx15 = (base_contexts[15] ^ ctx_xor));
 
 				if (kInputs > 1) p1 = GetSTP(s1, 1);
 				if (kInputs > 2) p2 = GetSTP(s2, 2);
@@ -740,28 +819,28 @@ namespace cm {
 						mixer_update_rate_[m0->GetLearn()], 16,
 						p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15
 					);
-					// Only update the states / predictions if the mixer was far enough from the bounds, helps 60k on enwik8 and 1-2sec.
+					// Only update the states / predictions if the mixer was far enough from the bounds
 					const bool kOptP = false;
 					if (ret) {
 						auto updater = probs_[0].GetUpdater(bit);
 	          if (kBitType != kBitTypeLZP && mm_l == 0) {
-	            if (kInputs > 0) *sp0 = NextState(sp0 - hash_table_, s0, bit, updater, 0, kOptP ? opts_[0] : 23);
+	            if (kInputs > 0) SetState(idx0, NextState(idx0, s0, bit, updater, 0, kOptP ? opts_[0] : 23));
 	          }
-						if (kInputs > 1) *sp1 = NextState(sp1 - hash_table_, s1, bit, updater, 1, kOptP ? opts_[1] : 10);
-						if (kInputs > 2) *sp2 = NextState(sp2 - hash_table_, s2, bit, updater, 2, kOptP ? opts_[2] : 9);
-						if (kInputs > 3) *sp3 = NextState(sp3 - hash_table_, s3, bit, updater, 3, kOptP ? opts_[3] : 9);
-						if (kInputs > 4) *sp4 = NextState(sp4 - hash_table_, s4, bit, updater, 4, kOptP ? opts_[4] : 9);
-						if (kInputs > 5) *sp5 = NextState(sp5 - hash_table_, s5, bit, updater, 5, kOptP ? opts_[5] : 9);
-						if (kInputs > 6) *sp6 = NextState(sp6 - hash_table_, s6, bit, updater, 6, kOptP ? opts_[6] : 9);
-						if (kInputs > 7) *sp7 = NextState(sp7 - hash_table_, s7, bit, updater, 7, kOptP ? opts_[7] : 9);
-						if (kInputs > 8) *sp8 = NextState(sp8 - hash_table_, s8, bit, updater, 8, kOptP ? opts_[8] : 9);
-						if (kInputs > 9) *sp9 = NextState(sp9 - hash_table_, s9, bit, updater, 9, kOptP ? opts_[9] : 9);
-						if (kInputs > 10) *sp10 = NextState(sp10 - hash_table_, s10, bit, updater, 10, kOptP ? opts_[10] : 9);
-						if (kInputs > 11) *sp11 = NextState(sp11 - hash_table_, s11, bit, updater, 11, kOptP ? opts_[11] : 9);
-						if (kInputs > 12) *sp12 = NextState(sp12 - hash_table_, s12, bit, 12, kOptP ? opts_[12] : 9);
-						if (kInputs > 13) *sp13 = NextState(sp13 - hash_table_, s13, bit, updater, 13, kOptP ? opts_[13] : 9);
-						if (kInputs > 14) *sp14 = NextState(sp14 - hash_table_, s14, bit, updater, 14, kOptP ? opts_[14] : 9);
-						if (kInputs > 15) *sp15 = NextState(sp15 - hash_table_, s15, bit, updater, 15, kOptP ? opts_[15] : 9);
+						if (kInputs > 1) SetState(idx1, NextState(idx1, s1, bit, updater, 1, kOptP ? opts_[1] : 10));
+						if (kInputs > 2) SetState(idx2, NextState(idx2, s2, bit, updater, 2, kOptP ? opts_[2] : 9));
+						if (kInputs > 3) SetState(idx3, NextState(idx3, s3, bit, updater, 3, kOptP ? opts_[3] : 9));
+						if (kInputs > 4) SetState(idx4, NextState(idx4, s4, bit, updater, 4, kOptP ? opts_[4] : 9));
+						if (kInputs > 5) SetState(idx5, NextState(idx5, s5, bit, updater, 5, kOptP ? opts_[5] : 9));
+						if (kInputs > 6) SetState(idx6, NextState(idx6, s6, bit, updater, 6, kOptP ? opts_[6] : 9));
+						if (kInputs > 7) SetState(idx7, NextState(idx7, s7, bit, updater, 7, kOptP ? opts_[7] : 9));
+						if (kInputs > 8) SetState(idx8, NextState(idx8, s8, bit, updater, 8, kOptP ? opts_[8] : 9));
+						if (kInputs > 9) SetState(idx9, NextState(idx9, s9, bit, updater, 9, kOptP ? opts_[9] : 9));
+						if (kInputs > 10) SetState(idx10, NextState(idx10, s10, bit, updater, 10, kOptP ? opts_[10] : 9));
+						if (kInputs > 11) SetState(idx11, NextState(idx11, s11, bit, updater, 11, kOptP ? opts_[11] : 9));
+						if (kInputs > 12) SetState(idx12, NextState(idx12, s12, bit, updater, 12, kOptP ? opts_[12] : 9));
+						if (kInputs > 13) SetState(idx13, NextState(idx13, s13, bit, updater, 13, kOptP ? opts_[13] : 9));
+						if (kInputs > 14) SetState(idx14, NextState(idx14, s14, bit, updater, 14, kOptP ? opts_[14] : 9));
+						if (kInputs > 15) SetState(idx15, NextState(idx15, s15, bit, updater, 15, kOptP ? opts_[15] : 9));
 					}
 				}
 				{
@@ -1032,20 +1111,23 @@ namespace cm {
               ent.EncodeBits(stream, c, 8);
             }
           } else {
-            auto* s0 = &hash_table_[o2pos + (last_bytes_ & 0xFFFF) * o0size];
-            auto* s1 = &hash_table_[o1pos + p0 * o0size];
-            auto* s2 = &hash_table_[o0pos];
+            size_t idx_s0 = o2pos + (last_bytes_ & 0xFFFF) * o0size;
+            size_t idx_s1 = o1pos + p0 * o0size;
+            size_t idx_s2 = o0pos;
             size_t ctx = 1;
             uint32_t ch = c << 24;
             bool second_nibble = false;
             size_t base_ctx = 0;
             for (;;) {
-              auto* st0 = s0 + ctx;
-              auto* st1 = s1 + ctx;
-              auto* st2 = s2 + ctx;
-              uint32_t idx0 = (fast_probs_[*st0] + 2048) >> (4 + 4);
-              uint32_t idx1 = (fast_probs_[*st1] + 2048) >> (4 + 4);
-              uint32_t idx2 = (fast_probs_[*st2] + 2048) >> (4 + 4);
+              size_t idx_st0 = idx_s0 + ctx;
+              size_t idx_st1 = idx_s1 + ctx;
+              size_t idx_st2 = idx_s2 + ctx;
+              uint8_t val_st0 = GetState(idx_st0);
+              uint8_t val_st1 = GetState(idx_st1);
+              uint8_t val_st2 = GetState(idx_st2);
+              uint32_t idx0 = (fast_probs_[val_st0] + 2048) >> (4 + 4);
+              uint32_t idx1 = (fast_probs_[val_st1] + 2048) >> (4 + 4);
+              uint32_t idx2 = (fast_probs_[val_st2] + 2048) >> (4 + 4);
               size_t cur = idx0;
               cur = (cur << 4) | idx1;
               cur = (cur << 4) | idx2;
@@ -1069,18 +1151,18 @@ namespace cm {
                 current_entropy += -log2(prob);
               }
               pr->update(bit, 10);
-              *st0 = state_trans_[*st0][bit];
-              *st1 = state_trans_[*st1][bit];
-              *st2 = state_trans_[*st2][bit];
+              SetState(idx_st0, state_trans_[val_st0][bit]);
+              SetState(idx_st1, state_trans_[val_st1][bit]);
+              SetState(idx_st2, state_trans_[val_st2][bit]);
               ctx += ctx + bit;
               if (ctx & 0x10) {
                 if (second_nibble) {
                   break;
                 }
                 base_ctx = 15 + (ctx ^ 0x10) * 15;
-                s0 += base_ctx;
-                s1 += base_ctx;
-                s2 += base_ctx;
+                idx_s0 += base_ctx;
+                idx_s1 += base_ctx;
+                idx_s2 += base_ctx;
                 ctx = 1;
                 second_nibble = true;
               }

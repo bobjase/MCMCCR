@@ -231,10 +231,10 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
 
   debugLog("CM after SSE init");
 
-  hash_mask_ = ((2 * MB) << mem_level_) / sizeof(hash_table_[0]) - 1;
+  hash_mask_ = ((2 * MB) << mem_level_) / sizeof(base_hash_table_[0]) - 1;
   hash_alloc_size_ = hash_mask_ + kHashStart + (1 << huffman_len_limit);
   hash_storage_.resize(hash_alloc_size_); // Add extra space for ctx.
-  hash_table_ = reinterpret_cast<uint8_t*>(hash_storage_.getData()); // Here is where the real hash table starts
+  base_hash_table_ = reinterpret_cast<uint8_t*>(hash_storage_.getData()); // Here is where the real hash table starts
 
   buffer_.Resize((MB / 4) << mem_level_, sizeof(uint32_t));
 
@@ -489,7 +489,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
       // State count.
       size_t z = 0, nz = 0;
       for (size_t i = 0;i <= hash_mask_;++i) {
-        ++(hash_table_[i] != 0 ? nz : z);
+        ++(base_hash_table_[i] != 0 ? nz : z);
       }
       std::cout << "zero=" << z << " nonzero=" << nz << std::endl;
     }
