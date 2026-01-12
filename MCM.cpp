@@ -435,7 +435,7 @@ public:
   const std::string kOutDictArg = "-out-dict=";
   std::string dict_file;
   // Segmentation parameters
-  size_t segment_window = 256;
+  size_t segment_window = 128;
   float segment_threshold = 0.0f;
   size_t segment_min_segment = 4096;
   size_t segment_max_segment = 65536;  // 64KB max segment size
@@ -818,13 +818,24 @@ int OracleChildMain(int argc, char* argv[]) {
             }
             debugLog("read succ_list");
 
-            // Read alone_costs
-            std::vector<double> alone_costs(num_succ);
-            if (num_succ > 0 && fread(alone_costs.data(), sizeof(double), num_succ, stdin) != num_succ) {
-                debugLog("Failed to read alone_costs");
-                break;
+            // Read succ_profiles
+            std::vector<SegmentProfile> succ_profiles(num_succ);
+            if (num_succ > 0) {
+                for(size_t i=0; i<num_succ; ++i){
+                    uint64_t size;
+                    if(fread(&size, sizeof(uint64_t), 1, stdin) !=1){
+                        debugLog("Failed to read profile size");
+                        break;
+                    }
+                    std::vector<float> checkpoints(size);
+                    if(size >0 && fread(checkpoints.data(), sizeof(float), size, stdin) != size){
+                        debugLog("Failed to read checkpoints");
+                        break;
+                    }
+                    succ_profiles[i] = SegmentProfile{0.0, checkpoints};
+                }
             }
-            debugLog("read alone_costs");
+            debugLog("read succ_profiles");
 
             // Process the pred
             std::map<size_t, std::vector<std::pair<size_t, double>>> succ_costs;
@@ -869,7 +880,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 debugLog("Got succ data");
 
                 // Use provided alone_bits
-                double alone_bits = alone_costs[i];
+                double alone_bits = succ_profiles[i].checkpoints.back();
 
                 // Compress pred data
                 MemoryReadStream in_pred(data_pred);
@@ -880,6 +891,9 @@ int OracleChildMain(int argc, char* argv[]) {
 
                 // Reset entropy accumulation for succ compression
                 cm.resetAccumulatedEntropy();
+
+                // Arm SPRT
+                cm.armSPRT(succ_profiles[i].checkpoints, alone_bits / (double)len_succ);
 
                 // Compress head
                 debugLog("Compressing head for succ " + std::to_string(succ));
@@ -901,6 +915,9 @@ int OracleChildMain(int argc, char* argv[]) {
                     debugLog("Exception in compressing head for succ " + std::to_string(succ) + ", setting high cost");
                     cost = 1e9;  // High cost to avoid selecting
                 }
+
+                // Disarm SPRT
+                cm.disarmSPRT();
 
                 // Log to calibration dataset
                 if (calibration_mode) {
@@ -2010,9 +2027,9 @@ int main(int argc, char* argv[]) {
     std::vector<std::vector<std::pair<size_t, double>>> pred_costs(num_segments);  // for each pred, list of (succ, cost)
     std::cout << "Number of pred to process: " << pred_to_succ.size() << std::endl << std::flush;
 
-    // 1. Pre-compute Alone Costs
-    std::cout << "Pre-computing Alone Costs: 0.0% (0/" << num_segments << " segments)" << std::flush;
-    std::vector<double> global_alone_costs(num_segments);
+    // 1. Pre-compute Alone Profiles
+    std::cout << "Pre-computing Alone Profiles: 0.0% (0/" << num_segments << " segments)" << std::flush;
+    std::vector<SegmentProfile> global_profiles(num_segments);
     // Use serial for now
     for (size_t i = 0; i < num_segments; ++i) {
         // Get segment data
@@ -2035,16 +2052,29 @@ int main(int argc, char* argv[]) {
         MemoryReadStream in_alone(head_data);
         VoidWriteStream out_alone;
         cm_alone.compress(&in_alone, &out_alone, head_data.size());
-        double alone_bits = 0.0;
-        for (double e : cm_alone.entropies) alone_bits += e;
-        global_alone_costs[i] = alone_bits;
+        
+        // Build checkpoints
+        const auto& entropies = cm_alone.entropies;
+        double accum = 0.0;
+        std::vector<float> checkpoints;
+        size_t byte_pos = 0;
+        for (size_t check = 2; ; ++check) {
+            size_t target_byte = check << 8;
+            if (target_byte >= entropies.size()) break;
+            for (; byte_pos < target_byte; ++byte_pos) {
+                accum += entropies[byte_pos];
+            }
+            if (checkpoints.size() <= check) checkpoints.resize(check + 1);
+            checkpoints[check] = (float)accum;
+        }
+        global_profiles[i] = SegmentProfile{accum, checkpoints};
 
         // Progress
         double percent = 100.0 * (i + 1) / num_segments;
-        std::cout << "\rPre-computing Alone Costs: " << std::fixed << std::setprecision(1) << percent << "% (" << (i + 1) << "/" << num_segments << " segments)" << std::flush;
+        std::cout << "\rPre-computing Alone Profiles: " << std::fixed << std::setprecision(1) << percent << "% (" << (i + 1) << "/" << num_segments << " segments)" << std::flush;
     }
     std::cout << std::endl;
-    std::cout << "Pre-computed alone costs for " << num_segments << " segments" << std::endl;
+    std::cout << "Pre-computed alone profiles for " << num_segments << " segments" << std::endl;
 
     // 2. Swarm Logic
     std::vector<std::pair<size_t, std::vector<size_t>>> pred_list;
@@ -2095,8 +2125,8 @@ int main(int argc, char* argv[]) {
                 // Prepare Data
                 size_t pred_id = pred_list[current_idx].first;
                 const auto& succs = pred_list[current_idx].second;
-                std::vector<double> succ_alone_costs;
-                for (size_t s : succs) succ_alone_costs.push_back(global_alone_costs[s]);
+                std::vector<SegmentProfile> succ_profiles;
+                for (size_t s : succs) succ_profiles.push_back(global_profiles[s]);
 
                 // Write to Child
                 DWORD written;
@@ -2104,7 +2134,13 @@ int main(int argc, char* argv[]) {
                 uint64_t num_succs = succs.size();
                 WriteFile(hChildInWrite, &num_succs, sizeof(uint64_t), &written, NULL);
                 if (!succs.empty()) WriteFile(hChildInWrite, succs.data(), sizeof(size_t) * succs.size(), &written, NULL);
-                if (!succ_alone_costs.empty()) WriteFile(hChildInWrite, succ_alone_costs.data(), sizeof(double) * succ_alone_costs.size(), &written, NULL);
+                if (!succ_profiles.empty()) {
+                    for(const auto& p : succ_profiles){
+                        uint64_t size = p.checkpoints.size();
+                        WriteFile(hChildInWrite, &size, sizeof(uint64_t), &written, NULL);
+                        if(size > 0) WriteFile(hChildInWrite, p.checkpoints.data(), sizeof(float) * size, &written, NULL);
+                    }
+                }
                 FlushFileBuffers(hChildInWrite);
 
                 // Read from Child
