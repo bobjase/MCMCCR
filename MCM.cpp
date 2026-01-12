@@ -435,12 +435,12 @@ public:
   const std::string kOutDictArg = "-out-dict=";
   std::string dict_file;
   // Segmentation parameters
-  size_t segment_window = 512;
+  size_t segment_window = 256;
   float segment_threshold = 0.0f;
   size_t segment_min_segment = 4096;
   size_t segment_max_segment = 65536;  // 64KB max segment size
   size_t segment_lookback = 1024;  // Fingerprinting parameters
-  size_t fingerprint_top_k = 32;
+  size_t fingerprint_top_k = 1024;
   int usage(const std::string& name) {
     printHeader();
     std::cout
@@ -872,6 +872,9 @@ int OracleChildMain(int argc, char* argv[]) {
                 cm.compress(&in_pred, &out_pred, data_pred.size());
                 double pred_entropy_sum = 0.0;
                 for (double e : cm.entropies) pred_entropy_sum += e;
+
+                // Reset entropy accumulation for succ compression
+                cm.resetAccumulatedEntropy();
 
                 // Compress head
                 debugLog("Compressing head for succ " + std::to_string(succ));

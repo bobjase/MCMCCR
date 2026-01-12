@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <type_traits>
 #include <vector>
+#include <array>
 #include <windows.h>
 #include <fstream>
 
@@ -83,6 +84,11 @@ namespace cm {
     kModelSpecialChar,
 
     kModelCount,
+  };
+
+  // --- SPRT Exception ---
+  struct SPRT_Pruned : public std::exception {
+      const char* what() const noexcept override { return "SPRT Pruned"; }
   };
 
   class CMProfile {
@@ -493,6 +499,19 @@ namespace cm {
     uint64_t miss_len_;
     uint64_t miss_count_[kMaxMiss];
     uint64_t fast_bytes_;
+
+    // --- SPRT State ---
+    std::array<float, 100> sprt_profile_;    // Baseline cost (Alone) checkpoints
+    double sprt_baseline_ = 0.0;         // Pred cost (starting offset)
+    double sprt_best_rate_ = -1.0;       // Target savings rate to beat
+    double sprt_accumulated_ = 0.0;      // Current run total cost
+    
+    // Variance Estimation State
+    double sprt_sum_entropy_ = 0.0;
+    double sprt_sum_sq_entropy_ = 0.0;
+    
+    bool sprt_armed_ = false;
+    const double kSprtConfidence = 1.0;  // Reduced for less aggressive pruning
 
     size_t mem_level_ = 0;
 
@@ -980,7 +999,7 @@ namespace cm {
     template <const bool decode, typename TStream>
     size_t processByte(TStream& stream, uint32_t c = 0) {
       //process_count++;
-      //byte_index++;
+      byte_index++;
       size_t base_contexts[kInputs] = {};
       auto* ctx_ptr = base_contexts;
 
@@ -1150,14 +1169,60 @@ namespace cm {
       }
 
       if (observer_mode) {
-        debugLog("pushing current_entropy: " + std::to_string(current_entropy));
-        debugLog("cow_mode = " + std::to_string(cow_mode));
-        if (cow_mode) { entropies.push_back(cow_entropies.size()); cow_entropies.push_back(current_entropy); } else entropies.push_back(current_entropy);
+        // 1. Calculate Byte Entropy
+        double local_cost = current_entropy; // The entropy for this byte
+        
+        // 2. Update Trackers
+        
+        if (sprt_armed_) {
+            sprt_accumulated_ += local_cost;
+            sprt_sum_entropy_ += local_cost;
+            sprt_sum_sq_entropy_ += (local_cost * local_cost);
+
+            // 3. SPRT Check (Every 256 bytes, starting at 512)
+            // We use byte_index which is tracked in CM (ensure byte_index is incremented at top of processByte!)
+            if ((byte_index & 0xFF) == 0 && byte_index >= 512) {
+                size_t check_idx = (byte_index >> 8); 
+                
+                if (check_idx < 100) {
+                    double n = (double)byte_index;
+                    
+                    // A. Calculate Sigma (Standard Deviation)
+                    double mean = sprt_sum_entropy_ / n;
+                    double var = (sprt_sum_sq_entropy_ / n) - (mean * mean);
+                    double sigma = (var > 0) ? std::sqrt(var) : 0.1;
+                    
+                    // B. Calculate Confidence Margin (K * Sigma / Sqrt(N))
+                    double margin = kSprtConfidence * sigma / std::sqrt(n);
+                    
+                    // C. Calculate The Limit
+                    // We want: (Baseline - Current) / N  >  Best_Rate - Margin
+                    // Algebra flip: Current < Baseline - (Best_Rate * N) + (Margin * N)
+                    
+                    double baseline_cost = sprt_profile_[check_idx];
+                    double target_savings = sprt_best_rate_ * n;
+                    double safety_buffer = margin * n; 
+                    
+                    // If we are compressing WORSE than this limit, we are statistically dead.
+                    double limit = baseline_cost - target_savings + safety_buffer;
+                    
+                    // Safety Clamp: Don't kill if we are just slightly worse than "Alone" (Toxic Check)
+                    // If we haven't found ANY good match yet (best_rate is negative), be lenient.
+                    if (sprt_best_rate_ <= 0) {
+                        limit = baseline_cost + 8192.0; // Allow 8192 bits (1024 bytes) expansion max
+                    }
+
+                    if (sprt_accumulated_ > limit) {
+                         throw SPRT_Pruned();
+                    }
+                }
+            }
+        }
+        
+        // 4. Handle Vector Output (Legacy Observer behavior)
+        if (cow_mode) cow_entropies.push_back(current_entropy); 
+        else entropies.push_back(current_entropy);
         current_entropy = 0;
-        // if (entropies.size() > byte_index + 100) {
-        //   std::cout << "Entropies size " << entropies.size() << " exceeds byte_index " << byte_index << " by more than 100" << std::endl;
-        //   std::exit(1);
-        // }
       }
       // if (byte_index % 10000 == 0) {
       //   std::cout << "byte index: " << byte_index << ", entropies size: " << entropies.size() << std::endl;
@@ -1253,6 +1318,35 @@ namespace cm {
       last_bytes_ = (last_bytes_ << 8) | static_cast<uint8_t>(c);
       bracket_.Update(c);
       special_char_model_.Update(c);
+    }
+
+    // Configure the Breaker
+    void armSPRT(const std::array<float, 100>& profile, double best_rate_so_far) {
+        sprt_profile_ = profile;
+        sprt_baseline_ = 0; // We reset accumulated for the succ part, so baseline is 0 relative to start of succ
+        sprt_best_rate_ = best_rate_so_far;
+        
+        // Reset trackers
+        sprt_accumulated_ = 0.0;
+        sprt_sum_entropy_ = 0.0;
+        sprt_sum_sq_entropy_ = 0.0;
+        
+        sprt_armed_ = true;
+    }
+
+    void disarmSPRT() { 
+        sprt_armed_ = false; 
+    }
+    
+    // Helper to get total cost of current run
+    double getAccumulatedEntropy() const {
+        return sprt_accumulated_;
+    }
+
+    // Reset accumulated entropy for new compression run
+    void resetAccumulatedEntropy() {
+        sprt_accumulated_ = 0.0;
+        entropies.clear();
     }
 
     virtual void compress(Stream* in_stream, Stream* out_stream, uint64_t max_count);
