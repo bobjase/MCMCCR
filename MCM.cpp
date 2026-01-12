@@ -435,12 +435,12 @@ public:
   const std::string kOutDictArg = "-out-dict=";
   std::string dict_file;
   // Segmentation parameters
-  size_t segment_window = 512;
+  size_t segment_window = 128;
   float segment_threshold = 0.0f;
   size_t segment_min_segment = 4096;
   size_t segment_max_segment = 65536;  // 64KB max segment size
   size_t segment_lookback = 1024;  // Fingerprinting parameters
-  size_t fingerprint_top_k = 32;
+  size_t fingerprint_top_k = 256;
   int usage(const std::string& name) {
     printHeader();
     std::cout

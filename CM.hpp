@@ -476,6 +476,16 @@ namespace cm {
       memset(base_hash_table_, 0, hash_alloc_size_);
     }
 
+    double getAccumulatedEntropy() const {
+      double sum = 0.0;
+      for (double e : entropies) sum += e;
+      return sum;
+    }
+
+    void SetOverlay(PagedOverlay* ov) {
+      overlay_ = ov;
+    }
+
     // --- VIRTUAL ACCESSORS ---
     ALWAYS_INLINE uint8_t GetState(size_t index) const {
         if (overlay_) return overlay_->Get(index);
@@ -489,9 +499,6 @@ namespace cm {
             base_hash_table_[index] = val; // Direct write (only during Pred setup)
         }
     }
-    
-    // For switching candidates
-    void SetOverlay(PagedOverlay* ov) { overlay_ = ov; }
 
     // If force profile is true then we dont use a detector.
     bool force_profile_;
