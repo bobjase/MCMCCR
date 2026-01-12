@@ -911,7 +911,7 @@ int OracleChildMain(int argc, char* argv[]) {
 
                 cm.compress(&in_chunk, &out_pred, scan_len);
 
-                debugError("Finished compression for succ " + std::to_string(succ));
+                //debugError("Finished compression for succ " + std::to_string(succ));
 
                 // 4. Score
                 double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
@@ -928,7 +928,10 @@ int OracleChildMain(int argc, char* argv[]) {
                 } else {
                     // Find worst in roster
                     auto min_it = std::min_element(roster.begin(), roster.end(), 
-                        [](const Candidate& a, const Candidate& b){ return a.savings_rate < b.savings_rate; });
+                      [](const Candidate& a, const Candidate& b){ 
+                          if (std::abs(a.savings_rate - b.savings_rate) > 1e-9) return a.savings_rate < b.savings_rate;
+                          return a.id > b.id; // Break ties: prefer evicting higher IDs (arbitrary but consistent)
+                      });
                     
                     if (savings_rate > min_it->savings_rate) {
                         // We beat the worst! 
@@ -942,14 +945,19 @@ int OracleChildMain(int argc, char* argv[]) {
                         // We lost. worker_ov remains the worker (will be Reset next loop).
                     }
                 }
-                debugError("Processed succ " + std::to_string(succ) + " for pred " + std::to_string(pred_id) + ", roster size: " + std::to_string(roster.size()));
+                debugLog("Processed succ " + std::to_string(succ) + " for pred " + std::to_string(pred_id) + ", roster size: " + std::to_string(roster.size()));
             }
             
             // Cleanup the extra worker
             delete worker_ov;
 
             // Sort the final 32
-            std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
+            //std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
+            // Deterministic Sort: Break ties with ID
+            std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ 
+                if (std::abs(a.savings_rate - b.savings_rate) > 1e-9) return a.savings_rate > b.savings_rate;
+                return a.id < b.id; // Tie-breaker
+            });
 
             // --- ROUND 2: SEMI-FINALS (2048 Bytes) ---
             for (auto& cand : roster) {
@@ -981,7 +989,12 @@ int OracleChildMain(int argc, char* argv[]) {
             }
 
             // Prune: Sort & Keep Top 16
-            std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
+            //std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
+            // Deterministic Sort
+            std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ 
+                if (std::abs(a.savings_rate - b.savings_rate) > 1e-9) return a.savings_rate > b.savings_rate;
+                return a.id < b.id; 
+            });
             
             size_t cut_2 = std::min(roster.size(), (size_t)64);
             for (size_t k = cut_2; k < roster.size(); ++k) delete roster[k].overlay;
@@ -2376,9 +2389,12 @@ int main(int argc, char* argv[]) {
         double cost = std::stod(cost_str);
         candidates[pred_id].push_back({succ_id, cost});
       }
-      // Sort by cost ascending (savings)
+      // Sort by cost ascending (Stable)
       std::sort(candidates[pred_id].begin(), candidates[pred_id].end(), 
-                [](const Edge& a, const Edge& b) { return a.cost < b.cost; });
+                [](const Edge& a, const Edge& b) { 
+                    if (std::abs(a.cost - b.cost) > 1e-9) return a.cost < b.cost;
+                    return a.to < b.to; // Break ties with successor ID
+                });
 
       // RED TEAM FIX: Protect Natural Predecessor from eviction
       // If we resize to 32, we MUST ensure the natural edge (pred_id + 1) stays.
@@ -2503,7 +2519,7 @@ int main(int argc, char* argv[]) {
     const double RESET_PENALTY = 2000.0;
     std::vector<EdgeSavings> all_edges;
     for (size_t pred = 0; pred < num_segments; ++pred) {
-      for (const auto& edge : candidates[pred]) {
+      for (const auto& edge : allowed_fusions[pred]) { // <--- FIX: Use filtered list
         size_t succ = edge.to;
         double cost = edge.cost;
         double savings = RESET_PENALTY - cost;
@@ -2545,7 +2561,7 @@ int main(int argc, char* argv[]) {
         size_t changes = 0;
 
         for (size_t u = 0; u < num_segments; ++u) {
-            for (const auto& edge : candidates[u]) {
+            for (const auto& edge : allowed_fusions[u]) { // <--- FIX: Use filtered list
                 size_t v = edge.to;
                 double cost = edge.cost;
 
