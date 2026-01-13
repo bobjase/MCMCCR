@@ -435,7 +435,7 @@ public:
   const std::string kOutDictArg = "-out-dict=";
   std::string dict_file;
   // Segmentation parameters
-  size_t segment_window = 256;
+  size_t segment_window = 192;
   float segment_threshold = 0.0f;
   size_t segment_min_segment = 4096;
   size_t segment_max_segment = 65536;  // 64KB max segment size
@@ -793,7 +793,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 debugError("Failed to read pred_id, exiting");
                 break;
             }
-            debugLog("read pred_id: " + std::to_string(pred_id));
+            //debugError("read pred_id: " + std::to_string(pred_id));
             if (pred_id >= valid_segments.size()) {
                 debugError("Invalid pred_id");
                 continue;
@@ -849,6 +849,7 @@ int OracleChildMain(int argc, char* argv[]) {
             // 2. Init & Compress
             cm.init(); 
             cm.skip_init = true; 
+            cm.entropies.clear(); // <--- CRITICAL FIX: Clear accumulation
             cm.SetOverlay(nullptr); 
             
             ReadMemoryStream in_pred(data_pred.data(), data_pred.data() + data_pred.size());
@@ -881,8 +882,8 @@ int OracleChildMain(int argc, char* argv[]) {
 
             // Void output stream for compression
             //VoidWriteStream out_pred;
-
-            size_t roundOneSize = 1024;
+            debugError("Starting ROUND 1: QUALIFIERS for pred " + std::to_string(pred_id));
+            size_t roundOneSize = 512;
             // --- ROUND 1: QUALIFIERS (Streaming & Recycling) ---
             for (size_t succ : succ_list) {
                 if (succ >= valid_segments.size()) {
@@ -1007,7 +1008,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 return a.id < b.id; 
             });
             
-            size_t cut_2 = std::min(roster.size(), (size_t)64);
+            size_t cut_2 = std::min(roster.size(), (size_t)128);
             for (size_t k = cut_2; k < roster.size(); ++k) delete roster[k].overlay;
             roster.resize(cut_2);
 
@@ -1035,6 +1036,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 
                 delete cand.overlay; // Done with this candidate
             }
+            cm.entropies.clear(); // <--- CRITICAL FIX: Clear accumulation
             cm.SetOverlay(nullptr); // Safety reset
 
             debugLog("loop end");
@@ -1988,16 +1990,30 @@ int main(int argc, char* argv[]) {
       std::cerr << "Error opening output file: " << out_file << std::endl;
       return 1;
     }
+
+    // FIX: Transpose the Graph (Receiver -> Donors  ==>  Donor -> Receivers)
+    // The Fingerprinter finds Donors for a Receiver (candidates[recv] = {donor...}).
+    // The Oracle expects PRED: SUCC... (candidates[donor] = {recv...}).
+    std::vector<std::vector<size_t>> donor_to_receivers(num_valid);
+    for (size_t recv = 0; recv < num_valid; ++recv) {
+        for (size_t donor : candidates[recv]) {
+            if (donor < num_valid) {
+                donor_to_receivers[donor].push_back(recv);
+            }
+        }
+    }
+
+    // Write the transposed map (Pred -> Succs)
     for (size_t i = 0; i < num_valid; ++i) {
       ofs << i << ":";
-      for (size_t j = 0; j < candidates[i].size(); ++j) {
+      for (size_t j = 0; j < donor_to_receivers[i].size(); ++j) {
         if (j > 0) ofs << ",";
-        ofs << candidates[i][j];
+        ofs << donor_to_receivers[i][j];
       }
       ofs << std::endl;
     }
     ofs.close();
-    std::cout << "Wrote candidate lists for " << num_valid << " segments to " << out_file << std::endl;
+    std::cout << "Wrote transposed candidate lists (Pred->Succs) for " << num_valid << " segments to " << out_file << std::endl;
 
     // Save fingerprint data for reuse in oracle mode
     std::string fingerprint_file = in_file + ".segments.fingerprints";
@@ -2153,6 +2169,7 @@ int main(int argc, char* argv[]) {
         cm_alone.cur_profile_.SetMinLZPLen(10);
         cm_alone.observer_mode = true;
         cm_alone.init();
+        cm_alone.entropies.clear(); // <--- CRITICAL FIX: Clear accumulation
         MemoryReadStream in_alone(head_data);
         VoidWriteStream out_alone;
         cm_alone.compress(&in_alone, &out_alone, head_data.size());
@@ -2177,7 +2194,7 @@ int main(int argc, char* argv[]) {
     std::mutex results_mutex;
     std::atomic<size_t> processed_preds(0);
     std::mutex output_mutex;
-    const int BATCH_SIZE = 10;
+    const int BATCH_SIZE = 1;
 
     auto worker_func = [&]() {
         while (true) {
