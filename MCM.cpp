@@ -882,7 +882,7 @@ int OracleChildMain(int argc, char* argv[]) {
             // Void output stream for compression
             //VoidWriteStream out_pred;
 
-            size_t roundOneSize = 512;
+            size_t roundOneSize = 1024;
             // --- ROUND 1: QUALIFIERS (Streaming & Recycling) ---
             for (size_t succ : succ_list) {
                 if (succ >= valid_segments.size()) {
@@ -915,12 +915,19 @@ int OracleChildMain(int argc, char* argv[]) {
 
                 // 4. Score
                 double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
-                double alone_cost = succ_alone_costs[succ];
                 
-                double savings_rate = (alone_cost - joint_delta) / scan_len;
+                // FIX: Normalize Alone Cost to the scan length
+                // We assume entropy is roughly uniform across the segment (Approximation)
+                size_t full_len = std::min(len, (size_t)10240); // The length used by Parent
+                double alone_rate = succ_alone_costs[succ] / (double)full_len; // Bits per byte
+                double alone_cost_scaled = alone_rate * scan_len; // Cost for *this* chunk
+
+                // Now compare Apples to Apples (512 bytes vs 512 bytes)
+                double savings_rate = (alone_cost_scaled - joint_delta) / scan_len;
+
 
                 // 5. King of the Hill Logic
-                if (roster.size() < 128) {
+                if (roster.size() < 256) {
                     // Always accept if we have room
                     roster.push_back({succ, worker_ov, savings_rate});
                     // Allocate a NEW worker for next turn (since we kept the old one)
@@ -983,9 +990,13 @@ int OracleChildMain(int argc, char* argv[]) {
                 cm.compress(&in_chunk, &out_pred, scan_len);
 
                 double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
-                double alone_cost = succ_alone_costs[cand.id];
                 
-                cand.savings_rate = (alone_cost - joint_delta) / scan_len;
+                // FIX: Normalize Alone Cost
+                size_t full_len = std::min(len, (size_t)10240);
+                double alone_rate = succ_alone_costs[cand.id] / (double)full_len;
+                double alone_cost_scaled = alone_rate * scan_len;
+                
+                cand.savings_rate = (alone_cost_scaled - joint_delta) / scan_len;
             }
 
             // Prune: Sort & Keep Top 16
@@ -2074,21 +2085,26 @@ int main(int argc, char* argv[]) {
     // Filter valid segments as in fingerprint
     std::vector<std::pair<size_t, size_t>> valid_segments = segments;
 
-    // Build reverse map: pred -> list of succ that have pred as candidate
+    // Build map: pred -> list of succ
     std::map<size_t, std::vector<size_t>> pred_to_succ;
-    for (size_t pred = 0; pred < candidates.size(); ++pred) {
-      if (!candidates[pred].empty()) {
-        for (auto it = candidates[pred].begin(); it != candidates[pred].end(); ) {
-          if (*it >= num_segments) {
-            it = candidates[pred].erase(it);
-          } else {
-            ++it;
-          }
+    
+    // FIX 1: TRANSPOSE GRAPH 
+    // candidates[recv] contains the list of potential Donors (Predecessors).
+    // We need to invert this to create a map of Donor -> Receivers (Succs).
+    for (size_t recv = 0; recv < candidates.size(); ++recv) {
+        for (size_t donor : candidates[recv]) {
+             if (donor < num_segments && donor != recv) { // Bounds check & prevent self-loops
+                 pred_to_succ[donor].push_back(recv);
+             }
         }
-        if (!candidates[pred].empty()) {
-          pred_to_succ[pred] = candidates[pred];
-        }
-      }
+    }
+
+    // FIX 2: DEDUPLICATE LISTS
+    // Ensure we don't test the same pair twice, and sort for determinism.
+    for (auto& pair : pred_to_succ) {
+        std::vector<size_t>& v = pair.second;
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
     }
     std::cout << "pred_to_succ size: " << pred_to_succ.size() << std::endl << std::flush;
 
@@ -2396,6 +2412,13 @@ int main(int argc, char* argv[]) {
                     return a.to < b.to; // Break ties with successor ID
                 });
 
+      // DEDUPLICATE: Remove multiple entries for the same successor
+      auto last = std::unique(candidates[pred_id].begin(), candidates[pred_id].end(),
+          [](const Edge& a, const Edge& b) {
+              return a.to == b.to; 
+          });
+      candidates[pred_id].erase(last, candidates[pred_id].end());
+
       // RED TEAM FIX: Protect Natural Predecessor from eviction
       // If we resize to 32, we MUST ensure the natural edge (pred_id + 1) stays.
       if (candidates[pred_id].size() > 32) {
@@ -2479,8 +2502,8 @@ int main(int argc, char* argv[]) {
           double bonus = (cost < 0) ? (cost * 0.50) : 0; // Boost natural savings by 50%
           adjusted_cost += bonus - 4000.0; // Artificial "Gravity" to keep natural neighbors
         } else {
-          // Raise threshold to 128 bytes (1024 bits) to cover overhead
-          if (cost > -1024.0) continue;
+          // Raise threshold to 500 bytes (1024 bits) to cover overhead
+          if (cost > -1000.0) continue;
         }
         
         allowed_fusions[pred].push_back({succ, adjusted_cost});
@@ -2718,7 +2741,7 @@ int main(int argc, char* argv[]) {
     // If we couldn't fuse them, keep them in original file order.
     // This allows the compressor to at least use the default context history.
     std::sort(orphans.begin(), orphans.end());
-    
+
     std::cout << "Sorted orphans by Donor Score -> Entropy." << std::endl;
 
     // Build reordered segment list: chains first (in some order), then orphans
