@@ -2088,23 +2088,24 @@ int main(int argc, char* argv[]) {
     // Build map: pred -> list of succ
     std::map<size_t, std::vector<size_t>> pred_to_succ;
     
-    // FIX 1: TRANSPOSE GRAPH 
-    // candidates[recv] contains the list of potential Donors (Predecessors).
-    // We need to invert this to create a map of Donor -> Receivers (Succs).
-    for (size_t recv = 0; recv < candidates.size(); ++recv) {
-        for (size_t donor : candidates[recv]) {
-             if (donor < num_segments && donor != recv) { // Bounds check & prevent self-loops
-                 pred_to_succ[donor].push_back(recv);
-             }
+    // REVERTED: Use direct candidate list (presumed Pred -> Succs)
+    for (size_t pred = 0; pred < candidates.size(); ++pred) {
+      if (!candidates[pred].empty()) {
+        std::vector<size_t> clean_succs;
+        for (size_t succ : candidates[pred]) {
+            // Only keep valid segments and prevent self-loops
+            if (succ < num_segments && succ != pred) {
+                clean_succs.push_back(succ);
+            }
         }
-    }
-
-    // FIX 2: DEDUPLICATE LISTS
-    // Ensure we don't test the same pair twice, and sort for determinism.
-    for (auto& pair : pred_to_succ) {
-        std::vector<size_t>& v = pair.second;
-        std::sort(v.begin(), v.end());
-        v.erase(std::unique(v.begin(), v.end()), v.end());
+        // Deduplicate simple list
+        std::sort(clean_succs.begin(), clean_succs.end());
+        clean_succs.erase(std::unique(clean_succs.begin(), clean_succs.end()), clean_succs.end());
+        
+        if (!clean_succs.empty()) {
+            pred_to_succ[pred] = clean_succs;
+        }
+      }
     }
     std::cout << "pred_to_succ size: " << pred_to_succ.size() << std::endl << std::flush;
 
@@ -2643,30 +2644,43 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // --- Output Generation ---
-    // Build chains from next_seg
-    std::vector<std::vector<size_t>> chains;
+    // --- Output Generation (Corrected) ---
+    // 1. Trace all sequences from the graph
+    std::vector<std::vector<size_t>> all_sequences;
     std::vector<bool> visited(num_segments, false);
+    
     for (size_t i = 0; i < num_segments; ++i) {
+      // Find start of chains (nodes with no predecessor)
       if (!visited[i] && prev_seg[i] == -1) {
-        // Start of a chain
-        std::vector<size_t> chain;
+        std::vector<size_t> seq;
         size_t current = i;
         while (current != static_cast<size_t>(-1)) {
           visited[current] = true;
-          chain.push_back(current);
+          seq.push_back(current);
           current = next_seg[current];
         }
-        chains.push_back(chain);
+        all_sequences.push_back(seq);
       }
     }
-
-    // Collect orphans
-    std::vector<size_t> orphans;
+    
+    // Safety catch: ensure any cycles or missed nodes are grabbed
     for (size_t i = 0; i < num_segments; ++i) {
-      if (!visited[i]) {
-        orphans.push_back(i);
-      }
+        if (!visited[i]) {
+            all_sequences.push_back({i});
+        }
+    }
+
+    // 2. Separate "Real Chains" (Fused) from "Orphans" (Unfused)
+    std::vector<std::vector<size_t>> chains; // Variable name kept as 'chains' for compatibility
+    std::vector<size_t> orphans;
+    
+    for (const auto& seq : all_sequences) {
+        if (seq.size() > 1) {
+            chains.push_back(seq);
+        } else {
+            // It's an orphan (isolated segment, failed to fuse)
+            orphans.push_back(seq[0]);
+        }
     }
 
     std::cout << "Built " << chains.size() << " chains and found " << orphans.size() << " orphans" << std::endl;
