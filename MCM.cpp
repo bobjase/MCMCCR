@@ -882,7 +882,7 @@ int OracleChildMain(int argc, char* argv[]) {
             // Void output stream for compression
             //VoidWriteStream out_pred;
 
-            size_t roundOneSize = 256;
+            size_t roundOneSize = 512;
             // --- ROUND 1: QUALIFIERS (Streaming & Recycling) ---
             for (size_t succ : succ_list) {
                 if (succ >= valid_segments.size()) {
@@ -2473,12 +2473,14 @@ int main(int argc, char* argv[]) {
         double adjusted_cost = cost;
         
         if (is_natural) {
-          // Apply incumbency bonus
-          double bonus = (cost < 0) ? (cost * 0.10) : -500.0;
-          adjusted_cost += bonus;
+          // STRONG INCUMBENCY BONUS
+          // Breaking the natural flow is very expensive (~2KB-4KB lost). 
+          // We force the solver to keep natural edges unless the alternative is massive.
+          double bonus = (cost < 0) ? (cost * 0.50) : 0; // Boost natural savings by 50%
+          adjusted_cost += bonus - 4000.0; // Artificial "Gravity" to keep natural neighbors
         } else {
-          // For non-natural, only allow if significant savings
-          if (cost > -FUSION_THRESHOLD) continue;
+          // Raise threshold to 128 bytes (1024 bits) to cover overhead
+          if (cost > -1024.0) continue;
         }
         
         allowed_fusions[pred].push_back({succ, adjusted_cost});
@@ -2702,13 +2704,21 @@ int main(int argc, char* argv[]) {
         return score_a > score_b; // Descending (Best donors first)
     });
     std::cout << "Sorted " << chains.size() << " chains." << std::endl;
-    // --- STEP 3: Smart Orphan Sort ---
-    std::sort(orphans.begin(), orphans.end(), [&](size_t a, size_t b) {
-        if (std::abs(donor_scores[a] - donor_scores[b]) > 1e-4) {
-             return donor_scores[a] > donor_scores[b]; // Stronger donor first
-        }
-        return get_cost(a) < get_cost(b);
-    });
+    if (false) {
+      // --- STEP 3: Smart Orphan Sort ---
+      std::sort(orphans.begin(), orphans.end(), [&](size_t a, size_t b) {
+          if (std::abs(donor_scores[a] - donor_scores[b]) > 1e-4) {
+              return donor_scores[a] > donor_scores[b]; // Stronger donor first
+          }
+          return get_cost(a) < get_cost(b);
+      });
+    }
+
+    // --- STEP 3: Natural Orphan Sort ---
+    // If we couldn't fuse them, keep them in original file order.
+    // This allows the compressor to at least use the default context history.
+    std::sort(orphans.begin(), orphans.end());
+    
     std::cout << "Sorted orphans by Donor Score -> Entropy." << std::endl;
 
     // Build reordered segment list: chains first (in some order), then orphans
