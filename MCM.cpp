@@ -435,7 +435,7 @@ public:
   const std::string kOutDictArg = "-out-dict=";
   std::string dict_file;
   // Segmentation parameters
-  size_t segment_window = 128;
+  size_t segment_window = 192;
   float segment_threshold = 0.0f;
   size_t segment_min_segment = 4096;
   size_t segment_max_segment = 65536;  // 64KB max segment size
@@ -981,6 +981,7 @@ int OracleChildMain(int argc, char* argv[]) {
 
                 // Reuse Overlay (it contains the hash writes from Round 1)
                 cm.SetOverlay(cand.overlay);
+                cand.overlay -> Reset();
                 cm.restoreSnapshot(pred_snapshot); // Reset Mixers to start
                 cm.byte_index = 0;
                 
@@ -1021,6 +1022,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 memcpy(chunk.data(), file_data + valid_segments[cand.id].first, scan_len);
 
                 cm.SetOverlay(cand.overlay);
+                cand.overlay -> Reset();
                 cm.restoreSnapshot(pred_snapshot);
                 cm.byte_index = 0;
                 
@@ -2184,6 +2186,20 @@ int main(int argc, char* argv[]) {
     std::cout << std::endl;
     std::cout << "Pre-computed alone costs for " << num_segments << " segments" << std::endl;
 
+    // --- NEW: SAVE .ALONE FILE ---
+    std::string alone_out_file = in_file + ".alone";
+    std::ofstream alone_ofs(alone_out_file); // Text format for readability/simplicity
+    if (alone_ofs) {
+        for (double cost : global_alone_costs) {
+            alone_ofs << cost << "\n";
+        }
+        alone_ofs.close();
+        std::cout << "Wrote alone costs to " << alone_out_file << std::endl;
+    } else {
+        std::cerr << "Failed to write .alone file!" << std::endl;
+    }
+    // -----------------------------
+
     // 2. Swarm Logic
     std::vector<std::pair<size_t, std::vector<size_t>>> pred_list;
     for (const auto& p : pred_to_succ) {
@@ -2320,650 +2336,319 @@ int main(int argc, char* argv[]) {
   }
   case Options::kModePathCover: {
     printHeader();
-    std::cout << "Running PathCover Mode" << std::endl;
+    std::cout << "Running Physics-Based PathCover (Context Mixing Model)" << std::endl;
     auto start_time = std::chrono::high_resolution_clock::now();
     if (argc != 3) {
       std::cerr << "Usage: mcm -pathcover <original_file>" << std::endl;
       return 1;
     }
+    
+    // --- 1. Load Topology (Segments) ---
     std::string in_file = std::string(argv[2]) + ".segments";
-    std::cout << "in_file: " << in_file << std::endl;
-    // Read segments file
-    std::string segments_file = in_file;
-    std::cout << "segments_file: " << segments_file << std::endl;
-    std::ifstream seg_ifs(segments_file);
-    if (!seg_ifs) {
-      std::cerr << "Error opening segments file: " << segments_file << std::endl;
-      return 1;
-    }
-    size_t num_seg;
-    seg_ifs >> num_seg;
+    std::cout << "Loading topology from: " << in_file << std::endl;
+    std::ifstream seg_ifs(in_file);
+    if (!seg_ifs) { std::cerr << "Error opening segments." << std::endl; return 1; }
+    size_t num_seg; seg_ifs >> num_seg;
     std::vector<std::pair<size_t, size_t>> segments(num_seg);
-    for (size_t i = 0; i < num_seg; ++i) {
-      seg_ifs >> segments[i].first >> segments[i].second;
-    }
+    for (size_t i = 0; i < num_seg; ++i) seg_ifs >> segments[i].first >> segments[i].second;
     seg_ifs.close();
     size_t num_segments = num_seg;
-    std::cout << "Read " << num_segments << " segments from segments file" << std::endl;
+    std::string original_file = in_file.substr(0, in_file.find_last_of('.'));
 
-    std::string original_file = segments_file.substr(0, segments_file.find_last_of('.')); // remove .segments
-    std::cout << "original_file: " << original_file << std::endl;
-
-    // Read entropy for segment costs
+    // --- 2. Load Ground Truths (Hot & Alone) ---
+    // A. Hot Costs (Entropies)
     std::string entropy_file = original_file + ".entropy";
     std::vector<double> entropies;
     std::ifstream eifs(entropy_file, std::ios::binary);
     if (eifs) {
-      uint64_t num_bytes;
-      eifs.read(reinterpret_cast<char*>(&num_bytes), sizeof(num_bytes));
+      uint64_t num_bytes; eifs.read(reinterpret_cast<char*>(&num_bytes), sizeof(num_bytes));
       entropies.resize(num_bytes);
       eifs.read(reinterpret_cast<char*>(&entropies[0]), num_bytes * sizeof(double));
       eifs.close();
-      std::cout << "Read " << num_bytes << " entropies" << std::endl;
+    } else { std::cerr << "Warning: .entropy missing. Using length proxies." << std::endl; }
+
+    // B. Alone Costs (Reset State)
+    std::vector<double> alone_costs(num_segments, 0.0);
+    std::string alone_path = original_file + ".alone";
+    std::ifstream alone_ifs(alone_path, std::ios::binary); 
+    if (alone_ifs) {
+        // Assume text format for simplicity (one float per line)
+        double val; size_t idx = 0;
+        while (alone_ifs >> val && idx < num_segments) alone_costs[idx++] = val;
     } else {
-      std::cout << "Warning: entropy file not found, using length for costs" << std::endl;
+        std::cout << "Warning: .alone missing. Using 4.5 bits/byte fallback." << std::endl;
+        for(size_t i=0; i<num_segments; ++i) alone_costs[i] = segments[i].second * 4.5;
     }
 
-    // Read candidates for orphan clustering
-    std::string candidates_file = segments_file + ".candidates";
-    std::cout << "candidates_file: " << candidates_file << std::endl;
-    std::ifstream cifs(candidates_file);
-    std::vector<std::vector<std::pair<size_t, double>>> candidate_distances(num_segments);
-    if (cifs) {
-      std::string line;
-      while (std::getline(cifs, line)) {
-        std::istringstream iss(line);
-        std::string token;
-        std::getline(iss, token, ':');
-        size_t i = std::stoul(token);
-        if (i >= num_segments) continue;
-        std::vector<std::pair<size_t, double>>& dists = candidate_distances[i];
-        while (std::getline(iss, token, ',')) {
-          if (token.empty()) continue;
-          size_t j = std::stoul(token);
-          std::getline(iss, token, ',');
-          double d = std::stod(token);
-          dists.push_back({j, d});
-        }
-      }
-      cifs.close();
-      std::cout << "Read candidate distances" << std::endl;
-    } else {
-      std::cout << "Warning: candidates file not found, using simple orphan sort" << std::endl;
-    }
-
-    // Read oracle - NEW FORMAT: multiple candidates per predecessor
-    struct Edge {
-      size_t to;
-      double cost;
-    };
+    // --- 3. Load Oracle Data (Candidate Edges) ---
+    struct Edge { size_t to; double cost; };
     std::vector<std::vector<Edge>> candidates(num_segments);
     std::ifstream oracle_ifs(original_file + ".oracle");
-    if (!oracle_ifs) {
-      std::cerr << "Error opening oracle file: " << in_file << std::endl;
-      return 1;
-    }
-    std::string line;
-    while (std::getline(oracle_ifs, line)) {
-      std::istringstream iss(line);
-      std::string token;
-      std::getline(iss, token, ':');
-      size_t pred_id = std::stoul(token);
-      std::string transitions_str;
-      std::getline(iss, transitions_str);
-      std::istringstream trans_iss(transitions_str);
-      std::string trans_token;
-      while (std::getline(trans_iss, trans_token, ';')) {
-        if (trans_token.empty()) continue;
-        std::istringstream pair_iss(trans_token);
-        std::string succ_str, cost_str;
-        std::getline(pair_iss, succ_str, ',');
-        std::getline(pair_iss, cost_str);
-        size_t succ_id = std::stoul(succ_str);
-        double cost = std::stod(cost_str);
-
-        size_t real_len = segments[succ_id].second;
-        const size_t SCAN_LIMIT = 10240;
-
-        // if (real_len > SCAN_LIMIT && cost < 0) { // Only extrapolate savings
-        //     double head_savings = cost; // This is the known savings for first 10KB
-            
-        //     size_t tail_len = real_len - SCAN_LIMIT;
-        //     double tail_ratio = (double)tail_len / (double)SCAN_LIMIT;
-            
-        //     // Extrapolate to tail with dampening (0.8) to account for context dilution
-        //     double tail_savings = head_savings * tail_ratio * 0.8;
-            
-        //     cost = head_savings + tail_savings;
-        // }
-
-        // --- SANITY CHECK: Print this ONCE to prove we are running new code ---
-        static bool printed_sanity = false;
-        if (!printed_sanity) {
-            std::cout << ">>> SANITY CHECK: NO EXTRAPOLATION LOGIC IS ACTIVE <<<" << std::endl;
-            printed_sanity = true;
-        }
-
-        candidates[pred_id].push_back({succ_id, cost});
-      }
-      // Sort by cost ascending (Stable)
-      std::sort(candidates[pred_id].begin(), candidates[pred_id].end(), 
-                [](const Edge& a, const Edge& b) { 
-                    if (std::abs(a.cost - b.cost) > 1e-9) return a.cost < b.cost;
-                    return a.to < b.to; // Break ties with successor ID
-                });
-
-      // DEDUPLICATE: Remove multiple entries for the same successor
-      auto last = std::unique(candidates[pred_id].begin(), candidates[pred_id].end(),
-          [](const Edge& a, const Edge& b) {
-              return a.to == b.to; 
-          });
-      candidates[pred_id].erase(last, candidates[pred_id].end());
-      
-      size_t max_candidates = candidates[pred_id].size();
-      // RED TEAM FIX: Protect Natural Predecessor from eviction
-      // If we resize to 32, we MUST ensure the natural edge (pred_id + 1) stays.
-      if (candidates[pred_id].size() > max_candidates) {
-        size_t natural_succ = pred_id + 1;
-        bool natural_found = false;
-        size_t natural_idx = -1;
-        
-        // Check if natural successor is in the list
-        for (size_t k = 0; k < candidates[pred_id].size(); ++k) {
-            if (candidates[pred_id][k].to == natural_succ) {
-                natural_found = true;
-                natural_idx = k;
-                break;
+    if (oracle_ifs) {
+        std::string line;
+        while (std::getline(oracle_ifs, line)) {
+            std::istringstream iss(line);
+            std::string token; std::getline(iss, token, ':');
+            size_t pred = std::stoul(token);
+            std::string trans_str; std::getline(iss, trans_str);
+            std::istringstream trans_iss(trans_str);
+            while (std::getline(trans_iss, token, ';')) {
+                if (token.empty()) continue;
+                size_t comma = token.find(',');
+                size_t succ = std::stoul(token.substr(0, comma));
+                double cost = std::stod(token.substr(comma+1));
+                candidates[pred].push_back({succ, cost});
             }
         }
-
-        // Resize to 31 to leave room if we need to force-keep natural
-        // or resize to 32 if natural is already safe in top 32
-        if (natural_found && natural_idx < max_candidates) {
-             candidates[pred_id].resize(max_candidates);
-        } else if (natural_found && natural_idx >= max_candidates) {
-             // Natural was found but is about to be cut. Save it.
-             Edge natural_edge = candidates[pred_id][natural_idx];
-             candidates[pred_id].resize(max_candidates-1);
-             candidates[pred_id].push_back(natural_edge); // Put it back
-        } else {
-             candidates[pred_id].resize(max_candidates); // Natural not in list at all
-        }
-      }
     }
     oracle_ifs.close();
-    size_t total_candidates = 0;
-    for (const auto& c : candidates) total_candidates += c.size();
-    std::cout << "Read " << total_candidates << " candidate transitions from oracle" << std::endl;
 
-    // --- STEP 1: Calculate Donor Scores ---
-    // A negative cost means the predecessor makes the successor smaller (Savings).
-    // We want to find "Universal Donors" (High negative sum).
+    // --- PHASE 4: DONOR SCORING (EMPERICAL) ---
+    // Objective: Identify "Universal Donors" - segments that compress others well.
+    std::cout << "Calculating Donor Scores..." << std::endl;
+
     std::vector<double> donor_scores(num_segments, 0.0);
-    for (size_t i = 0; i < num_segments; ++i) {
-        for (const auto& edge : candidates[i]) {
-            // Only count "savings" (negative costs), ignore "pollution" (positive costs)
-            if (edge.cost < 0) {
-                donor_scores[i] += edge.cost;
-            }
-        }
-    }
-    
-    // Beam Search Parameters
-    const size_t BEAM_WIDTH = 2000;
-    const double ORPHAN_PENALTY = 1000.0;
-    
-    // RED TEAM FIX: Threshold is in TOTAL BITS. 
-    // 2.0 was too small. We require ~64 bytes (512 bits) of savings to justify a jump.
-    const double FUSION_THRESHOLD = 512.0;
-    
-    // --- STEP 1: Load "Incumbent" (Natural) Costs ---
-    // We need to know exactly how good the natural order is to defend it.
-    std::vector<double> natural_costs(num_segments, 1.0); 
+    // Threshold: We only count it as a "Donation" if it saves > 64 bytes
+    const double DONATION_THRESHOLD = 512.0; 
 
     for (size_t pred = 0; pred < num_segments; ++pred) {
         for (const auto& edge : candidates[pred]) {
-            if (edge.to == pred + 1) {
-                natural_costs[edge.to] = edge.cost; // Store the extrapolated cost
-                break;
+            // A negative cost means 'pred' makes 'succ' smaller.
+            // We sum these savings to see how valuable 'pred' is as a context source.
+            if (edge.cost < -DONATION_THRESHOLD) {
+                // edge.cost is negative (savings), so we add it directly.
+                // Lower (more negative) donor_score = Better Donor.
+                donor_scores[pred] += edge.cost;
             }
         }
     }
-    std::cout << "Loaded natural costs from oracle data." << std::endl;
 
-    // --- STEP 2: Build Clean Fusion List ---
-    // We filter the candidate list.
-    // RED TEAM FIX: Apply "Tail Risk" Penalty.
-    // If a segment is longer than the scan limit (10KB), we assume the unseen tail 
-    // will suffer from context dilution if moved. We penalize the cost.
-    
+    // 4.3 Compute Edge Weights (Simple Savings)
+    // We treat every edge as a simple "Profit" opportunity. No extrapolation.
     std::vector<std::vector<Edge>> allowed_fusions(num_segments);
     size_t edge_count = 0;
-    const size_t ORACLE_SCAN_LIMIT = 10240;
-    const double TAIL_RISK_PER_BYTE = 0.05; // 0.05 bits per byte penalty (~0.6% risk)
+    
+    // The cost to break a natural link.
+    const double break_penalty_bits = 800.0; // ~100 bytes
 
     for (size_t pred = 0; pred < num_segments; ++pred) {
         for (const auto& edge : candidates[pred]) {
             size_t succ = edge.to;
-            double cost = edge.cost; // Raw savings from header (negative)
+            double raw_savings = edge.cost; 
+            
             bool is_natural = (succ == pred + 1);
+            double final_cost = raw_savings;
 
-            if (!is_natural) {
-                // Apply Tail Risk Penalty to non-natural moves
-                size_t real_len = segments[succ].second;
-                if (real_len > ORACLE_SCAN_LIMIT) {
-                    size_t unseen_bytes = real_len - ORACLE_SCAN_LIMIT;
-                    // Penalty: Positive value added to cost (making it less negative/good)
-                    double penalty = unseen_bytes * TAIL_RISK_PER_BYTE; 
-                    cost += penalty;
-                }
+            if (is_natural) {
+                // Incumbency Bonus: Natural links get a free pass
+                final_cost = -1.0; 
+            } else {
+                // Artificial links must pay the tax
+                final_cost += break_penalty_bits;
             }
 
-            // Filter: Only keep edge if it STILL saves bits after penalty
-            // or if it is the natural link (which we always keep as baseline)
-            if (is_natural || cost < -100.0) {
-                allowed_fusions[pred].push_back({succ, cost});
+            // Filter
+            if (is_natural || final_cost < 0.0) { 
+                allowed_fusions[pred].push_back({succ, final_cost});
                 edge_count++;
             }
         }
     }
-    std::cout << "Pre-computed " << edge_count << " allowed fusions (Tail Risk Applied)" << std::endl;
+    std::cout << "Optimization Engine: " << edge_count << " edges prepared." << std::endl;
 
-    // --- GGCA-IR Algorithm ---
-
-    // Data Structures
-    struct UnionFind {
-      std::vector<int> parent;
-      UnionFind(size_t n) {
-        parent.resize(n);
-        std::iota(parent.begin(), parent.end(), 0);
-      }
-      int find(int v) {
-        if (v == parent[v]) return v;
-        return parent[v] = find(parent[v]);
-      }
-      void unite(int a, int b) {
-        a = find(a);
-        b = find(b);
-        if (a != b) parent[b] = a;
-      }
-    };
-
-    struct EdgeSavings {
-      uint32_t u, v;
-      double savings;
-    };
-
-    // --- STEP 3: GGCA-IR Algorithm (Beat The Incumbent) ---
-    bool improved = true;
-    int pass = 0;
-    const int MAX_PASSES = 100;
-    const double MIN_SAVINGS_BITS = 800.0; // Stop if pass saves < 100 bytes
+    // --- PHASE 5: GRAPH SOLVER (GGCA-IR) ---
+    // Objective: Minimize Sum(C_local).
+    // Target to beat: 0.0 (Natural Cost in Delta-Space).
     
-    // The Cost of Breaking a Chain. 
-    // Represents Deep Context loss (~500 bytes) + Metadata overhead.
-    const double SWITCHING_FEE = 4000.0; 
+    struct UnionFind {
+      std::vector<int> p;
+      UnionFind(size_t n) { p.resize(n); std::iota(p.begin(), p.end(), 0); }
+      int find(int x) { return x == p[x] ? x : p[x] = find(p[x]); }
+      void unite(int a, int b) { p[find(b)] = find(a); }
+    };
 
-    // Initialize Graph State
     std::vector<int> next_seg(num_segments, -1);
     std::vector<int> prev_seg(num_segments, -1);
     UnionFind dsu(num_segments);
+    
+    bool improved = true;
+    int pass = 0;
+    double total_savings = 0.0;
 
-    while (improved && pass < MAX_PASSES) {
+    while (improved && pass < 50) {
         improved = false;
         pass++;
         size_t changes = 0;
-        double pass_savings_bits = 0.0;
-
+        
         for (size_t u = 0; u < num_segments; ++u) {
-            for (const auto& edge : allowed_fusions[u]) { 
+            for (const auto& edge : allowed_fusions[u]) {
                 size_t v = edge.to;
-                double new_cost = edge.cost; // The savings offered by u->v
+                double new_val = edge.cost; // C_local
 
-                // ---------------------------------------------------------
-                // CASE 1: STANDARD STITCH (Connecting two free ends)
-                // ---------------------------------------------------------
+                // 1. STITCH
                 if (next_seg[u] == -1 && prev_seg[v] == -1) {
                     if (dsu.find(u) != dsu.find(v)) {
-                         // Compare against v's "Natural Fate"
-                         // If we don't link v, it implicitly defaults to Natural Order eventually.
-                         // So we must beat the Natural Link Cost.
-                         double current_val = natural_costs[v];
-                         
-                         // Apply Defender Bonus: To win, New must be LOWER (more negative)
-                         // than (Natural - Fee). 
-                         if (new_cost < (current_val - SWITCHING_FEE)) {
-                             next_seg[u] = v; prev_seg[v] = u; 
-                             dsu.unite(u, v);
-                             improved = true; changes++;
-                             pass_savings_bits += (current_val - new_cost);
-                         }
+                        // Compare against Natural (0.0)
+                        if (new_val < 0.0) {
+                            next_seg[u] = v; prev_seg[v] = u;
+                            dsu.unite(u, v);
+                            improved = true; changes++;
+                            total_savings += (-new_val);
+                        }
                     }
                 }
-                
-                // ---------------------------------------------------------
-                // CASE 2: AGGRESSIVE STEAL (v already has a parent 'old')
-                // ---------------------------------------------------------
+                // 2. STEAL (v has pred)
                 else if (next_seg[u] == -1 && prev_seg[v] != -1) {
                     int old_pred = prev_seg[v];
-                    
-                    // 1. Determine Value of the Current Link
-                    double current_val = 0;
-                    if ((size_t)old_pred == v - 1) {
-                        // Current is Natural: Use the precise pre-calculated cost
-                        current_val = natural_costs[v];
-                        // It gets the Defender Bonus
-                        current_val -= SWITCHING_FEE; 
-                    } else {
-                        // Current is Artificial: Find its cost in the edge list
-                        bool found = false;
-                        for(auto& e : candidates[old_pred]) if(e.to == v) { current_val = e.cost; found=true; break; }
-                        if (!found) current_val = 0; // Should not happen
+                    double current_val = 0.0; // Default natural
+                    if ((size_t)old_pred != v - 1) {
+                         // Find artificial cost
+                         for(auto& e : allowed_fusions[old_pred]) if(e.to == v) current_val = e.cost;
                     }
-
-                    // 2. The Trade: Is New Cost LOWER (better) than Current Value?
-                    if (dsu.find(u) != dsu.find(v) && new_cost < current_val) {
-                        next_seg[old_pred] = -1; // Unlink old
-                        next_seg[u] = v; prev_seg[v] = u; // Link new
-                        dsu.unite(u, v); 
+                    if (dsu.find(u) != dsu.find(v) && new_val < current_val) {
+                        next_seg[old_pred] = -1; 
+                        next_seg[u] = v; prev_seg[v] = u;
+                        dsu.unite(u, v);
                         improved = true; changes++;
-                        pass_savings_bits += (current_val - new_cost);
+                        total_savings += (current_val - new_val);
                     }
                 }
-                
-                // ---------------------------------------------------------
-                // CASE 3: AGGRESSIVE BREAK (u already has a child 'old')
-                // ---------------------------------------------------------
+                // 3. BREAK (u has succ)
                 else if (next_seg[u] != -1 && prev_seg[v] == -1) {
                     int old_next = next_seg[u];
-                    
-                    // 1. Determine Value of the Current Link
-                    double current_val = 0;
-                    if ((size_t)old_next == u + 1) {
-                        current_val = natural_costs[old_next];
-                        current_val -= SWITCHING_FEE; // Defender Bonus
-                    } else {
-                        bool found = false;
-                        for(auto& e : candidates[u]) if(e.to == (size_t)old_next) { current_val = e.cost; found=true; break; }
-                        if(!found) current_val = 0;
+                    double current_val = 0.0;
+                    if ((size_t)old_next != u + 1) {
+                         for(auto& e : allowed_fusions[u]) if(e.to == (size_t)old_next) current_val = e.cost;
                     }
-
-                    // 2. The Trade
-                    if (dsu.find(u) != dsu.find(v) && new_cost < current_val) {
-                        prev_seg[old_next] = -1; 
-                        next_seg[u] = v; prev_seg[v] = u; 
-                        dsu.unite(u, v); 
+                    if (dsu.find(u) != dsu.find(v) && new_val < current_val) {
+                        prev_seg[old_next] = -1;
+                        next_seg[u] = v; prev_seg[v] = u;
+                        dsu.unite(u, v);
                         improved = true; changes++;
-                        pass_savings_bits += (current_val - new_cost);
+                        total_savings += (current_val - new_val);
                     }
                 }
             }
         }
-        
         if (improved) {
-             // Clean DSU rebuild for safety
+            // Rebuild DSU
             dsu = UnionFind(num_segments);
-            for(size_t i=0; i<num_segments; ++i) {
-                if (next_seg[i] != -1) dsu.unite(i, next_seg[i]);
-            }
-            std::cout << "Pass " << std::setw(2) << pass << ": " 
-                      << std::setw(5) << changes << " optimizations. "
-                      << "Est. Savings: " << (long)(pass_savings_bits / 8) << " bytes." << std::endl;
-            
-            if (pass_savings_bits < MIN_SAVINGS_BITS) improved = false;
+            for(size_t i=0; i<num_segments; ++i) if(next_seg[i]!=-1) dsu.unite(i, next_seg[i]);
+            std::cout << "Pass " << pass << ": " << changes << " changes. Est Delta: " << (long)(total_savings/8) << " bytes." << std::endl;
         }
     }
 
-    // --- STEP 4: Final Scorecard (Relative to Natural) ---
-    std::cout << "\n--- OPTIMIZATION SCORECARD (VS NATURAL) ---\n";
+    // --- PHASE 6: DONOR-BASED SORTING ---
     
-    double total_natural_cost = 0.0;
-    double total_optimized_cost = 0.0;
-    size_t links_changed = 0;
-
-    for (size_t u = 0; u < num_segments; ++u) {
-        int v = next_seg[u];
-        
-        // 1. Calculate Natural Cost for 'u's slot (u -> u+1)
-        // If 'u' is the last segment, natural cost is 0 (end of stream).
-        double nat_cost = 0.0;
-        if (u + 1 < num_segments) {
-             // Look up u -> u+1 in the candidate list if possible, or use natural_costs vector
-             if (u+1 < natural_costs.size()) nat_cost = natural_costs[u+1];
-        }
-        total_natural_cost += nat_cost;
-
-        // 2. Calculate Optimized Cost for the link we chose (u -> v)
-        double opt_cost = 0.0; // Default to 0 (Alone) if v == -1
-        if (v != -1) {
-            bool found = false;
-            for (const auto& edge : candidates[u]) {
-                if (edge.to == (size_t)v) {
-                    opt_cost = edge.cost;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) opt_cost = 0.0; // Should not happen
-            
-            // Check if we changed the structure
-            if ((size_t)v != u + 1) links_changed++;
-        } else {
-            // If v == -1, it means 'u' is a tail. 
-            // In the reordered file, 'u' connects to NOTHING (reset).
-            // Cost is 0 (Alone / Reset cost).
-            opt_cost = 0.0;
-            if (u + 1 < num_segments) links_changed++; // We broke the natural link
-        }
-        total_optimized_cost += opt_cost;
-    }
-
-    double net_savings_bits = total_natural_cost - total_optimized_cost;
-    // Note: Costs are negative (savings). 
-    // If Natural = -5000 and Opt = -6000, Net = (-5000) - (-6000) = +1000 bits saved.
-    // If Natural = -5000 and Opt = -4000, Net = -1000 bits saved (loss).
-
-    std::cout << "Baseline Savings (Natural): " << (long)(total_natural_cost / 8) << " bytes\n";
-    std::cout << "Optimized Savings (Graph):  " << (long)(total_optimized_cost / 8) << " bytes\n";
-    std::cout << "Net Improvement:            " << (long)(net_savings_bits / 8) << " bytes\n";
-    std::cout << "Structural Changes:         " << links_changed << " segments reordered\n";
-    std::cout << "--------------------------\n";
-
-    
-
-    // --- Output Generation (Corrected) ---
-    // 1. Trace all sequences from the graph
-    std::vector<std::vector<size_t>> all_sequences;
+    std::vector<std::vector<size_t>> all_groups;
     std::vector<bool> visited(num_segments, false);
-    
+
+    // 1. Collect Chains and Orphans
     for (size_t i = 0; i < num_segments; ++i) {
-      // Find start of chains (nodes with no predecessor)
-      if (!visited[i] && prev_seg[i] == -1) {
-        std::vector<size_t> seq;
-        size_t current = i;
-        while (current != static_cast<size_t>(-1)) {
-          visited[current] = true;
-          seq.push_back(current);
-          current = next_seg[current];
+        if (!visited[i] && prev_seg[i] == -1) {
+            std::vector<size_t> seq;
+            size_t curr = i;
+            while (curr != -1) {
+                visited[curr] = true;
+                seq.push_back(curr);
+                curr = next_seg[curr];
+            }
+            all_groups.push_back(seq);
         }
-        all_sequences.push_back(seq);
-      }
     }
+    // Catch stragglers
+    for(size_t i=0; i<num_segments; ++i) {
+        if(!visited[i]) all_groups.push_back({i});
+    }
+
+    // 2. Define "Group Generosity"
+    auto GetGroupDonorScore = [&](const std::vector<size_t>& c) {
+        double total_score = 0.0;
+        for (size_t s : c) total_score += donor_scores[s];
+        // Average score per segment? Or Total? 
+        // Gold used Sum. A long chain of donors is a massive battery.
+        return total_score; 
+    };
     
-    // Safety catch: ensure any cycles or missed nodes are grabbed
-    for (size_t i = 0; i < num_segments; ++i) {
-        if (!visited[i]) {
-            all_sequences.push_back({i});
-        }
-    }
-
-    // 2. Separate "Real Chains" (Fused) from "Orphans" (Unfused)
-    std::vector<std::vector<size_t>> chains; // Variable name kept as 'chains' for compatibility
-    std::vector<size_t> orphans;
-    
-    for (const auto& seq : all_sequences) {
-        if (seq.size() > 1) {
-            chains.push_back(seq);
-        } else {
-            // It's an orphan (isolated segment, failed to fuse)
-            orphans.push_back(seq[0]);
-        }
-    }
-
-    std::cout << "Built " << chains.size() << " chains and found " << orphans.size() << " orphans" << std::endl;
-
-    // Handle orphans: sort by entropy cost ascending
-    auto get_cost = [&](size_t seg) -> double {
-      if (!entropies.empty()) {
-        double cost = 0.0;
-        size_t start = segments[seg].first;
-        size_t len = segments[seg].second;
-        for (size_t k = 0; k < len; ++k) {
-          cost += entropies[start + k];
-        }
-        return cost;
-      } else {
-        return segments[seg].second; // length as proxy
-      }
+    // Helper: Original Position
+    auto GetAvgPos = [&](const std::vector<size_t>& c) {
+        double sum = 0; for(auto s : c) sum += s; return sum / c.size();
     };
 
-    // --- STEP 2: Sort Chains by Cleanliness & Priority ---
-    std::cout << "Sorting chains by Toxicity and Donor Score..." << std::endl;
-    std::sort(chains.begin(), chains.end(), [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
-        // 1. Calculate Toxicity (Average Entropy)
-        auto chain_entropy = [&](const std::vector<size_t>& chain) {
-            double total = 0.0;
-            for (size_t s : chain) total += get_cost(s);
-            // If get_cost returns total bits, divide by length. 
-            // Here get_cost returns entropy*len or just len. 
-            // We need Bits-Per-Byte approximation. 
-            // Assuming get_cost approx equals compressed size in bits:
-            double len = 0.0;
-            for (size_t s : chain) len += segments[s].second;
-            return (len > 0) ? (total / len) : 8.0; 
-        };
+    std::cout << "Sorting " << all_groups.size() << " groups by Donor Score (Gold Logic)..." << std::endl;
 
-        // Note: get_cost currently returns "Approximate Bits". 
-        // We need to normalize if we want true "Bits Per Byte".
-        // However, for sorting, "Total Entropy" (Cost) is a reasonable proxy for difficulty 
-        // if segments are roughly same size.
+    std::sort(all_groups.begin(), all_groups.end(), [&](const auto& a, const auto& b) {
+        double score_a = GetGroupDonorScore(a);
+        double score_b = GetGroupDonorScore(b);
         
-        // Strategy: "Toxic Deferral"
-        // If a chain is "Hard" (High Entropy), push it to the end.
-        // We use a simplified check: Compare average per-segment cost.
-        double cost_a = 0.0; for(auto s : a) cost_a += get_cost(s);
-        double cost_b = 0.0; for(auto s : b) cost_b += get_cost(s);
-        double avg_a = cost_a / a.size();
-        double avg_b = cost_b / b.size();
-
-        // Heuristic: If one is significantly "Harder" (> 20% diff), sort by difficulty (Easy First)
-        // "Easy First" means Low Cost First.
-        if (std::abs(avg_a - avg_b) > (std::min(avg_a, avg_b) * 0.2)) {
-            return avg_a < avg_b;
+        // Primary: Donor Score (Ascending)
+        // Remember: donor_scores are NEGATIVE (savings). 
+        // So -10000 is better than -100.
+        // We want -10000 FIRST.
+        if (std::abs(score_a - score_b) > 1e-1) {
+            return score_a < score_b; 
         }
-
-        // 2. Otherwise (similar difficulty), sort by Donor Score (Helpfulness)
-        double score_a = 0.0; for (size_t seg : a) score_a += donor_scores[seg];
-        double score_b = 0.0; for (size_t seg : b) score_b += donor_scores[seg];
-        return score_a > score_b; // Descending (Best donors first)
+        
+        // Secondary: Stability
+        return GetAvgPos(a) < GetAvgPos(b);
     });
-    std::cout << "Sorted " << chains.size() << " chains." << std::endl;
-    if (true) {
-      // --- STEP 3: Smart Orphan Sort ---
-      std::sort(orphans.begin(), orphans.end(), [&](size_t a, size_t b) {
-          if (std::abs(donor_scores[a] - donor_scores[b]) > 1e-4) {
-              return donor_scores[a] > donor_scores[b]; // Stronger donor first
-          }
-          return get_cost(a) < get_cost(b);
-      });
-    } else {
-      // --- STEP 3: Natural Orphan Sort ---
-      // If we couldn't fuse them, keep them in original file order.
-      // This allows the compressor to at least use the default context history.
-      std::sort(orphans.begin(), orphans.end());
-    }
-    std::cout << "Sorted orphans by Donor Score -> Entropy." << std::endl;
 
-    // Build reordered segment list: chains first (in some order), then orphans
-    std::vector<size_t> reordered_segments;
-    for (const auto& chain : chains) {
-      reordered_segments.insert(reordered_segments.end(), chain.begin(), chain.end());
+    // Flatten...
+    std::vector<size_t> final_order;
+    for (const auto& group : all_groups) {
+        final_order.insert(final_order.end(), group.begin(), group.end());
     }
-    reordered_segments.insert(reordered_segments.end(), orphans.begin(), orphans.end());
 
-    // Load original file data
+    // 5. Write Files
     std::ifstream data_ifs(original_file, std::ios::binary | std::ios::ate);
-    if (!data_ifs) {
-      std::cerr << "Error opening original file: " << original_file << std::endl;
-      return 1;
-    }
     size_t file_size = data_ifs.tellg();
     data_ifs.seekg(0);
     std::vector<uint8_t> file_data(file_size);
-    if (file_size > 0 && !data_ifs.read(reinterpret_cast<char*>(&file_data[0]), file_size)) {
-      std::cerr << "Error reading original file: " << original_file << std::endl;
-      return 1;
-    }
+    if (file_size > 0) data_ifs.read((char*)&file_data[0], file_size);
     data_ifs.close();
-    std::cout << "Loaded " << file_size << " bytes from original file" << std::endl;
 
-    // Generate reordered file
-    std::string reordered_file = original_file + ".reordered";
-    std::ofstream rofs(reordered_file, std::ios::binary);
-    if (!rofs) {
-      std::cerr << "Error opening reordered file: " << reordered_file << std::endl;
-      return 1;
-    }
-    for (size_t seg : reordered_segments) {
-      size_t start = segments[seg].first;
-      size_t len = segments[seg].second;
-      rofs.write(reinterpret_cast<const char*>(&file_data[start]), len);
+    std::string out_name = original_file + ".reordered";
+    std::ofstream rofs(out_name, std::ios::binary);
+    for (size_t s : final_order) {
+        size_t start = segments[s].first;
+        size_t len = segments[s].second;
+        rofs.write((char*)&file_data[start], len);
     }
     rofs.close();
-    std::cout << "Wrote reordered file to " << reordered_file << std::endl;
 
-    // Generate segment table (lengths in reordered order)
-    std::string segment_table_file = reordered_file + ".segments";
-    std::ofstream stofs(segment_table_file);
-    if (!stofs) {
-      std::cerr << "Error opening segment table file: " << segment_table_file << std::endl;
-      return 1;
+    // --- COUNT STATS FOR LOGGING ---
+    size_t count_chains = 0;
+    size_t count_orphans = 0;
+    for (const auto& grp : all_groups) {
+        if (grp.size() > 1) count_chains++;
+        else count_orphans++;
     }
-    for (size_t seg : reordered_segments) {
-      stofs << segments[seg].second << std::endl;
-    }
-    stofs.close();
-    std::cout << "Wrote segment table to " << segment_table_file << std::endl;
 
-    // Generate RLE-move index (segment ids in reordered order, RLE-encoded)
-    std::string index_file = reordered_file + ".index";
-    std::ofstream iofs(index_file);
-    if (!iofs) {
-      std::cerr << "Error opening index file: " << index_file << std::endl;
-      return 1;
-    }
-    if (!reordered_segments.empty()) {
-      size_t current_start = reordered_segments[0]; // Renamed for clarity
-      size_t count = 1;
-      for (size_t i = 1; i < reordered_segments.size(); ++i) {
-        // CHECK SEQUENTIALITY: Is this segment exactly 1 greater than the previous?
-        if (reordered_segments[i] == current_start + count) {
-          count++;
-        } else {
-          iofs << current_start << "," << count << std::endl;
-          current_start = reordered_segments[i];
-          count = 1;
+    std::cout << "Physics Optimization Complete." << std::endl;
+    std::cout << "Final Topology: " << all_groups.size() << " total groups." << std::endl;
+    std::cout << "  - Chains (Merged): " << count_chains << std::endl;
+    std::cout << "  - Orphans (Single): " << count_orphans << std::endl;
+    std::cout << "Sorting all groups by Density (Unified Physics Model)..." << std::endl;
+    
+    // Write Index (RLE)
+    std::ofstream iofs(out_name + ".index");
+    if (!final_order.empty()) {
+        size_t start = final_order[0];
+        size_t count = 1;
+        for (size_t i = 1; i < final_order.size(); ++i) {
+            if (final_order[i] == start + count) {
+                count++;
+            } else {
+                iofs << start << "," << count << "\n";
+                start = final_order[i];
+                count = 1;
+            }
         }
-      }
-      iofs << current_start << "," << count << std::endl;
+        iofs << start << "," << count << "\n";
     }
     iofs.close();
-    std::cout << "Wrote RLE index to " << index_file << std::endl;
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end_time - start_time;
-    std::cout << "Phase 5 completed in " << elapsed.count() << " seconds" << std::endl;
-
+    std::cout << "Physics Optimization Complete." << std::endl;
     break;
   }
   }
