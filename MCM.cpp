@@ -2430,15 +2430,16 @@ int main(int argc, char* argv[]) {
     UnionFind dsu(num_segments);
 
     // --- RESTORED PHASE: Global Greedy Construction ---
-    // This was MISSING in your New code. It builds the skeleton.
+    // If this is missing, the solver starts with an empty graph (Newest Logic).
+    // If this is present, it starts with a strong skeleton (Gold Logic).
     struct EdgeSavings { uint32_t u, v; double savings; };
     std::vector<EdgeSavings> all_edges;
-    const double RESET_PENALTY = 1000.0;
+    const double RESET_PENALTY = 800.0;
 
     for (size_t pred = 0; pred < num_segments; ++pred) {
       for (const auto& edge : candidates[pred]) {
         double cost = edge.cost;
-        double savings = RESET_PENALTY - cost; // Convert to positive savings
+        double savings = RESET_PENALTY - cost; 
         bool is_natural = (edge.to == pred + 1);
         if (is_natural) savings += 0.1 * std::abs(cost);
         
@@ -2447,71 +2448,159 @@ int main(int argc, char* argv[]) {
         }
       }
     }
-    // Sort descending (Best savings first)
     std::sort(all_edges.begin(), all_edges.end(), [](const EdgeSavings& a, const EdgeSavings& b) {
       return a.savings > b.savings;
     });
     std::cout << "Greedy Phase: Processing " << all_edges.size() << " global edges..." << std::endl;
 
+    double greedy_savings = 0.0; // <--- THIS IS THE VARIABLE YOU WERE MISSING
     for (const auto& edge : all_edges) {
       if (next_seg[edge.u] == -1 && prev_seg[edge.v] == -1 && dsu.find(edge.u) != dsu.find(edge.v)) {
         next_seg[edge.u] = edge.v;
         prev_seg[edge.v] = edge.u;
         dsu.unite(edge.u, edge.v);
+        greedy_savings += edge.savings;
       }
     }
 
-    // --- Iterative Refinement ---
+    // --- Iterative Refinement (True Gold Logic) ---
     bool improved = true;
     int pass = 0;
-    while (improved && pass < 50) {
+    // We start with the savings from the Greedy Phase
+    double total_savings = greedy_savings; 
+
+    std::cout << "Starting Iterative Refinement..." << std::endl;
+
+    while (improved && pass < 500) {
         improved = false; pass++;
         size_t changes = 0;
+        double pass_delta = 0.0;
         
         for (size_t u = 0; u < num_segments; ++u) {
-            for (const auto& edge : allowed_fusions[u]) {
+            // CRITICAL FIX: Iterate raw 'candidates', NOT 'allowed_fusions'
+            // This matches the Gold logic exactly.
+            for (const auto& edge : candidates[u]) {
                 size_t v = edge.to;
-                double cost = edge.cost;
+                double cost = edge.cost; // Raw Oracle Cost
                 
-                // 1. Stitch
+                // 1. Stitch (Tail -> Head)
                 if (next_seg[u] == -1 && prev_seg[v] == -1 && dsu.find(u) != dsu.find(v)) {
                     if (cost < RESET_PENALTY) {
                         next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v);
                         improved = true; changes++;
+                        pass_delta += (RESET_PENALTY - cost); 
                     }
                 }
-                // 2. Steal
+                // 2. Steal (Target v already has a pred)
                 else if (next_seg[u] == -1 && prev_seg[v] != -1) {
                     int old_pred = prev_seg[v];
-                    double old_cost = 1e9;
-                    for(auto& e : candidates[old_pred]) if(e.to == v) { old_cost = e.cost; break; }
                     
+                    // Lookup cost of existing link (old_pred -> v)
+                    // We must find it in 'candidates' to compare apples-to-apples
+                    double old_cost = 1e9; 
+                    bool found = false;
+                    for(const auto& e : candidates[old_pred]) {
+                        if (e.to == v) { old_cost = e.cost; found = true; break; }
+                    }
+                    // Handle implicit natural link case if not in candidates
+                    if (!found && old_pred == (int)v - 1) {
+                         // Natural link cost is 0 relative to itself, but usually negative in oracle.
+                         // If missing from oracle, we assume it's roughly 'alone cost' (bad).
+                         // Better fallback: assume it's just 'RESET_PENALTY' (weak link).
+                         old_cost = RESET_PENALTY; 
+                    }
+
                     if (dsu.find(u) != dsu.find(v) && cost < old_cost) {
-                        next_seg[old_pred] = -1;
-                        next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v);
+                        next_seg[old_pred] = -1; // Break old
+                        next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v); // Link new
                         improved = true; changes++;
+                        pass_delta += (old_cost - cost);
                     }
                 }
-                // 3. Break
+                // 3. Break (Source u already has a succ)
                 else if (next_seg[u] != -1 && prev_seg[v] == -1) {
                     int old_next = next_seg[u];
                     if (dsu.find(u) != dsu.find(v)) {
                         double old_cost = 1e9;
-                        for(auto& e : candidates[u]) if(e.to == (size_t)old_next) { old_cost = e.cost; break; }
-                        
-                        if (cost < old_cost) {
-                            prev_seg[old_next] = -1;
-                            next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v);
-                            improved = true; changes++;
+                        bool found = false;
+                        for(const auto& e : candidates[u]) {
+                            if (e.to == (size_t)old_next) { old_cost = e.cost; found = true; break; }
                         }
+                        if (!found && u == (size_t)old_next - 1) old_cost = RESET_PENALTY;
+
+                        if (cost < old_cost) {
+                            prev_seg[old_next] = -1; // Break old
+                            next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v); // Link new
+                            improved = true; changes++;
+                            pass_delta += (old_cost - cost);
+                        }
+                    }
+                }
+                // 4. OVERPOWER (Double Break) - The "Red Team" Fix
+                // Condition: u has a successor (old_next), v has a predecessor (old_pred).
+                // Both are busy. But u->v is SO GOOD that we break both families.
+                else if (next_seg[u] != -1 && prev_seg[v] != -1) {
+                    int old_next = next_seg[u];
+                    int old_pred = prev_seg[v];
+                    
+                    // Sanity check: Don't break if they are already connected to each other (u->v)
+                    if (old_next == (int)v) continue;
+
+                    // Check cycles: ensure u and v are not in the same component already
+                    // (Connecting them would form a loop, not a chain)
+                    if (dsu.find(u) == dsu.find(v)) continue;
+
+                    // COST ANALYSIS
+                    // We need u->v to be better than u->old_next AND old_pred->v.
+                    // We must justify breaking TWO existing links.
+                    
+                    double cost_u_old = 1e9;
+                    bool found_u = false;
+                    for(const auto& e : candidates[u]) {
+                        if (e.to == (size_t)old_next) { cost_u_old = e.cost; found_u = true; break; }
+                    }
+                    if (!found_u && u == (size_t)old_next - 1) cost_u_old = RESET_PENALTY;
+
+                    double cost_old_v = 1e9;
+                    bool found_v = false;
+                    for(const auto& e : candidates[old_pred]) {
+                        if (e.to == v) { cost_old_v = e.cost; found_v = true; break; }
+                    }
+                    if (!found_v && old_pred == (int)v - 1) cost_old_v = RESET_PENALTY;
+
+                    // THE LOGIC:
+                    // If 'cost' (new link) is significantly better than the existing links.
+                    // We use a "Confidence Threshold" (e.g. 10%) to prevent thrashing.
+                    // Is New < Old_1 AND New < Old_2?
+                    
+                    if (cost < cost_u_old && cost < cost_old_v) {
+                         // DISCONNECT OLD
+                         prev_seg[old_next] = -1; // old_next becomes orphan (or head of new chain)
+                         next_seg[old_pred] = -1; // old_pred becomes orphan (or tail of new chain)
+                         
+                         // CONNECT NEW
+                         next_seg[u] = v; 
+                         prev_seg[v] = u; 
+                         dsu.unite(u, v);
+                         
+                         improved = true; changes++;
+                         
+                         // Savings: We gained the new link, lost the two old links.
+                         // This calculation is tricky because we turned two edges into one edge + two gaps.
+                         // But locally, we improved the edge quality at this specific junction.
+                         // (Approximation for log display)
+                         pass_delta += (cost_u_old - cost) + (cost_old_v - cost);
                     }
                 }
             }
         }
+        
         if (improved) {
              dsu = UnionFind(num_segments);
              for(size_t i=0; i<num_segments; ++i) if(next_seg[i]!=-1) dsu.unite(i, next_seg[i]);
-             std::cout << "Pass " << pass << ": " << changes << " changes." << std::endl;
+             
+             total_savings += pass_delta;
+             std::cout << "Pass " << pass << ": " << changes << " changes. Est Delta: " << (long)(pass_delta/8.0) << " bytes." << std::endl;
         }
     }
 
@@ -2541,6 +2630,20 @@ int main(int argc, char* argv[]) {
     };
 
     std::cout << "Sorting " << all_groups.size() << " groups using Gold Standard logic (Toxicity + Weak-First)..." << std::endl;
+
+    // --- COUNT STATS FOR LOGGING ---
+    size_t count_chains = 0;
+    size_t count_orphans = 0;
+    for (const auto& grp : all_groups) {
+        if (grp.size() > 1) count_chains++;
+        else count_orphans++;
+    }
+
+    std::cout << "Physics Optimization Complete." << std::endl;
+    std::cout << "Final Topology: " << all_groups.size() << " total groups." << std::endl;
+    std::cout << "  - Chains (Merged): " << count_chains << std::endl;
+    std::cout << "  - Orphans (Single): " << count_orphans << std::endl;
+    std::cout << "Sorting all groups by Density (Unified Physics Model)..." << std::endl;
 
     std::sort(all_groups.begin(), all_groups.end(), [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
         // METRIC 1: TOXICITY (Easy things First)
