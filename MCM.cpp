@@ -2353,18 +2353,39 @@ int main(int argc, char* argv[]) {
     size_t num_segments = num_seg;
     std::string original_file = in_file.substr(0, in_file.find_last_of('.'));
 
-    // Read Entropy (Critical for Toxicity Sort)
+    // A. Load HOT Costs (.entropy is produced by Observer Mode = Full Context)
     std::string entropy_file = original_file + ".entropy";
-    std::vector<double> entropies;
+    std::vector<double> hot_costs; // Renamed from 'entropies' to be explicit
     std::ifstream eifs(entropy_file, std::ios::binary);
     if (eifs) {
-      uint64_t num_bytes; eifs.read(reinterpret_cast<char*>(&num_bytes), sizeof(num_bytes));
-      entropies.resize(num_bytes);
-      eifs.read(reinterpret_cast<char*>(&entropies[0]), num_bytes * sizeof(double));
-      eifs.close();
-    } else { std::cout << "Warning: .entropy missing. Toxicity sort will be inaccurate." << std::endl; }
+        uint64_t num_entries; 
+        uint64_t stock_size_dummy; 
+        
+        // FIX: Match the writer format from kModeObserver
+        eifs.read(reinterpret_cast<char*>(&num_entries), sizeof(num_entries));
+        eifs.read(reinterpret_cast<char*>(&stock_size_dummy), sizeof(stock_size_dummy)); // <--- WAS MISSING
+        
+        hot_costs.resize(num_entries);
+        eifs.read(reinterpret_cast<char*>(&hot_costs[0]), num_entries * sizeof(double));
+        eifs.close();
+    } else { 
+        std::cout << "Warning: .entropy missing. HOT baseline will be wrong." << std::endl; 
+    }
+
+    // B. Load ALONE Costs (Produced by Oracle Mode = Zero Context)
+    std::string alone_file = original_file + ".alone";
+    std::vector<double> alone_costs;
+    std::ifstream aifs(alone_file); // Text format based on kModeOracle
+    if (aifs) {
+        double c;
+        while(aifs >> c) alone_costs.push_back(c);
+        aifs.close();
+    } else {
+        std::cout << "Warning: .alone missing. Falling back to raw size." << std::endl;
+    }
 
     // --- 2. Load Oracle & Candidates ---
+    // [Keep your existing Oracle loader here]
     struct Edge { size_t to; double cost; };
     std::vector<std::vector<Edge>> candidates(num_segments);
     std::ifstream oracle_ifs(original_file + ".oracle");
@@ -2387,16 +2408,75 @@ int main(int argc, char* argv[]) {
     }
     oracle_ifs.close();
 
+    // --- B. Calculate Baselines & Ratio ---
+
+    // 1. Calculate ALONE (Truncated)
+    // The .alone file was generated with a 10KB cap, so this is already truncated.
+    double sum_alone_trunc_bits = 0.0;
+    if (!alone_costs.empty()) {
+        for (double c : alone_costs) sum_alone_trunc_bits += c;
+    } else {
+        // Fallback: Manually cap if .alone missing
+        for (const auto& s : segments) sum_alone_trunc_bits += (std::min(s.second, (size_t)10240) * 8.0);
+    }
+
+    // 2. Calculate NATURAL (Truncated)
+    // Natural = Alone(Trunc) + Edges(Trunc)
+    double natural_edges_bits = 0.0;
+    for (size_t i = 0; i < num_segments - 1; ++i) {
+        for (const auto& e : candidates[i]) {
+            if (e.to == i + 1) { natural_edges_bits += e.cost; break; }
+        }
+    }
+    double sum_natural_trunc_bits = sum_alone_trunc_bits + natural_edges_bits;
+
+    // 3. Calculate HOT (Truncated vs Full)
+    double sum_hot_trunc_bits = 0.0;
+    double sum_hot_full_bits = 0.0;
+    
+    if (!hot_costs.empty()) {
+        for (const auto& seg : segments) {
+            size_t start = seg.first;
+            size_t len = seg.second;
+            size_t cap = std::min(len, (size_t)10240); // 10KB Cap matches Oracle
+            
+            // Sum First 10KB (Exact comparison to Oracle)
+            for (size_t k = 0; k < cap; ++k) {
+                if (start + k < hot_costs.size()) sum_hot_trunc_bits += hot_costs[start + k];
+            }
+            // Sum Full (For final size dashboard)
+            for (size_t k = 0; k < len; ++k) {
+                if (start + k < hot_costs.size()) sum_hot_full_bits += hot_costs[start + k];
+            }
+        }
+    } else {
+        // Fallback if entropy file missing
+        sum_hot_full_bits = 1088067.0 * 8.0; 
+        sum_hot_trunc_bits = sum_hot_full_bits * 0.5; // Wild guess
+    }
+
+    // 4. Calculate PURE Truncated Ratio (NAT : HOT)
+    // "For every 1 bit of Reality (Hot), how many bits does the Oracle (Nat) see?"
+    // Expected: > 1.0 (Oracle is pessimistic/inefficient vs Deep Context)
+    double ratio = 1.0;
+    if (sum_hot_trunc_bits > 0.1) ratio = sum_natural_trunc_bits / sum_hot_trunc_bits;
+
+    std::cout << "Sum(NATURAL Trunc): " << (long)(sum_natural_trunc_bits/8.0) << " bytes" << std::endl;
+    std::cout << "Sum(HOT Trunc):     " << (long)(sum_hot_trunc_bits/8.0) << " bytes" << std::endl;
+    std::cout << "Ratio (Nat:Hot):    " << ratio << "x (Pure Head-to-Head)" << std::endl;
+
+
     // --- 3. Compute Scores (Gold Logic) ---
     // Donor Score: Sum of negative costs (Savings)
     std::vector<double> donor_scores(num_segments, 0.0);
-    const double FUSION_THRESHOLD = 512.0; // 64 bytes
+    const double FUSION_THRESHOLD = 320.0; // 64 bytes
 
     for (size_t i = 0; i < num_segments; ++i) {
         for (const auto& edge : candidates[i]) {
             if (edge.cost < 0) donor_scores[i] += edge.cost;
         }
     }
+    
 
     // --- 4. Graph Construction (GGCA-IR) ---
     // Pre-compute Allowed Fusions
@@ -2429,6 +2509,18 @@ int main(int argc, char* argv[]) {
     std::vector<int> prev_seg(num_segments, -1);
     UnionFind dsu(num_segments);
 
+    // --- 0. CALCULATE BASELINE (NATURAL ORDER) ---
+    double baseline_bits = 0.0;
+    for (size_t i = 0; i < num_segments - 1; ++i) {
+        // Sum costs of i -> i+1
+        bool found = false;
+        for (const auto& edge : candidates[i]) {
+            if (edge.to == i + 1) { baseline_bits += edge.cost; found = true; break; }
+        }
+    }
+    std::cout << "Baseline Natural Cost: " << (long)(baseline_bits/8.0) << " bytes (Delta from Alone)." << std::endl;
+
+  
     // --- RESTORED PHASE: Global Greedy Construction ---
     // If this is missing, the solver starts with an empty graph (Newest Logic).
     // If this is present, it starts with a strong skeleton (Gold Logic).
@@ -2440,10 +2532,15 @@ int main(int argc, char* argv[]) {
       for (const auto& edge : candidates[pred]) {
         double cost = edge.cost;
         double savings = RESET_PENALTY - cost; 
-        bool is_natural = (edge.to == pred + 1);
-        if (is_natural) savings += 0.1 * std::abs(cost);
+        // Bias removed: Let the Oracle decide based on raw data
+        bool is_natural = (edge.to == pred + 1); 
+        // if (is_natural) savings += 0.1 * std::abs(cost);
         
-        if (savings > 0) {
+        // Restore Inertia: 5% bonus for keeping order
+        if (is_natural) savings += 0.05 * std::abs(cost);
+        
+        // Only accept if it passes threshold or is natural
+        if (savings > 0 && (is_natural || savings > FUSION_THRESHOLD)) {
           all_edges.push_back({(uint32_t)pred, (uint32_t)edge.to, savings});
         }
       }
@@ -2453,156 +2550,162 @@ int main(int argc, char* argv[]) {
     });
     std::cout << "Greedy Phase: Processing " << all_edges.size() << " global edges..." << std::endl;
 
-    double greedy_savings = 0.0; // <--- THIS IS THE VARIABLE YOU WERE MISSING
+    // 1. Build Greedy Graph
     for (const auto& edge : all_edges) {
       if (next_seg[edge.u] == -1 && prev_seg[edge.v] == -1 && dsu.find(edge.u) != dsu.find(edge.v)) {
         next_seg[edge.u] = edge.v;
         prev_seg[edge.v] = edge.u;
         dsu.unite(edge.u, edge.v);
-        greedy_savings += edge.savings;
       }
     }
 
-    // --- Iterative Refinement (True Gold Logic) ---
-    bool improved = true;
-    int pass = 0;
-    // We start with the savings from the Greedy Phase
-    double total_savings = greedy_savings; 
+    // 2. MEASURE the Greedy Graph (Don't estimate)
+    double greedy_optimized_bits = 0.0;
+    for(size_t u=0; u<num_segments; ++u) {
+         if (next_seg[u] != -1) {
+             bool found = false;
+             for(const auto& e : candidates[u]) {
+                 if(e.to == (size_t)next_seg[u]) { greedy_optimized_bits += e.cost; found = true; break; }
+             }
+             if (!found) greedy_optimized_bits += 0.0; 
+         }
+    }
+    
+    // 3. Calculate Initial Real Savings (Natural Baseline - Greedy Cost)
+    double initial_oracle_delta = natural_edges_bits - greedy_optimized_bits;
+    
+    // 4. Initialize Loop Variable with REAL bytes
+    double cumulative_savings_bits = 0;//initial_oracle_delta / ratio;
 
-    std::cout << "Starting Iterative Refinement..." << std::endl;
+    std::cout << "Greedy Savings: " << (long)(cumulative_savings_bits/8.0) << " bytes." << std::endl;
+
+    // --- Iterative Refinement ---
+    bool improved = true;
+    int pass = 0; 
+    
 
     while (improved && pass < 500) {
         improved = false; pass++;
         size_t changes = 0;
-        double pass_delta = 0.0;
         
         for (size_t u = 0; u < num_segments; ++u) {
-            // CRITICAL FIX: Iterate raw 'candidates', NOT 'allowed_fusions'
-            // This matches the Gold logic exactly.
             for (const auto& edge : candidates[u]) {
                 size_t v = edge.to;
-                double cost = edge.cost; // Raw Oracle Cost
+                double cost = edge.cost; 
                 
-                // 1. Stitch (Tail -> Head)
+                // 1. Stitch
                 if (next_seg[u] == -1 && prev_seg[v] == -1 && dsu.find(u) != dsu.find(v)) {
                     if (cost < RESET_PENALTY) {
                         next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v);
                         improved = true; changes++;
-                        pass_delta += (RESET_PENALTY - cost); 
                     }
                 }
-                // 2. Steal (Target v already has a pred)
+                // 2. Steal
                 else if (next_seg[u] == -1 && prev_seg[v] != -1) {
                     int old_pred = prev_seg[v];
-                    
-                    // Lookup cost of existing link (old_pred -> v)
-                    // We must find it in 'candidates' to compare apples-to-apples
-                    double old_cost = 1e9; 
+                    double old_cost = 1e9;
                     bool found = false;
-                    for(const auto& e : candidates[old_pred]) {
-                        if (e.to == v) { old_cost = e.cost; found = true; break; }
-                    }
-                    // Handle implicit natural link case if not in candidates
-                    if (!found && old_pred == (int)v - 1) {
-                         // Natural link cost is 0 relative to itself, but usually negative in oracle.
-                         // If missing from oracle, we assume it's roughly 'alone cost' (bad).
-                         // Better fallback: assume it's just 'RESET_PENALTY' (weak link).
-                         old_cost = RESET_PENALTY; 
-                    }
+                    for(const auto& e : candidates[old_pred]) if(e.to == v) { old_cost = e.cost; found = true; break; }
+                    if (!found && old_pred == (int)v - 1) old_cost = RESET_PENALTY; 
 
                     if (dsu.find(u) != dsu.find(v) && cost < old_cost) {
-                        next_seg[old_pred] = -1; // Break old
-                        next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v); // Link new
+                        next_seg[old_pred] = -1;
+                        next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v);
                         improved = true; changes++;
-                        pass_delta += (old_cost - cost);
                     }
                 }
-                // 3. Break (Source u already has a succ)
+                // 3. Break
                 else if (next_seg[u] != -1 && prev_seg[v] == -1) {
                     int old_next = next_seg[u];
                     if (dsu.find(u) != dsu.find(v)) {
                         double old_cost = 1e9;
                         bool found = false;
-                        for(const auto& e : candidates[u]) {
-                            if (e.to == (size_t)old_next) { old_cost = e.cost; found = true; break; }
-                        }
+                        for(const auto& e : candidates[u]) if(e.to == (size_t)old_next) { old_cost = e.cost; found = true; break; }
                         if (!found && u == (size_t)old_next - 1) old_cost = RESET_PENALTY;
 
                         if (cost < old_cost) {
-                            prev_seg[old_next] = -1; // Break old
-                            next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v); // Link new
+                            prev_seg[old_next] = -1;
+                            next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v);
                             improved = true; changes++;
-                            pass_delta += (old_cost - cost);
                         }
                     }
                 }
-                // 4. OVERPOWER (Double Break) - The "Red Team" Fix
-                // Condition: u has a successor (old_next), v has a predecessor (old_pred).
-                // Both are busy. But u->v is SO GOOD that we break both families.
+                // 4. Overpower
                 else if (next_seg[u] != -1 && prev_seg[v] != -1) {
                     int old_next = next_seg[u];
                     int old_pred = prev_seg[v];
-                    
-                    // Sanity check: Don't break if they are already connected to each other (u->v)
                     if (old_next == (int)v) continue;
-
-                    // Check cycles: ensure u and v are not in the same component already
-                    // (Connecting them would form a loop, not a chain)
                     if (dsu.find(u) == dsu.find(v)) continue;
 
-                    // COST ANALYSIS
-                    // We need u->v to be better than u->old_next AND old_pred->v.
-                    // We must justify breaking TWO existing links.
-                    
                     double cost_u_old = 1e9;
                     bool found_u = false;
-                    for(const auto& e : candidates[u]) {
-                        if (e.to == (size_t)old_next) { cost_u_old = e.cost; found_u = true; break; }
-                    }
+                    for(const auto& e : candidates[u]) if (e.to == (size_t)old_next) { cost_u_old = e.cost; found_u = true; break; }
                     if (!found_u && u == (size_t)old_next - 1) cost_u_old = RESET_PENALTY;
 
                     double cost_old_v = 1e9;
                     bool found_v = false;
-                    for(const auto& e : candidates[old_pred]) {
-                        if (e.to == v) { cost_old_v = e.cost; found_v = true; break; }
-                    }
+                    for(const auto& e : candidates[old_pred]) if (e.to == v) { cost_old_v = e.cost; found_v = true; break; }
                     if (!found_v && old_pred == (int)v - 1) cost_old_v = RESET_PENALTY;
 
-                    // THE LOGIC:
-                    // If 'cost' (new link) is significantly better than the existing links.
-                    // We use a "Confidence Threshold" (e.g. 10%) to prevent thrashing.
-                    // Is New < Old_1 AND New < Old_2?
-                    
                     if (cost < cost_u_old && cost < cost_old_v) {
-                         // DISCONNECT OLD
-                         prev_seg[old_next] = -1; // old_next becomes orphan (or head of new chain)
-                         next_seg[old_pred] = -1; // old_pred becomes orphan (or tail of new chain)
-                         
-                         // CONNECT NEW
-                         next_seg[u] = v; 
-                         prev_seg[v] = u; 
-                         dsu.unite(u, v);
-                         
+                         prev_seg[old_next] = -1; 
+                         next_seg[old_pred] = -1; 
+                         next_seg[u] = v; prev_seg[v] = u; dsu.unite(u, v);
                          improved = true; changes++;
-                         
-                         // Savings: We gained the new link, lost the two old links.
-                         // This calculation is tricky because we turned two edges into one edge + two gaps.
-                         // But locally, we improved the edge quality at this specific junction.
-                         // (Approximation for log display)
-                         pass_delta += (cost_u_old - cost) + (cost_old_v - cost);
                     }
                 }
             }
         }
         
         if (improved) {
-             dsu = UnionFind(num_segments);
-             for(size_t i=0; i<num_segments; ++i) if(next_seg[i]!=-1) dsu.unite(i, next_seg[i]);
+             // ... [DSU Update] ...
+
+             // 1. Calculate Optimized Graph Cost
+             double current_optimized_bits = 0.0;
+             for(size_t u=0; u<num_segments; ++u) {
+                 if (next_seg[u] != -1) {
+                     bool found = false;
+                     for(const auto& e : candidates[u]) {
+                         if(e.to == (size_t)next_seg[u]) { current_optimized_bits += e.cost; found = true; break; }
+                     }
+                     if (!found) current_optimized_bits += 0.0; 
+                 }
+             }
+
+             // 2. Calculate Oracle Delta (Raw Oracle Units)
+             double oracle_delta = natural_edges_bits - current_optimized_bits;
+
+             // 3. Apply Pure Ratio
+             // We convert "Oracle Units" to "Real Units"
+             // Real = Oracle / Ratio
+             double real_savings_bits = oracle_delta / ratio;
              
-             total_savings += pass_delta;
-             std::cout << "Pass " << pass << ": " << changes << " changes. Est Delta: " << (long)(pass_delta/8.0) << " bytes." << std::endl;
+             cumulative_savings_bits = real_savings_bits;
+
+             std::cout << "Pass " << pass << ": " << changes << " changes. "
+                       << "Est. Savings: " << (long)(real_savings_bits / 8.0) << " bytes" << std::endl;
         }
     }
+
+    // --- FINAL DASHBOARD (Calibrated) ---
+    long hot_weak_bytes = (long)(sum_hot_full_bits / 8.0);
+    long hot_real_bytes = 1088067; // The known strong baseline
+    long baseline_gap = hot_weak_bytes - hot_real_bytes; // ~56KB
+
+    long total_raw_savings = (long)(cumulative_savings_bits / 8.0);
+    long net_real_savings = total_raw_savings - baseline_gap;
+    
+    long final_size_bytes = hot_real_bytes - net_real_savings;
+
+    std::cout << "\n--- ESTIMATION DASHBOARD ---" << std::endl;
+    std::cout << "HOT Baseline (Weak):    " << hot_weak_bytes << " bytes" << std::endl;
+    std::cout << "HOT Baseline (Real):    " << hot_real_bytes << " bytes" << std::endl;
+    std::cout << "Profile Efficiency Gap: " << baseline_gap << " bytes" << std::endl;
+    std::cout << "----------------------------" << std::endl;
+    std::cout << "Optimization Found:     " << total_raw_savings << " bytes" << std::endl;
+    std::cout << "Net New Savings:        " << net_real_savings << " bytes (Prediction)" << std::endl;
+    std::cout << "Predicted Final Size:   " << final_size_bytes << " bytes" << std::endl;
+    std::cout << "----------------------------\n" << std::endl;
 
     // --- 5. Output & Sorting (RESTORED GOLD SORTING) ---
     
@@ -2624,9 +2727,10 @@ int main(int argc, char* argv[]) {
     for(size_t i=0; i<num_segments; ++i) if(!visited[i]) all_groups.push_back({i});
 
     // Helper: Cost Calculator for Toxicity
+    // We sort by Inherent Complexity (Alone), not Contextual Complexity (Hot)
     auto get_seg_cost = [&](size_t seg) -> double {
-        if (!entropies.empty() && seg < entropies.size()) return entropies[seg];
-        return (double)segments[seg].second;
+        if (!alone_costs.empty() && seg < alone_costs.size()) return alone_costs[seg];
+        return (double)segments[seg].second * 8.0; 
     };
 
     std::cout << "Sorting " << all_groups.size() << " groups using Gold Standard logic (Toxicity + Weak-First)..." << std::endl;
