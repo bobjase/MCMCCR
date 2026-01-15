@@ -33,6 +33,8 @@
 #include <io.h>
 #include <fcntl.h>
 #include <cctype>
+#include "EntropySegmenter.h"
+#include "CCRConfig.h"
 
 // --- Helper: Binary I/O ---
 #include "Util.hpp"
@@ -765,25 +767,16 @@ int OracleChildMain(int argc, char* argv[]) {
         }
 
         // Define CM objects ONCE (performance optimization)
-        cm::CM<8, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
-        // Use full profile for max compression accuracy
-        cm.cur_profile_ = cm::CMProfile();
-        for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
-            cm.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
-        }
-        cm.cur_profile_.SetMatchModelOrder(12);
-        cm.cur_profile_.SetMinLZPLen(10);
+        // [CCR ALIGNMENT] Define CM objects ONCE
+        // 1. Joint Compressor (Predecessor + Successor)
+        cm::CM<16, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileText);
+        
+        // Manual Configuration to match -x11
+        cm.init();
+        cm.text_profile_ = GetCCRProfile(); // Inject Economy Profile
+        cm.SetDataProfile(cm::CM<16, false>::kProfileText); // Force Text Mode
+        cm.skip_init = true; // Prevent accidental reset
         cm.observer_mode = true;
-
-        cm::CM<8, false> cm_alone(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
-        // Use full profile for max compression accuracy
-        cm_alone.cur_profile_ = cm::CMProfile();
-        for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
-            cm_alone.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
-        }
-        cm_alone.cur_profile_.SetMatchModelOrder(12);
-        cm_alone.cur_profile_.SetMinLZPLen(10);
-        cm_alone.observer_mode = true;
 
         // Worker loop
         while (true) {
@@ -1580,10 +1573,14 @@ int main(int argc, char* argv[]) {
     // archive.ExtractAll();
     break;
   }
+
+
+
   case Options::kModeObserver: {
     try {
     printHeader();
-    std::cout << "Running in Observer Mode" << std::endl;
+    std::cout << "Running in Observer Mode (CCR Aligned)" << std::endl;
+    
     // Read the input file
     std::vector<FileInfo> files = options.files;
     uint64_t total_size = 0;
@@ -1598,6 +1595,7 @@ int main(int argc, char* argv[]) {
       fin.close();
     }
     std::cout << "Total size " << total_size << std::endl;
+    
     // Create a buffer for the file
     std::vector<uint8_t> buffer(total_size);
     uint64_t pos = 0;
@@ -1608,19 +1606,46 @@ int main(int argc, char* argv[]) {
       pos += count;
     }
     std::cout << "Read " << pos << " bytes" << std::endl;
-    // Create CM
-    cm::CM<8, false> compressor(FrequencyCounter<256>(), 8, false, Detector::kProfileSimple);
+    
+    // [FIX 1] INCREASE TEMPLATE SIZE & FORCE TEXT MODE
+    // Changed <8, false> to <16, false> to fit 13 models.
+    // Changed kProfileSimple to kProfileText to load text-specific structures.
+    cm::CM<16, false> compressor(FrequencyCounter<256>(), 8, false, Detector::kProfileText);
+    
     compressor.observer_mode = true;
+
+    // [FIX 2] MANUAL INIT & OVERWRITE SEQUENCE
+    // 1. Run standard initialization (allocates memory, tables, etc.)
+    compressor.init(); 
+
+    // 2. INJECT ECONOMY PROFILE
+    // Overwrite the internal profile directly (it is public in CM.hpp)
+    compressor.text_profile_ = GetCCRProfile();
+
+    // 3. APPLY CHANGE
+    // Tell the compressor to switch to Text Mode using the profile we just injected.
+    // We use the scope operator :: to access the Enum.
+    compressor.SetDataProfile(cm::CM<16, false>::kProfileText);
+
+    // 4. DISABLE AUTO-INIT
+    // Prevent compress() from running init() again and wiping our changes.
+    compressor.skip_init = true;
+
     // Create streams
     ReadMemoryStream rms(buffer.data(), buffer.data() + buffer.size());
     VoidWriteStream vws;
-    std::cout << "Starting compress" << std::endl;
+    
+    std::cout << "Starting aligned compress..." << std::endl;
     std::cout << "Compressing " << buffer.size() << " bytes" << std::endl;
+    
     compressor.compress(&rms, &vws, buffer.size());
+    
     std::cout << "entropies.size() = " << compressor.entropies.size() << std::endl;
     std::cout << "Compress done" << std::endl;
+    
     // Skip stock compression size for observer to avoid hang
     uint64_t stock_size = 0;
+    
     // Output entropies
     std::string out_file = options.archive_file.getName();
     if (out_file.empty()) {
@@ -1631,6 +1656,7 @@ int main(int argc, char* argv[]) {
       std::cerr << "Error opening output file: " << out_file << std::endl;
       return 1;
     }
+    
     // Write total bytes
     uint64_t num_bytes = compressor.entropies.size();
     ofs.write(reinterpret_cast<const char*>(&num_bytes), sizeof(num_bytes));
@@ -1649,229 +1675,180 @@ int main(int argc, char* argv[]) {
     }
     break;
   }
+
   case Options::kModeSegment: {
     printHeader();
-    std::cout << "Running Auto-Tuned MDL-PELT Segmentation" << std::endl;
+    std::cout << "Running Auto-Tuned PELT Segmentation (Macro-Micro)" << std::endl;
 
-    // 1. Configuration
-    const size_t BLOCK_SIZE = (options.segment_window > 0) ? options.segment_window : 512;
+    if (options.files.empty()) { std::cerr << "Error: No input file." << std::endl; return 1; }
     std::string in_file = options.files[0].getName();
-    
-    // 2. Load Data & Build Prefix Histograms (Heavy Lift - Do Once)
-    std::ifstream fin(in_file, std::ios::binary | std::ios::ate);
-    if (!fin) { std::cerr << "Error: " << in_file << std::endl; return 1; }
-    size_t file_size = fin.tellg();
-    fin.seekg(0);
-    size_t num_blocks = (file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    
-    std::cout << "File: " << formatNumber(file_size) << " bytes | Blocks: " << num_blocks << std::endl;
-    std::cout << "Building Histograms..." << std::flush;
+    std::string entropy_file = in_file + ".entropy";
 
-    std::vector<uint8_t> buffer(BLOCK_SIZE);
-    // Use uint32_t to save RAM (4 bytes vs 8 bytes) 
-    std::vector<std::array<uint32_t, 256>> prefix_counts;
-    prefix_counts.reserve(num_blocks + 1);
-    prefix_counts.push_back({}); // 0-th is empty
-    std::fill(prefix_counts[0].begin(), prefix_counts[0].end(), 0);
+    // 1. Load Entropy
+    std::ifstream fin_ent(entropy_file, std::ios::binary | std::ios::ate);
+    if (!fin_ent) { std::cerr << "Error: Missing .entropy file." << std::endl; return 1; }
+    size_t ent_size = fin_ent.tellg();
+    fin_ent.seekg(0);
+    size_t num_entries = ent_size / sizeof(double);
+    std::vector<double> full_entropy(num_entries);
+    fin_ent.read((char*)full_entropy.data(), ent_size);
+    fin_ent.close();
 
-    std::array<uint32_t, 256> current_counts = {0};
-    for (size_t i = 0; i < num_blocks; ++i) {
-        size_t read_size = std::min(BLOCK_SIZE, file_size - (i * BLOCK_SIZE));
-        fin.read(reinterpret_cast<char*>(buffer.data()), read_size);
-        for (size_t k = 0; k < read_size; ++k) current_counts[buffer[k]]++;
-        prefix_counts.push_back(current_counts);
+    // 2. SPEED FIX: Downsample (Coarse-Graining)
+    // Averages every 64 bytes into 1 point. 
+    // Reduces 5,000,000 points -> 78,000 points. Runs instantly.
+    const size_t DOWNSAMPLE_RATE = 64; 
+    std::vector<double> coarse_profile;
+    coarse_profile.reserve(num_entries / DOWNSAMPLE_RATE + 1);
+
+    for (size_t i = 0; i < num_entries; i += DOWNSAMPLE_RATE) {
+        double sum = 0;
+        size_t count = 0;
+        for (size_t k = 0; k < DOWNSAMPLE_RATE && (i+k) < num_entries; ++k) {
+            sum += full_entropy[i+k];
+            count++;
+        }
+        coarse_profile.push_back(sum / count); 
     }
-    fin.close();
-    std::cout << " Done." << std::endl;
+    std::cout << "Downsampled profile: " << num_entries << " -> " << coarse_profile.size() << " points." << std::endl;
 
-    // 3. Pre-compute Log Table
-    const size_t LOG_TABLE_SIZE = 65536; 
-    std::vector<double> x_log_x(LOG_TABLE_SIZE);
-    x_log_x[0] = 0.0;
-    for (size_t i = 1; i < LOG_TABLE_SIZE; ++i) x_log_x[i] = i * std::log2(i);
-
-    // 4. The PELT Solver (Reusable Lambda)
-    const double log_N = std::log2(file_size);
-    const double K = 255.0; 
-
-    // Helper to calc cost between blocks
-    auto GetSegCost = [&](size_t start, size_t end, double penalty) -> double {
-        const auto& c_end = prefix_counts[end];
-        const auto& c_start = prefix_counts[start];
-        size_t len = (end == num_blocks) ? (file_size - start * BLOCK_SIZE) : ((end - start) * BLOCK_SIZE);
-        if (len == 0) return 0.0;
-
-        double sum_c_log_c = 0.0;
-        for (int i = 0; i < 256; ++i) {
-            uint32_t count = c_end[i] - c_start[i];
-            if (count > 0) {
-                if (count < LOG_TABLE_SIZE) sum_c_log_c += x_log_x[count];
-                else sum_c_log_c += count * std::log2(count);
-            }
-        }
-        double term_L_log_L = (len < LOG_TABLE_SIZE) ? x_log_x[len] : (len * std::log2(len));
-        return (term_L_log_L - sum_c_log_c) + penalty;
-    };
-
-    auto RunPELT = [&](double factor) -> std::vector<size_t> {
-        double penalty = 0.5 * K * log_N * factor;
-        std::vector<double> F(num_blocks + 1, 1e18);
-        std::vector<int> bp(num_blocks + 1, -1);
-        std::vector<size_t> candidates = {0};
-        F[0] = -penalty; 
-
-        for (size_t t = 1; t <= num_blocks; ++t) {
-            double min_cost = 1e18;
-            int best_tau = -1;
-            
-            // Update
-            for (size_t tau : candidates) {
-                double c = F[tau] + GetSegCost(tau, t, penalty);
-                if (c < min_cost) { min_cost = c; best_tau = tau; }
-            }
-            F[t] = min_cost;
-            bp[t] = best_tau;
-
-            // Prune
-            auto it = std::remove_if(candidates.begin(), candidates.end(), [&](size_t tau) {
-                return (F[tau] + GetSegCost(tau, t, penalty)) > F[t];
-            });
-            candidates.erase(it, candidates.end());
-            candidates.push_back(t);
-        }
-
-        // Backtrack
-        std::vector<size_t> cuts;
-        size_t curr = num_blocks;
-        while (curr > 0) {
-            cuts.push_back(curr);
-            curr = bp[curr];
-        }
-        cuts.push_back(0);
-        std::reverse(cuts.begin(), cuts.end());
-        return cuts;
-    };
-
-    // 5. Auto-Tuning Loop
-    // Target: Avg segment size ~16KB (Adjustable)
-    size_t target_count = file_size / 16384; 
-    if (target_count < 50) target_count = 50; // Minimum sanity
-    if (target_count > 50000) target_count = 50000; // Cap
-
-    double low = 0.05, high = 5.0;
-    double best_factor = 1.2;
-    std::vector<size_t> best_cuts;
+    // 3. Run PELT on Coarse Data
+    // Scale penalty for smaller dataset size
+    // Base penalty logic: ~20 * log(N)
+    double raw_penalty = 100.0 * std::log(coarse_profile.size());
     
-    // Or use user override if provided
-    if (options.segment_threshold > 0.0) {
-        std::cout << "Using manual threshold: " << options.segment_threshold << std::endl;
-        best_cuts = RunPELT(options.segment_threshold);
-    } else {
-        std::cout << "Auto-Tuning for ~" << target_count << " segments..." << std::endl;
-        for (int i = 0; i < 10; ++i) {
-            double mid = (low + high) / 2.0;
-            auto cuts = RunPELT(mid);
-            size_t count = cuts.size() - 1;
-            
-            std::cout << "  Iter " << i << ": Factor=" << mid << " -> " << count << " segs" << std::endl;
-            
-            if (abs((long)count - (long)target_count) < (target_count * 0.1)) {
-                best_cuts = std::move(cuts);
-                best_factor = mid;
-                break; // Close enough
-            }
-            
-            if (count < target_count) high = mid; // Too few -> Lower penalty
-            else low = mid; // Too many -> Raise penalty
-            
-            if (i == 9) best_cuts = std::move(cuts); // Take last result
-        }
-    }
+    // Scale it down to match the downsampled signal energy
+    double penalty = raw_penalty / (double)DOWNSAMPLE_RATE;
+    
+    // Safety floor: Don't let penalty hit 0 or cuts become free
+    if (penalty < 0.1) penalty = 0.1;
 
-    std::cout << "Final: " << (best_cuts.size() - 1) << " segments." << std::endl;
+    // Minimum 1 coarse block (represents 64 real bytes)
+    size_t min_coarse_size = 4096 / DOWNSAMPLE_RATE; 
+    if (min_coarse_size < 1) min_coarse_size = 1;
 
-    // Convert to byte boundaries
+    std::cout << "Analyzing Structure (PELT)... Penalty=" << penalty << std::endl;
+    std::vector<size_t> coarse_cuts = EntropySegmenter::FindCuts(coarse_profile, penalty, min_coarse_size);
+    
+    // 4. Scale & Snap to "Model Peaks" (High Precision Fix)
+    // We use the Coarse PELT to find the neighborhood, then scan the 
+    // Full Resolution profile to find the exact byte where confusion spiked.
     std::vector<size_t> boundaries;
     boundaries.push_back(0);
-    for (size_t block : best_cuts) {
-      if (block > 0) {
-        boundaries.push_back(block * BLOCK_SIZE);
-      }
-    }
-    boundaries.push_back(file_size);
+    
+    // Window to search for the spike (covers the downsampling blur)
+    const size_t SNAP_RADIUS = DOWNSAMPLE_RATE * 2; 
 
-    // Boundary Refinement Phase ("Inductive Boundary Snap")
-    std::cout << "Refining " << boundaries.size() << " boundaries..." << std::endl;
-    std::string original_file = in_file;
-    std::ifstream fin_refine(original_file, std::ios::binary);
-    if (fin_refine) {
-      const size_t SEARCH_RADIUS = BLOCK_SIZE / 2;
-      for (size_t i = 1; i < boundaries.size() - 1; ++i) {
-        size_t coarse_cut = boundaries[i];
-        size_t search_start = (coarse_cut > SEARCH_RADIUS) ? coarse_cut - SEARCH_RADIUS : 0;
-        size_t search_end = std::min(file_size, coarse_cut + SEARCH_RADIUS);
+    for (size_t coarse_cut : coarse_cuts) {
+        size_t approx_loc = coarse_cut * DOWNSAMPLE_RATE;
         
-        // Constrain to neighbors to preserve segment order
-        if (search_start <= boundaries[i - 1]) search_start = boundaries[i - 1] + 1;
-        if (search_end >= boundaries[i + 1]) search_end = boundaries[i + 1] - 1;
-        
-        size_t window_len = search_end - search_start;
-        if (window_len < 2) continue;
-        std::vector<uint8_t> window(window_len);
-        fin_refine.seekg(search_start);
-        fin_refine.read(reinterpret_cast<char*>(window.data()), window_len);
+        // Don't snap 0 or EOF
+        if (approx_loc == 0 || approx_loc >= num_entries) continue;
 
-        // Initialize Histograms
-        std::array<uint32_t, 256> right_counts = {0};
-        std::array<uint32_t, 256> left_counts = {0};
-        double right_sum = 0.0;
-        double left_sum = 0.0;
+        // Define search window in full_entropy
+        size_t start = (approx_loc > SNAP_RADIUS) ? approx_loc - SNAP_RADIUS : 0;
+        size_t end = std::min(num_entries, approx_loc + SNAP_RADIUS);
 
-        // Start with everything in the Right partition
-        for (uint8_t b : window) {
-          if (right_counts[b] > 0) right_sum -= x_log_x[right_counts[b]];
-          right_counts[b]++;
-          right_sum += x_log_x[right_counts[b]];
-        }
+        // Find the "Surprisal Cliff" (Local Max Entropy)
+        // The semantic boundary is usually where the model is MOST confused.
+        double max_val = -1.0;
+        size_t best_idx = approx_loc;
 
-        double min_local_cost = std::numeric_limits<double>::infinity();
-        size_t best_local_offset = 0;
-
-        // Sweep the cut point from Left to Right
-        for (size_t k = 0; k < window_len - 1; ++k) {
-          uint8_t b = window[k];
-          
-          // Move byte 'b' from Right to Left
-          right_sum -= x_log_x[right_counts[b]];
-          right_counts[b]--;
-          if (right_counts[b] > 0) right_sum += x_log_x[right_counts[b]];
-
-          if (left_counts[b] > 0) left_sum -= x_log_x[left_counts[b]];
-          left_counts[b]++;
-          left_sum += x_log_x[left_counts[b]];
-
-          size_t len_l = k + 1;
-          size_t len_r = window_len - len_l;
-          
-          // Calculate Entropy Cost: L*log(L) - sum(c*log(c))
-          double cost_l = x_log_x[len_l] - left_sum;
-          double cost_r = x_log_x[len_r] - right_sum;
-          double total = cost_l + cost_r;
-
-          if (total < min_local_cost) {
-            min_local_cost = total;
-            best_local_offset = k + 1;
-          }
+        for (size_t i = start; i < end; ++i) {
+            // Optional: Use a simple 3-byte moving average to ignore single-byte noise
+            // but for now, raw max is usually the header start.
+            if (full_entropy[i] > max_val) {
+                max_val = full_entropy[i];
+                best_idx = i;
+            }
         }
         
-        // Update to the optimal byte-perfect boundary
-        boundaries[i] = search_start + best_local_offset;
-      }
-      fin_refine.close();
-      std::cout << "Refinement Complete." << std::endl;
-    } else {
-      std::cerr << "Warning: Could not reopen file for refinement" << std::endl;
+        boundaries.push_back(best_idx);
     }
+    
+    // Ensure file end
+    std::ifstream fin_check(in_file, std::ios::binary | std::ios::ate);
+    size_t file_size = fin_check.tellg();
+    fin_check.close();
+    
+    // Sort and dedup just in case snapping overlapped
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    
+    if (boundaries.back() < file_size) boundaries.push_back(file_size);
+
+    std::cout << "PELT found " << boundaries.size() - 1 << " regions (Snapped to Peak Entropy)." << std::endl;
+
+    // // 5. Boundary Refinement Phase ("Inductive Boundary Snap")
+    // // (This contains your recent Crash Fix)
+    // std::cout << "Refining " << boundaries.size() << " boundaries..." << std::endl;
+    // std::string original_file = in_file;
+    // std::ifstream fin_refine(original_file, std::ios::binary);
+    // if (fin_refine) {
+    //   const size_t BLOCK_SIZE = (options.segment_window > 0) ? options.segment_window : 512;
+    //   const size_t SEARCH_RADIUS = BLOCK_SIZE / 2;
+      
+    //   const size_t LOG_TABLE_SIZE = 65536; 
+    //   std::vector<double> x_log_x(LOG_TABLE_SIZE);
+    //   x_log_x[0] = 0.0;
+    //   for (size_t i = 1; i < LOG_TABLE_SIZE; ++i) x_log_x[i] = i * std::log2(i);
+
+    //   for (size_t i = 1; i < boundaries.size() - 1; ++i) {
+    //     size_t coarse_cut = boundaries[i];
+    //     size_t search_start = (coarse_cut > SEARCH_RADIUS) ? coarse_cut - SEARCH_RADIUS : 0;
+    //     size_t search_end = std::min(file_size, coarse_cut + SEARCH_RADIUS);
+        
+    //     if (search_start <= boundaries[i - 1]) search_start = boundaries[i - 1] + 1;
+    //     if (search_end >= boundaries[i + 1]) search_end = boundaries[i + 1] - 1;
+        
+    //     // Safety Check (The Fix)
+    //     if (search_end <= search_start) continue;
+
+    //     size_t window_len = search_end - search_start;
+    //     if (window_len < 2) continue;
+    //     std::vector<uint8_t> window(window_len);
+    //     fin_refine.seekg(search_start);
+    //     fin_refine.read(reinterpret_cast<char*>(window.data()), window_len);
+
+    //     std::array<uint32_t, 256> right_counts = {0};
+    //     std::array<uint32_t, 256> left_counts = {0};
+    //     double right_sum = 0.0;
+    //     double left_sum = 0.0;
+
+    //     for (uint8_t b : window) {
+    //       if (right_counts[b] > 0) right_sum -= x_log_x[right_counts[b]];
+    //       right_counts[b]++;
+    //       right_sum += x_log_x[right_counts[b]];
+    //     }
+
+    //     double min_local_cost = std::numeric_limits<double>::infinity();
+    //     size_t best_local_offset = 0;
+
+    //     for (size_t k = 0; k < window_len - 1; ++k) {
+    //       uint8_t b = window[k];
+    //       right_sum -= x_log_x[right_counts[b]];
+    //       right_counts[b]--;
+    //       if (right_counts[b] > 0) right_sum += x_log_x[right_counts[b]];
+
+    //       if (left_counts[b] > 0) left_sum -= x_log_x[left_counts[b]];
+    //       left_counts[b]++;
+    //       left_sum += x_log_x[left_counts[b]];
+
+    //       size_t len_l = k + 1;
+    //       size_t len_r = window_len - len_l;
+    //       double cost_l = (len_l < LOG_TABLE_SIZE ? x_log_x[len_l] : len_l * std::log2(len_l)) - left_sum;
+    //       double cost_r = (len_r < LOG_TABLE_SIZE ? x_log_x[len_r] : len_r * std::log2(len_r)) - right_sum;
+          
+    //       if (cost_l + cost_r < min_local_cost) {
+    //         min_local_cost = cost_l + cost_r;
+    //         best_local_offset = k + 1;
+    //       }
+    //     }
+    //     boundaries[i] = search_start + best_local_offset;
+    //   }
+    //   fin_refine.close();
+    //   std::cout << "Refinement Complete." << std::endl;
+    // }
 
     // 6. Write Output
     std::string out_file = in_file + ".segments";
@@ -1887,6 +1864,8 @@ int main(int argc, char* argv[]) {
     std::cout << "Wrote segments to " << out_file << std::endl;
     break;
   }
+
+  
   case Options::kModeFingerprint: {
     printHeader();
     std::cout << "Running Hybrid Holographic Fingerprinting Mode" << std::endl;
@@ -2162,15 +2141,16 @@ int main(int argc, char* argv[]) {
         memcpy(head_data.data(), file_data.data() + start, head_len);
 
         // Compress alone
-        cm::CM<8, false> cm_alone(FrequencyCounter<256>(), 0, false, Detector::kProfileSimple);
-        cm_alone.cur_profile_ = cm::CMProfile();
-        for (int j = 0; j < static_cast<int>(cm::kModelCount); ++j) {
-            cm_alone.cur_profile_.EnableModel(static_cast<cm::ModelType>(j));
-        }
-        cm_alone.cur_profile_.SetMatchModelOrder(12);
-        cm_alone.cur_profile_.SetMinLZPLen(10);
-        cm_alone.observer_mode = true;
+        // [CCR ALIGNMENT] Setup Alone Compressor
+        // Use <16, false> and Text Profile to match -x11 exactly.
+        cm::CM<16, false> cm_alone(FrequencyCounter<256>(), 0, false, Detector::kProfileText);
+        
+        // One-time Setup
         cm_alone.init();
+        cm_alone.text_profile_ = GetCCRProfile(); // Inject Economy Profile
+        cm_alone.SetDataProfile(cm::CM<16, false>::kProfileText);
+        cm_alone.skip_init = true; // Lock it
+        cm_alone.observer_mode = true;
         cm_alone.entropies.clear(); // <--- CRITICAL FIX: Clear accumulation
         MemoryReadStream in_alone(head_data);
         VoidWriteStream out_alone;
@@ -2336,14 +2316,15 @@ int main(int argc, char* argv[]) {
   }
   case Options::kModePathCover: {
     printHeader();
-    std::cout << "Running PathCover Mode (Restored Gold Logic)" << std::endl;
+    std::cout << "Running PathCover Mode (Final Topological Fix)" << std::endl;
+    auto start_time = std::chrono::high_resolution_clock::now();
     if (argc != 3) {
       std::cerr << "Usage: mcm -pathcover <original_file>" << std::endl;
       return 1;
     }
+    std::string in_file = std::string(argv[2]) + ".segments";
     
     // --- 1. Load Topology & Data ---
-    std::string in_file = std::string(argv[2]) + ".segments";
     std::ifstream seg_ifs(in_file);
     if (!seg_ifs) { std::cerr << "Error opening segments." << std::endl; return 1; }
     size_t num_seg; seg_ifs >> num_seg;
@@ -2353,39 +2334,30 @@ int main(int argc, char* argv[]) {
     size_t num_segments = num_seg;
     std::string original_file = in_file.substr(0, in_file.find_last_of('.'));
 
-    // A. Load HOT Costs (.entropy is produced by Observer Mode = Full Context)
+    // Load Entropy (Hot Costs)
     std::string entropy_file = original_file + ".entropy";
-    std::vector<double> hot_costs; // Renamed from 'entropies' to be explicit
+    std::vector<double> hot_costs;
     std::ifstream eifs(entropy_file, std::ios::binary);
     if (eifs) {
-        uint64_t num_entries; 
-        uint64_t stock_size_dummy; 
-        
-        // FIX: Match the writer format from kModeObserver
+        uint64_t num_entries, stock_dummy;
         eifs.read(reinterpret_cast<char*>(&num_entries), sizeof(num_entries));
-        eifs.read(reinterpret_cast<char*>(&stock_size_dummy), sizeof(stock_size_dummy)); // <--- WAS MISSING
-        
+        eifs.read(reinterpret_cast<char*>(&stock_dummy), sizeof(stock_dummy));
         hot_costs.resize(num_entries);
         eifs.read(reinterpret_cast<char*>(&hot_costs[0]), num_entries * sizeof(double));
         eifs.close();
-    } else { 
-        std::cout << "Warning: .entropy missing. HOT baseline will be wrong." << std::endl; 
     }
 
-    // B. Load ALONE Costs (Produced by Oracle Mode = Zero Context)
+    // Load Alone Costs
     std::string alone_file = original_file + ".alone";
     std::vector<double> alone_costs;
-    std::ifstream aifs(alone_file); // Text format based on kModeOracle
+    std::ifstream aifs(alone_file);
     if (aifs) {
         double c;
         while(aifs >> c) alone_costs.push_back(c);
         aifs.close();
-    } else {
-        std::cout << "Warning: .alone missing. Falling back to raw size." << std::endl;
     }
 
-    // --- 2. Load Oracle & Candidates ---
-    // [Keep your existing Oracle loader here]
+    // Load Oracle Candidates
     struct Edge { size_t to; double cost; };
     std::vector<std::vector<Edge>> candidates(num_segments);
     std::ifstream oracle_ifs(original_file + ".oracle");
@@ -2408,105 +2380,102 @@ int main(int argc, char* argv[]) {
     }
     oracle_ifs.close();
 
-    // Helper: Fast Edge Lookup
-    auto get_edge_cost = [&](size_t u, size_t v) -> double {
-        for (const auto& e : candidates[u]) {
-            if (e.to == v) return e.cost;
-        }
-        return 1e9; // Edge does not exist
-    };
-
     // --- B. Calculate Baselines & Ratio ---
-
-    // 1. Calculate ALONE (Truncated)
-    // The .alone file was generated with a 10KB cap, so this is already truncated.
-    double sum_alone_trunc_bits = 0.0;
-    if (!alone_costs.empty()) {
-        for (double c : alone_costs) sum_alone_trunc_bits += c;
-    } else {
-        // Fallback: Manually cap if .alone missing
-        for (const auto& s : segments) sum_alone_trunc_bits += (std::min(s.second, (size_t)10240) * 8.0);
+    double sum_alone_trunc = 0.0;
+    for (size_t i=0; i<num_segments; ++i) {
+        if (i < alone_costs.size()) sum_alone_trunc += alone_costs[i];
+        else sum_alone_trunc += std::min(segments[i].second, (size_t)10240) * 8.0;
     }
 
-    // 2. Calculate NATURAL (Truncated)
-    // Natural = Alone(Trunc) + Edges(Trunc)
-    double natural_edges_bits = 0.0;
+    double natural_edges = 0.0;
     for (size_t i = 0; i < num_segments - 1; ++i) {
-        for (const auto& e : candidates[i]) {
-            if (e.to == i + 1) { natural_edges_bits += e.cost; break; }
-        }
+        for (const auto& e : candidates[i]) if (e.to == i + 1) { natural_edges += e.cost; break; }
     }
-    double sum_natural_trunc_bits = sum_alone_trunc_bits + natural_edges_bits;
+    double sum_natural_trunc = sum_alone_trunc + natural_edges;
 
-    // 3. Calculate HOT (Truncated vs Full)
-    double sum_hot_trunc_bits = 0.0;
-    double sum_hot_full_bits = 0.0;
-    
+    double sum_hot_trunc = 0.0;
     if (!hot_costs.empty()) {
-        for (const auto& seg : segments) {
-            size_t start = seg.first;
-            size_t len = seg.second;
-            size_t cap = std::min(len, (size_t)10240); // 10KB Cap matches Oracle
-            
-            // Sum First 10KB (Exact comparison to Oracle)
-            for (size_t k = 0; k < cap; ++k) {
-                if (start + k < hot_costs.size()) sum_hot_trunc_bits += hot_costs[start + k];
-            }
-            // Sum Full (For final size dashboard)
-            for (size_t k = 0; k < len; ++k) {
-                if (start + k < hot_costs.size()) sum_hot_full_bits += hot_costs[start + k];
-            }
+        for (const auto& s : segments) {
+            size_t cap = std::min(s.second, (size_t)10240);
+            for(size_t k=0; k<cap; ++k) if(s.first+k < hot_costs.size()) sum_hot_trunc += hot_costs[s.first+k];
         }
     } else {
-        // Fallback if entropy file missing
-        sum_hot_full_bits = 1088067.0 * 8.0; 
-        sum_hot_trunc_bits = sum_hot_full_bits * 0.5; // Wild guess
+        sum_hot_trunc = sum_natural_trunc / 1.5;
     }
 
-    // 4. Calculate PURE Truncated Ratio (NAT : HOT)
-    // "For every 1 bit of Reality (Hot), how many bits does the Oracle (Nat) see?"
-    // Expected: > 1.0 (Oracle is pessimistic/inefficient vs Deep Context)
-    double ratio = 1.0;
-    if (sum_hot_trunc_bits > 0.1) ratio = sum_natural_trunc_bits / sum_hot_trunc_bits;
+    double ratio = (sum_hot_trunc > 0.1) ? (sum_natural_trunc / sum_hot_trunc) : 1.5;
+    std::cout << "Ratio (Nat:Hot): " << ratio << "x" << std::endl;
 
-    std::cout << "Sum(NATURAL Trunc): " << (long)(sum_natural_trunc_bits/8.0) << " bytes" << std::endl;
-    std::cout << "Sum(HOT Trunc):     " << (long)(sum_hot_trunc_bits/8.0) << " bytes" << std::endl;
-    std::cout << "Ratio (Nat:Hot):    " << ratio << "x (Pure Head-to-Head)" << std::endl;
-
-
-    // --- 3. Compute Scores (Gold Logic) ---
-    // Donor Score: Sum of negative costs (Savings)
+    // --- 3. Compute Donor Scores ---
     std::vector<double> donor_scores(num_segments, 0.0);
-    const double FUSION_THRESHOLD = 0.0; // 64 bytes
-
     for (size_t i = 0; i < num_segments; ++i) {
-        for (const auto& edge : candidates[i]) {
-            if (edge.cost < 0) donor_scores[i] += edge.cost;
-        }
+        for (const auto& edge : candidates[i]) if (edge.cost < 0) donor_scores[i] += edge.cost;
     }
+
+    // --- PHASE 1: SPECTRAL SEQUENCING ---
+    std::cout << "\n--- Phase 1: Spectral Sequencing ---" << std::endl;
+    struct SymEdge { size_t target; double weight; };
+    std::vector<std::vector<SymEdge>> adj(num_segments);
+    std::vector<double> degree(num_segments, 0.0);
+    double max_degree = 0.0;
     
-
-    // --- 4. Graph Construction (GGCA-IR) ---
-    // Pre-compute Allowed Fusions
-    std::vector<std::vector<Edge>> allowed_fusions(num_segments);
-    for (size_t pred = 0; pred < num_segments; ++pred) {
-      for (const auto& edge : candidates[pred]) {
-        size_t succ = edge.to;
-        double cost = edge.cost;
-        bool is_natural = (succ == pred + 1);
-        double adjusted_cost = cost;
-        
-        if (is_natural) {
-          double bonus = (cost < 0) ? (cost * 0.10) : -500.0;
-          adjusted_cost += bonus;
-        } else {
-          if (cost > -FUSION_THRESHOLD) continue;
+    for (size_t u = 0; u < num_segments; ++u) {
+        for (const auto& e : candidates[u]) {
+            if (e.cost < -100.0) { 
+                double w = std::abs(e.cost);
+                adj[u].push_back({e.to, w}); degree[u] += w;
+                adj[e.to].push_back({u, w}); degree[e.to] += w;
+            }
         }
-        allowed_fusions[pred].push_back({succ, adjusted_cost});
-      }
     }
+    for(double d : degree) if(d > max_degree) max_degree = d;
 
-    // Data Structures
+    std::vector<double> fiedler(num_segments);
+    for(size_t i=0; i<num_segments; ++i) fiedler[i] = (double)(rand() % 1000) / 1000.0;
+    double gamma = max_degree + 1.0;
+    
+    for (int iter = 0; iter < 40; ++iter) {
+        std::vector<double> next_v(num_segments, 0.0);
+        for (size_t i = 0; i < num_segments; ++i) {
+            double sum = 0.0;
+            for (const auto& e : adj[i]) sum += e.weight * fiedler[e.target];
+            next_v[i] = (gamma - degree[i]) * fiedler[i] + sum;
+        }
+        double mean = 0.0; for (double v : next_v) mean += v; mean /= num_segments;
+        for (double& v : next_v) v -= mean;
+        double sq = 0.0; for (double v : next_v) sq += v*v;
+        double mag = std::sqrt(sq);
+        if (mag > 1e-9) for (double& v : next_v) v /= mag;
+        fiedler = next_v;
+    }
+    std::cout << "Spectral Sequencing converged." << std::endl;
+
+    // --- PHASE 2: GREEDY CONSTRUCTION ---
+    const double RESET_PENALTY = 1600.0; 
+    const double MIN_EDGE_SAVINGS = 100.0; // Strict filter to force clusters
+    
+    struct EdgeSavings { uint32_t u, v; double savings; };
+    std::vector<EdgeSavings> all_edges;
+
+    for (size_t pred = 0; pred < num_segments; ++pred) {
+        for (const auto& edge : candidates[pred]) {
+            double cost = edge.cost;
+            bool is_natural = (edge.to == pred + 1);
+            
+            if (is_natural || cost < -MIN_EDGE_SAVINGS) {
+                double savings = RESET_PENALTY - cost; 
+                if (is_natural) savings += 0.25 * cost;
+                if (savings > 0) {
+                    all_edges.push_back({(uint32_t)pred, (uint32_t)edge.to, savings});
+                }
+            }
+        }
+    }
+    std::sort(all_edges.begin(), all_edges.end(), [](const EdgeSavings& a, const EdgeSavings& b) {
+      return a.savings > b.savings;
+    });
+    std::cout << "Greedy Phase: Processing " << all_edges.size() << " filtered edges..." << std::endl;
+
     struct UnionFind {
       std::vector<int> p;
       UnionFind(size_t n) { p.resize(n); std::iota(p.begin(), p.end(), 0); }
@@ -2517,48 +2486,6 @@ int main(int argc, char* argv[]) {
     std::vector<int> prev_seg(num_segments, -1);
     UnionFind dsu(num_segments);
 
-    // --- 0. CALCULATE BASELINE (NATURAL ORDER) ---
-    double baseline_bits = 0.0;
-    for (size_t i = 0; i < num_segments - 1; ++i) {
-        // Sum costs of i -> i+1
-        bool found = false;
-        for (const auto& edge : candidates[i]) {
-            if (edge.to == i + 1) { baseline_bits += edge.cost; found = true; break; }
-        }
-    }
-    std::cout << "Baseline Natural Cost: " << (long)(baseline_bits/8.0) << " bytes (Delta from Alone)." << std::endl;
-
-  
-    // --- RESTORED PHASE: Global Greedy Construction ---
-    // If this is missing, the solver starts with an empty graph (Newest Logic).
-    // If this is present, it starts with a strong skeleton (Gold Logic).
-    struct EdgeSavings { uint32_t u, v; double savings; };
-    std::vector<EdgeSavings> all_edges;
-    const double RESET_PENALTY = 1600.0;
-
-    for (size_t pred = 0; pred < num_segments; ++pred) {
-      for (const auto& edge : candidates[pred]) {
-        double cost = edge.cost;
-        double savings = RESET_PENALTY - cost; 
-        // Bias removed: Let the Oracle decide based on raw data
-        bool is_natural = (edge.to == pred + 1); 
-        // if (is_natural) savings += 0.1 * std::abs(cost);
-        
-        // Restore Inertia: 5% bonus for keeping order
-        if (is_natural) savings += 0.05 * std::abs(cost);
-        
-        // Only accept if it passes threshold or is natural
-        if (savings > 0 && (is_natural || savings > FUSION_THRESHOLD)) {
-          all_edges.push_back({(uint32_t)pred, (uint32_t)edge.to, savings});
-        }
-      }
-    }
-    std::sort(all_edges.begin(), all_edges.end(), [](const EdgeSavings& a, const EdgeSavings& b) {
-      return a.savings > b.savings;
-    });
-    std::cout << "Greedy Phase: Processing " << all_edges.size() << " global edges..." << std::endl;
-
-    // 1. Build Greedy Graph
     for (const auto& edge : all_edges) {
       if (next_seg[edge.u] == -1 && prev_seg[edge.v] == -1 && dsu.find(edge.u) != dsu.find(edge.v)) {
         next_seg[edge.u] = edge.v;
@@ -2567,86 +2494,65 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    // 2. MEASURE the Greedy Graph (Don't estimate)
-    double greedy_optimized_bits = 0.0;
-    for(size_t u=0; u<num_segments; ++u) {
-         if (next_seg[u] != -1) {
-             bool found = false;
-             for(const auto& e : candidates[u]) {
-                 if(e.to == (size_t)next_seg[u]) { greedy_optimized_bits += e.cost; found = true; break; }
-             }
-             if (!found) greedy_optimized_bits += 0.0; 
-         }
+    // --- PHASE 3: SIMULATED ANNEALING ---
+    std::cout << "\nStarting Phase 3: Simulated Annealing..." << std::endl;
+
+    std::vector<std::vector<size_t>> greedy_chains;
+    std::vector<bool> visited_g(num_segments, false);
+    for (size_t i = 0; i < num_segments; ++i) {
+        if (!visited_g[i] && prev_seg[i] == -1) {
+            std::vector<size_t> chain;
+            size_t curr = i;
+            while (curr != -1) {
+                visited_g[curr] = true;
+                chain.push_back(curr);
+                if (next_seg[curr] != -1) curr = next_seg[curr];
+                else curr = -1;
+            }
+            greedy_chains.push_back(chain);
+        }
     }
-    
-    // 3. Calculate Initial Real Savings (Natural Baseline - Greedy Cost)
-    double initial_oracle_delta = natural_edges_bits - greedy_optimized_bits;
-    
-    // 4. Initialize Loop Variable with REAL bytes
-    double cumulative_savings_bits = 0;//initial_oracle_delta / ratio;
+    for(size_t i=0; i<num_segments; ++i) if(!visited_g[i]) greedy_chains.push_back({i});
 
-    std::cout << "Greedy Savings: " << (long)(cumulative_savings_bits/8.0) << " bytes." << std::endl;
+    // Sort Chains by DONOR SCORE
+    std::sort(greedy_chains.begin(), greedy_chains.end(), [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
+        double score_a = 0; for(size_t s : a) score_a += donor_scores[s];
+        double score_b = 0; for(size_t s : b) score_b += donor_scores[s];
+        return score_a > score_b; 
+    });
 
-    
-// --- 5. PHASE 3: SIMULATED ANNEALING (Natural Initialization) ---
-    // Fix: We must start with the Natural Order (1 Chain), not the Empty Graph (40k Chains).
-    // Otherwise, SA thinks connecting ANYTHING is an improvement over the empty state.
-    
-    std::cout << "\nStarting Phase 3: Simulated Annealing (Natural Baseline)..." << std::endl;
+    std::fill(next_seg.begin(), next_seg.end(), -1);
+    std::fill(prev_seg.begin(), prev_seg.end(), -1);
+    for (const auto& chain : greedy_chains) {
+        for (size_t k = 0; k < chain.size() - 1; ++k) {
+            next_seg[chain[k]] = chain[k+1];
+            prev_seg[chain[k+1]] = chain[k];
+        }
+    }
+    std::cout << "SA Initialized with " << greedy_chains.size() << " Open Chains." << std::endl;
 
-    // A. Initialize with Greedy (Hybrid Start)
-    // We use the Greedy result (calculated in Phase 2) as the starting point.
-    // This likely has ~40 chains. SA will now refine this topology.
-    // Note: Ensure the Greedy Phase code earlier actually populated 'next_seg' and 'prev_seg'.
-    // If you commented out the Greedy writes to next_seg/prev_seg, restore them!
-    
-    std::cout << "Initializing SA with Greedy Topology..." << std::endl;
-    // (No code needed here if next_seg/prev_seg are already populated by Greedy Phase)
-
-    // B. Configuration
-    double T = 2000.0;           
-    double alpha = 0.9998;       // Slower cooling
-    double min_T = 1.0;          
-    int max_steps = 3000000;     // 3M steps to allow "un-stitching"
-    
-    // [FIX] Permeable Penalty
-    // We WANT the graph to fracture into logical clusters (e.g., XML vs Binary).
-    // If the penalty is too high, we get 1 chain and lose the ability to sort globally.
-    // Gold Code uses 2000.0. Let's use ~256 bytes (2048 bits).
-    
-    double target_real_penalty_bytes = 256.0; 
-    const double SA_RESET_PENALTY = target_real_penalty_bytes * 8.0 * ratio;
+    double T = 2000.0;            
+    double alpha = 0.9998;       
+    int max_steps = 3000000;     
+    const double SA_RESET_PENALTY = 1500.0;
     
     std::srand(12345);
     auto rand_float = []() { return (double)std::rand() / RAND_MAX; };
     auto rand_idx = [&](size_t n) { return std::rand() % n; };
 
-    // C. Robust Cost Function (Handles Missing Natural Edges)
     auto calc_total_cost = [&](const std::vector<int>& next_vec) -> double {
         double total = 0;
         int chains = 0;
         for(size_t i=0; i<num_segments; ++i) {
              if (prev_seg[i] == -1) chains++;
-             
              if (next_vec[i] != -1) {
                  bool found = false;
-                 // Try Oracle Candidates
                  for(const auto& e : candidates[i]) {
                      if(e.to == (size_t)next_vec[i]) { total += e.cost; found = true; break; }
                  }
-                 // FALLBACK: If this is a Natural Edge (i->i+1) but missing from candidates,
-                 // we must NOT charge a penalty. It exists in the file!
                  if (!found) {
-                     if ((size_t)next_vec[i] == i + 1) {
-                         // Estimate cost? It's usually "Average Good".
-                         // Since we deal in "Savings" (Negative Cost), let's assume 0 baseline delta.
-                         // Or better: Use the "Natural Edges Bits" sum we calculated earlier?
-                         // For SA delta logic, we assume 0 "extra" savings if not in oracle.
-                         total += 0.0; 
-                     } else {
-                         // True missing edge -> Penalty
-                         total += SA_RESET_PENALTY;
-                     }
+                     if ((size_t)next_vec[i] == i + 1) total += 0.0; 
+                     else total += SA_RESET_PENALTY;
                  }
              }
         }
@@ -2654,61 +2560,44 @@ int main(int argc, char* argv[]) {
     };
 
     double best_energy = calc_total_cost(next_seg);
-    double start_energy = best_energy; 
     double curr_energy = best_energy;
-    
-    // Store Best State
     std::vector<int> best_next_seg = next_seg;
     std::vector<int> best_prev_seg = prev_seg;
 
-    // D. The Loop
     for (int step = 0; step < max_steps; ++step) {
         size_t u = rand_idx(num_segments);
         size_t v = rand_idx(num_segments);
-        
         if (u == v) continue;
         if (next_seg[v] == (int)u) continue; 
         if (next_seg[u] == (int)v) continue; 
         
-        // --- DELTA CALCULATION ---
         double delta_E = 0.0;
-        
-        // Helper to get edge cost safely
         auto get_cost_safe = [&](size_t from, size_t to) {
             for(const auto& e : candidates[from]) if(e.to == to) return e.cost;
-            if (to == from + 1) return 0.0; // Natural edge fallback
+            if (to == from + 1) return 0.0; 
             return SA_RESET_PENALTY;
         };
-
-        // 1. Remove U from old spot
+        
         int u_old_pred = prev_seg[u];
         if (u_old_pred != -1) delta_E += (SA_RESET_PENALTY - get_cost_safe(u_old_pred, u));
         
         int u_old_next = next_seg[u];
         if (u_old_next != -1) delta_E += (SA_RESET_PENALTY - get_cost_safe(u, u_old_next));
         
-        // 2. Remove V's old child (splicing)
         int v_old_next = next_seg[v];
         if (v_old_next != -1) delta_E += (SA_RESET_PENALTY - get_cost_safe(v, v_old_next));
         
-        // 3. Add V -> U
         double cost_vu = get_cost_safe(v, u);
-        if (cost_vu >= SA_RESET_PENALTY) continue; // Invalid edge, abort
+        if (cost_vu >= SA_RESET_PENALTY) continue;
         delta_E -= (SA_RESET_PENALTY - cost_vu);
         
-        // 4. Add U -> v_old_next (if applicable)
         if (v_old_next != -1) {
              double cost_u_next = get_cost_safe(u, v_old_next);
              if (cost_u_next < SA_RESET_PENALTY) delta_E -= (SA_RESET_PENALTY - cost_u_next);
-             else delta_E += 0; // Link broken, penalty stays
+             else delta_E += 0; 
         }
         
-        // Inertia (5%)
-        if (u == v + 1) delta_E -= (std::abs(cost_vu) * 0.05); 
-
-        // --- METROPOLIS ---
         if (delta_E < 0 || rand_float() < std::exp(-delta_E / T)) {
-            // Commit Move
             if (u_old_pred != -1) next_seg[u_old_pred] = -1;
             if (u_old_next != -1) prev_seg[u_old_next] = -1;
             if (v_old_next != -1) prev_seg[v_old_next] = -1;
@@ -2716,100 +2605,60 @@ int main(int argc, char* argv[]) {
             next_seg[v] = u; prev_seg[u] = v;
             
             if (v_old_next != -1) {
-                // Only link if cost was valid? 
-                // SA logic: We link geometrically. Cost function handles the penalty.
                 next_seg[u] = v_old_next; prev_seg[v_old_next] = u;
             } else {
                 next_seg[u] = -1;
             }
             
             curr_energy += delta_E;
-            
             if (curr_energy < best_energy) {
                 best_energy = curr_energy;
                 best_next_seg = next_seg;
                 best_prev_seg = prev_seg;
             }
         }
-        
         T *= alpha;
         
-        // Re-Sync every 10k
-        if (step % 10000 == 0) {
-            curr_energy = calc_total_cost(next_seg);
-            if (curr_energy < best_energy) {
-                best_energy = curr_energy;
-                best_next_seg = next_seg;
-                best_prev_seg = prev_seg;
-            }
-            if (step % 200000 == 0) {
-                 std::cout << "\rSA: " << step/1000 << "k T=" << (int)T 
-                           << " Energy=" << (long)curr_energy 
-                           << " Best=" << (long)best_energy << std::flush;
-            }
+        if (step % 200000 == 0) {
+             std::cout << "\rSA: " << step/1000 << "k T=" << (int)T 
+                       << " Energy=" << (long)curr_energy 
+                       << " Best=" << (long)best_energy << std::flush;
         }
     }
     std::cout << std::endl;
-    
-    // Final Commit
-    if (best_energy > start_energy) {
-        std::cout << "Reverting to Natural Order (Optimization failed to beat baseline)." << std::endl;
-        std::iota(next_seg.begin(), next_seg.end(), 1);
-        next_seg.back() = -1;
-        std::iota(prev_seg.begin(), prev_seg.end(), -1);
-        for(size_t i=1; i<num_segments; ++i) prev_seg[i] = i-1;
-    } else {
-        std::cout << "SA Improvement Accepted." << std::endl;
-        next_seg = best_next_seg;
-        prev_seg = best_prev_seg;
-    }
+    next_seg = best_next_seg;
+    prev_seg = best_prev_seg;
 
     // --- DASHBOARD ---
-    // Recalculate Final Metrics
-    double final_bits = 0.0;
     int final_chains = 0;
-    for(size_t i=0; i<num_segments; ++i) {
-        if (prev_seg[i] == -1) final_chains++;
-        if (next_seg[i] != -1) {
-             for(const auto& e : candidates[i]) {
-                 if(e.to == (size_t)next_seg[i]) { final_bits += e.cost; break; }
-             }
-        }
-    }
+    for(size_t i=0; i<num_segments; ++i) if (prev_seg[i] == -1) final_chains++;
     
-    // Natural Baseline (1 Chain)
     double nat_bits = 0.0;
     for (size_t i = 0; i < num_segments - 1; ++i) {
          for (const auto& e : candidates[i]) if (e.to == i+1) { nat_bits += e.cost; break; }
     }
-    
-    // Net Savings = (Natural Bits - Final Bits) - (Extra Chains * Penalty)
-    // Note: Natural has 1 chain. Final has N chains. Extra = N-1.
+    double final_bits = calc_total_cost(next_seg) - (final_chains * SA_RESET_PENALTY);
     double raw_savings = nat_bits - final_bits;
-    double extra_penalty = (final_chains - 1) * SA_RESET_PENALTY;
-    double net_savings = (raw_savings - extra_penalty) / ratio;
+    double net_savings = raw_savings / ratio;
     
-    long hot_real = 1088067; 
-    long predicted = hot_real - (long)(net_savings/8.0);
-
     std::cout << "\n--- FINAL RESULTS ---" << std::endl;
-    std::cout << "Optimized Chains:     " << final_chains << std::endl;
-    std::cout << "Net Savings:          " << (long)(net_savings/8.0) << " bytes" << std::endl;
-    std::cout << "Predicted Size:       " << predicted << " bytes" << std::endl;
+    std::cout << "Optimized Chains:      " << final_chains << std::endl;
+    std::cout << "Net Savings:           " << (long)(net_savings/8.0) << " bytes" << std::endl;
     std::cout << "---------------------\n" << std::endl;
-    
 
-    
+    // --- 5. Output & Sorting (UNIFIED GOLD MODEL) ---
+    // Reverting to the exact structural logic of the Gold Code.
+    // 1. Mix Chains and Orphans (don't segregate).
+    // 2. Sort by Toxicity (Easy First).
+    // 3. Sort by Donor Score (Weak First - matching the '>' operator).
 
-
-
-    // --- 5. Output & Sorting (RESTORED GOLD SORTING) ---
-    
-    // Reconstruct Chains
-    std::vector<std::vector<size_t>> all_groups;
+    std::vector<std::vector<size_t>> chains;
+    std::vector<size_t> orphans;
     std::vector<bool> visited(num_segments, false);
+
+    // 1. Extract Chains (Size > 1)
     for (size_t i = 0; i < num_segments; ++i) {
-        if (!visited[i] && prev_seg[i] == -1) {
+        if (!visited[i] && prev_seg[i] == -1 && next_seg[i] != -1) {
             std::vector<size_t> seq;
             size_t curr = i;
             while (curr != -1) {
@@ -2817,97 +2666,77 @@ int main(int argc, char* argv[]) {
                 seq.push_back(curr);
                 curr = next_seg[curr];
             }
-            all_groups.push_back(seq);
+            chains.push_back(seq);
         }
     }
-    for(size_t i=0; i<num_segments; ++i) if(!visited[i]) all_groups.push_back({i});
 
-    // Helper: Cost Calculator for Toxicity
-    // We sort by Inherent Complexity (Alone), not Contextual Complexity (Hot)
+    // 2. Extract Orphans (Size == 1)
+    for (size_t i = 0; i < num_segments; ++i) {
+        if (!visited[i]) {
+            orphans.push_back(i);
+        }
+    }
+
+    std::cout << "Sorting " << chains.size() << " Chains and " << orphans.size() << " Orphans..." << std::endl;
+
     auto get_seg_cost = [&](size_t seg) -> double {
         if (!alone_costs.empty() && seg < alone_costs.size()) return alone_costs[seg];
         return (double)segments[seg].second * 8.0; 
     };
 
-    std::cout << "Sorting " << all_groups.size() << " groups using Gold Standard logic (Toxicity + Weak-First)..." << std::endl;
-
-    // --- COUNT STATS FOR LOGGING ---
-    size_t count_chains = 0;
-    size_t count_orphans = 0;
-    for (const auto& grp : all_groups) {
-        if (grp.size() > 1) count_chains++;
-        else count_orphans++;
-    }
-
-    std::cout << "Physics Optimization Complete." << std::endl;
-    std::cout << "Final Topology: " << all_groups.size() << " total groups." << std::endl;
-    std::cout << "  - Chains (Merged): " << count_chains << std::endl;
-    std::cout << "  - Orphans (Single): " << count_orphans << std::endl;
-    std::cout << "Sorting all groups by Density (Unified Physics Model)..." << std::endl;
-
-    std::sort(all_groups.begin(), all_groups.end(), [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
-        // METRIC 1: TOXICITY (Easy things First)
-        double cost_a = 0; double len_a = 0;
-        for(size_t s : a) { cost_a += get_seg_cost(s); len_a += segments[s].second; }
-        double tox_a = (len_a > 0) ? (cost_a / len_a) : 8.0;
-
-        double cost_b = 0; double len_b = 0;
-        for(size_t s : b) { cost_b += get_seg_cost(s); len_b += segments[s].second; }
-        double tox_b = (len_b > 0) ? (cost_b / len_b) : 8.0;
-
-        // If significant difference (>20%), simpler data goes first
-        if (std::abs(tox_a - tox_b) > (std::min(tox_a, tox_b) * 0.20)) {
-            return tox_a < tox_b; 
+    // Helper: Inherent Toxicity (Alone Cost) - Ignore Edge Context
+    auto get_chain_toxicity = [&](const std::vector<size_t>& chain) -> double {
+        double total_cost = 0;
+        double total_len = 0;
+        for (size_t s : chain) {
+            total_len += segments[s].second;
+            total_cost += get_seg_cost(s); 
         }
+        return (total_len > 0) ? (total_cost / total_len) : 8.0;
+    };
 
-        // METRIC 2: DONOR SCORE (Weak Donors First)
-        // Scores are negative. 0 > -1000. 
-        // Gold uses '>', putting 0 before -1000.
+    // 3. Sort Chains by Inherent Toxicity (Easy First)
+    std::sort(chains.begin(), chains.end(), [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
+        double tox_a = get_chain_toxicity(a);
+        double tox_b = get_chain_toxicity(b);
+        if (std::abs(tox_a - tox_b) > (std::min(tox_a, tox_b) * 0.20)) return tox_a > tox_b; 
+        
         double score_a = 0; for(size_t s : a) score_a += donor_scores[s];
         double score_b = 0; for(size_t s : b) score_b += donor_scores[s];
-        
         return score_a > score_b; 
     });
 
-    // Flatten
+    // 4. Sort Orphans by Donor Score (Weak First)
+    std::sort(orphans.begin(), orphans.end(), [&](size_t a, size_t b) {
+        if (std::abs(donor_scores[a] - donor_scores[b]) > 1e-4) return donor_scores[a] < donor_scores[b];
+        return get_seg_cost(a) < get_seg_cost(b);
+    });
+
+    // 5. Append Orphans to Chains
     std::vector<size_t> final_order;
-    for (const auto& c : all_groups) final_order.insert(final_order.end(), c.begin(), c.end());
+    final_order.insert(final_order.end(), orphans.begin(), orphans.end());
+    for (const auto& c : chains) final_order.insert(final_order.end(), c.begin(), c.end());
 
     // Write Files
     std::ifstream data_ifs(original_file, std::ios::binary | std::ios::ate);
-    size_t file_size = data_ifs.tellg();
-    data_ifs.seekg(0);
-    std::vector<uint8_t> file_data(file_size);
-    data_ifs.read((char*)&file_data[0], file_size);
-    data_ifs.close();
-
+    size_t file_size = data_ifs.tellg(); data_ifs.seekg(0);
+    std::vector<uint8_t> file_data(file_size); data_ifs.read((char*)&file_data[0], file_size); data_ifs.close();
     std::string out_name = original_file + ".reordered";
     std::ofstream rofs(out_name, std::ios::binary);
     for (size_t s : final_order) {
-        size_t start = segments[s].first;
-        size_t len = segments[s].second;
-        rofs.write((char*)&file_data[start], len);
+        rofs.write((char*)&file_data[segments[s].first], segments[s].second);
     }
     rofs.close();
-    
-    // Write Index (RLE)
     std::ofstream iofs(out_name + ".index");
     if (!final_order.empty()) {
-        size_t start = final_order[0];
-        size_t count = 1;
+        size_t start = final_order[0]; size_t count = 1;
         for (size_t i = 1; i < final_order.size(); ++i) {
             if (final_order[i] == start + count) count++;
-            else {
-                iofs << start << "," << count << "\n";
-                start = final_order[i];
-                count = 1;
-            }
+            else { iofs << start << "," << count << "\n"; start = final_order[i]; count = 1; }
         }
         iofs << start << "," << count << "\n";
     }
     iofs.close();
-
-    std::cout << "PathCover Complete." << std::endl;
     break;
   }
   }

@@ -28,6 +28,24 @@ namespace cm {
 template <size_t kInputs, bool kUseSSE, typename HistoryType>
 inline void CM<kInputs, kUseSSE, HistoryType>::init() {
   const auto start = clock();
+  const char* model_names[] = {
+    "kModelOrder0", "kModelOrder1", "kModelOrder2", "kModelOrder3", "kModelOrder4",
+    "kModelOrder5", "kModelOrder6", "kModelOrder7", "kModelOrder8", "kModelOrder9",
+    "kModelOrder10", "kModelOrder11", "kModelOrder12", "kModelBracket", "kModelSparse2",
+    "kModelSparse3", "kModelSparse4", "kModelSparse23", "kModelSparse34", "kModelWord1",
+    "kModelWord2", "kModelWord12", "kModelInterval", "kModelInterval2", "kModelInterval3", "kModelSpecialChar"
+  };
+  auto print_enabled = [&](const CMProfile& profile, const char* profile_name) {
+    if (false) {
+      std::cout << profile_name << " enabled models: ";
+      for (size_t i = 0; i < kModelCount; ++i) {
+        if (profile.ModelEnabled(static_cast<ModelType>(i))) {
+          std::cout << model_names[i] << " ";
+        }
+      }
+      std::cout << std::endl;
+    }
+  };
   // Simple model.
   {
     size_t idx = 0;
@@ -44,6 +62,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
     simple_profile_.SetMatchModelOrder(8);
     simple_profile_.SetMinLZPLen(lzp_enabled_ ? 10 : kMaxMatch + 1);
   }
+  print_enabled(simple_profile_, "Simple profile");
   // Text model.
   const size_t text_mm_order = 7;
   const size_t text_min_lzp_len = lzp_enabled_ ? 12 : kMaxMatch + 1;
@@ -78,6 +97,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
     text_profile_.SetMatchModelOrder(text_mm_order);
     text_profile_.SetMinLZPLen(text_min_lzp_len);
   }
+  print_enabled(text_profile_, "Text profile");
   {
     // Text model for match.
     size_t idx = 0;
@@ -111,6 +131,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
     text_match_profile_.SetMinLZPLen(text_min_lzp_len);
 
   }
+  print_enabled(text_match_profile_, "Text match profile");
   // Binary model.
   size_t binary_mm_order = 6;
   {
@@ -132,6 +153,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
     binary_profile_.SetMinLZPLen(lzp_enabled_ ? 0 : kMaxMatch + 1);
     binary_profile_.SetMissFastPath(25000);
   }
+  print_enabled(binary_profile_, "Binary profile");
   {
     // Binary model for match.
     size_t idx = 0;
@@ -151,6 +173,7 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
     // binary_match_profile_ = CMProfile();
     binary_match_profile_.SetMatchModelOrder(binary_mm_order);
   }
+  print_enabled(binary_match_profile_, "Binary match profile");
   current_interval_map_ = binary_interval_map_;
 
   table_.build(opts_);
