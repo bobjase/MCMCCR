@@ -784,7 +784,7 @@ int OracleChildMain(int argc, char* argv[]) {
             // Read pred_id
             size_t pred_id;
             if (fread(&pred_id, sizeof(size_t), 1, stdin) != 1) {
-                debugError("Failed to read pred_id, exiting " + std::to_string(pred_id) );
+                debugError("Failed to read pred_id " + std::to_string(pred_id)  + ", exiting " );
                 break;
             }
             //debugError("read pred_id: " + std::to_string(pred_id));
@@ -1064,14 +1064,19 @@ int OracleChildMain(int argc, char* argv[]) {
         CloseHandle(hFile);
         return 0;
     } catch (const std::bad_alloc& e) {
+        debugError("Bad alloc: " + std::string(e.what()));
         return 1;
     } catch (const std::out_of_range& e) {
+        debugError("Out of range: " + std::string(e.what())); 
         return 1;
     } catch (const std::runtime_error& e) {
+        debugError("Runtime error: " + std::string(e.what()));    
         return 1;
     } catch (const std::exception& e) {
+        debugError("Exception: " + std::string(e.what()));  
         return 1;
     } catch (...) {
+        debugError("Unknown exception caught"); 
         return 1;
     }
 }
