@@ -666,6 +666,12 @@ void se_translator(unsigned int code, EXCEPTION_POINTERS* ep) {
     throw std::runtime_error("SEH exception");
 }
 
+struct SegmentInfo {
+    size_t start;
+    size_t length;
+    double hot_cost;
+};
+
 // --- Oracle Child Process Function ---
 int OracleChildMain(int argc, char* argv[]) {
     _setmode(_fileno(stdin), _O_BINARY);
@@ -708,17 +714,28 @@ int OracleChildMain(int argc, char* argv[]) {
             CloseHandle(hSegFile);
             return 1;
         }
+        
+        
         std::string seg_content((char*)pSegView, segFileSize.QuadPart);
         std::istringstream seg_iss(seg_content);
+        
         uint64_t num_segments;
         seg_iss >> num_segments;
         debugLog("num_segments: " + std::to_string(num_segments));
-        std::vector<std::pair<size_t, size_t>> valid_segments(num_segments);
+
+        // Use our new struct here
+        std::vector<SegmentInfo> valid_segments(num_segments);
         debugLog("valid_segments resized");
-        for (auto& seg : valid_segments) {
-            seg_iss >> seg.first >> seg.second;
+
+        for (size_t i = 0; i < num_segments; ++i) {
+            // Extraction now pulls: Start, Length, and the new HotCost
+            if (!(seg_iss >> valid_segments[i].start >> valid_segments[i].length >> valid_segments[i].hot_cost)) {
+                debugError("Failed to parse segment data at index " + std::to_string(i));
+                break;
+            }
         }
-        debugLog("read valid_segments");
+        debugLog("read valid_segments with hot_costs");
+
         // Unmap segments
         UnmapViewOfFile(pSegView);
         CloseHandle(hSegMapping);
@@ -758,26 +775,71 @@ int OracleChildMain(int argc, char* argv[]) {
 
         // Adjust valid_segments for file size
         for (auto& p : valid_segments) {
-            size_t start = p.first;
-            size_t len = p.second;
+            size_t start = p.start;
+            size_t len = p.length;
             if (start >= file_size || len == 0) continue;
             if (start + len > file_size) {
                 len = file_size - start;
-                p.second = len;
+                p.length = len;
             }
         }
 
         // Define CM objects ONCE (performance optimization)
         // [CCR ALIGNMENT] Define CM objects ONCE
         // 1. Joint Compressor (Predecessor + Successor)
-        cm::CM<16, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileText);
+        // cm::CM<16, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileText);
         
-        // Manual Configuration to match -x11
+        // // Manual Configuration to match -x11
+        // cm.init();
+        // cm.text_profile_ = GetCCRProfile(); // Inject Economy Profile
+        // cm.SetDataProfile(cm::CM<16, false>::kProfileText); // Force Text Mode
+        // cm.skip_init = true; // Prevent accidental reset
+        // cm.observer_mode = true;
+
+          // Define CM objects ONCE (performance optimization)
+        cm::CM<16, false> cm(FrequencyCounter<256>(), 0, false, Detector::kProfileText);
+        // Use full profile for max compression accuracy
+        //cm.SetDataProfile(cm::CM<16, false>::kProfileText); // Force Text Mode
+        cm.text_profile_ = GetCCRProfile(); // Inject Economy Profile
+        //cm.cur_profile_ = cm::CMProfile();
+        // for (int i = 0; i < static_cast<int>(cm::kModelCount); ++i) {
+        //     cm.cur_profile_.EnableModel(static_cast<cm::ModelType>(i));
+        // }
+        //cm.cur_profile_.SetMatchModelOrder(12);
+        //cm.cur_profile_.SetMinLZPLen(10);
+        cm.observer_mode = true;
         cm.init();
         cm.text_profile_ = GetCCRProfile(); // Inject Economy Profile
-        cm.SetDataProfile(cm::CM<16, false>::kProfileText); // Force Text Mode
-        cm.skip_init = true; // Prevent accidental reset
-        cm.observer_mode = true;
+        size_t max_segment_length = 1024000;
+
+
+        // --- GLOBAL MEAT PRIMING ---
+        debugLog("Priming global meat snapshot...");
+
+        // 1. Wipe and Reset for a fresh start
+        memset(cm.base_hash_table_, 0, cm.hash_alloc_size_);
+        cm.init();
+        cm.entropies.clear();
+        cm.SetOverlay(nullptr);
+
+        // 2. Perform the sparse scan (Stride 4)
+        VoidWriteStream out_prime; 
+        for (size_t i = 0; i < valid_segments.size(); i += std::floor(static_cast<double>(valid_segments.size()) / 12.0)) {
+            size_t start = valid_segments[i].start;
+            size_t len = valid_segments[i].length;
+            
+            // Safety check for file data
+            const uint8_t* ptr_start = (const uint8_t*)(file_data + start);
+            ReadMemoryStream in_prime(ptr_start, ptr_start + len);
+            
+            // We don't care about the entropy result here, just the hash table updates
+            cm.compress(&in_prime, &out_prime, len);
+        }
+
+        // 3. Capture the "Meat" Snapshot
+        auto global_meat_snapshot = cm.takeSnapshot();
+        debugLog("Global meat snapshot captured.");
+        // ----------------------------
 
         // Worker loop
         while (true) {
@@ -825,8 +887,8 @@ int OracleChildMain(int argc, char* argv[]) {
             std::map<size_t, std::vector<std::pair<size_t, double>>> succ_costs;
 
             // Get pred data
-            size_t start_pred = valid_segments[pred_id].first;
-            size_t len_pred = valid_segments[pred_id].second;
+            size_t start_pred = valid_segments[pred_id].start;
+            size_t len_pred = valid_segments[pred_id].length;
             std::vector<uint8_t> data_pred(len_pred);
             memcpy(data_pred.data(), file_data + start_pred, len_pred);
             debugLog("Got pred data");
@@ -841,9 +903,9 @@ int OracleChildMain(int argc, char* argv[]) {
             memset(cm.base_hash_table_, 0, cm.hash_alloc_size_);
             
             // 2. Init & Compress
-            cm.init(); 
-            cm.skip_init = true; 
-            cm.entropies.clear(); // <--- CRITICAL FIX: Clear accumulation
+            // cm.init(); 
+            // cm.skip_init = true; 
+            // cm.entropies.clear(); // <--- CRITICAL FIX: Clear accumulation
             cm.SetOverlay(nullptr); 
             
             ReadMemoryStream in_pred(data_pred.data(), data_pred.data() + data_pred.size());
@@ -853,7 +915,7 @@ int OracleChildMain(int argc, char* argv[]) {
 
             // Take pred snapshot for tournament
             auto pred_snapshot = cm.takeSnapshot();
-            double pred_cost = cm.getAccumulatedEntropy();
+            double pred_cost = 0;//cm.getAccumulatedEntropy();
 
             // this is always outputting 0 -- seems like a bug
             //debugError("Pred cost: " + std::to_string(pred_cost));
@@ -865,7 +927,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 double savings_rate;
             };
             std::vector<Candidate> roster;
-            roster.reserve(129); // Keep it small!
+            roster.reserve(4096); // Keep it small!
 
             // The "Working" Overlay (Recycled)
             cm::PagedOverlay* worker_ov = new cm::PagedOverlay(cm.base_hash_table_, cm.hash_alloc_size_);
@@ -886,8 +948,8 @@ int OracleChildMain(int argc, char* argv[]) {
                 }
 
                 // 1. Setup Chunk
-                size_t start = valid_segments[succ].first;
-                size_t len = valid_segments[succ].second;
+                size_t start = valid_segments[succ].start;
+                size_t len = valid_segments[succ].length;
                 size_t scan_len = std::min((size_t)roundOneSize, len);
 
                 // 2. Reset Worker (Reuse memory)
@@ -897,6 +959,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 cm.SetOverlay(worker_ov);
                 cm.restoreSnapshot(pred_snapshot);
                 cm.byte_index = 0;
+                cm.entropies.clear();
 
                 // Point directly to the memory-mapped file
                 const uint8_t* ptr_start = (const uint8_t*)(file_data + start);
@@ -909,17 +972,20 @@ int OracleChildMain(int argc, char* argv[]) {
                 //debugError("Finished compression for succ " + std::to_string(succ));
 
                 // 4. Score
-                double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
+                // double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
                 
-                // FIX: Normalize Alone Cost to the scan length
-                // We assume entropy is roughly uniform across the segment (Approximation)
-                size_t full_len = std::min(len, (size_t)10240); // The length used by Parent
-                double alone_rate = succ_alone_costs[succ] / (double)full_len; // Bits per byte
-                double alone_cost_scaled = alone_rate * scan_len; // Cost for *this* chunk
+                // // FIX: Normalize Alone Cost to the scan length
+                // // We assume entropy is roughly uniform across the segment (Approximation)
+                // size_t full_len = std::min(len, (size_t)2048); // The length used by Parent
+                // double alone_rate = succ_alone_costs[succ] / (double)full_len; // Bits per byte
+                // double alone_cost_scaled = alone_rate * scan_len; // Cost for *this* chunk
 
-                // Now compare Apples to Apples (512 bytes vs 512 bytes)
-                double savings_rate = (alone_cost_scaled - joint_delta) / scan_len;
+                // // Now compare Apples to Apples (512 bytes vs 512 bytes)
+                // double savings_rate = (alone_cost_scaled - joint_delta) / scan_len;
 
+                // measure how much entropy we found (smaller=good) -- we're going to keep the smallest content below
+                // simplified from above b/c this is just a tournament and we don't really know how this goes, but we DO know that context importance fades
+                double savings_rate = cm.getAccumulatedEntropy();
 
                 // 5. King of the Hill Logic
                 if (roster.size() < 4096) {
@@ -929,7 +995,7 @@ int OracleChildMain(int argc, char* argv[]) {
                     worker_ov = new cm::PagedOverlay(cm.base_hash_table_, cm.hash_alloc_size_);
                 } else {
                     // Find worst in roster
-                    auto min_it = std::min_element(roster.begin(), roster.end(), 
+                    auto min_it = std::max_element(roster.begin(), roster.end(), 
                       [](const Candidate& a, const Candidate& b){ 
                           if (std::abs(a.savings_rate - b.savings_rate) > 1e-9) return a.savings_rate < b.savings_rate;
                           return a.id > b.id; // Break ties: prefer evicting higher IDs (arbitrary but consistent)
@@ -953,7 +1019,7 @@ int OracleChildMain(int argc, char* argv[]) {
             // Cleanup the extra worker
             delete worker_ov;
 
-            // Sort the final 32
+            // Sort the finalists
             //std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
             // Deterministic Sort: Break ties with ID
             std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ 
@@ -963,12 +1029,12 @@ int OracleChildMain(int argc, char* argv[]) {
 
             // --- ROUND 2: SEMI-FINALS (2048 Bytes) ---
             for (auto& cand : roster) {
-                size_t len = valid_segments[cand.id].second;
+                size_t len = valid_segments[cand.id].length;
                 if (len <= roundOneSize) continue; // Already fully scanned
                 
                 size_t limit = 2048;
                 size_t scan_len = std::min(len, limit);
-                size_t start = valid_segments[cand.id].first;
+                size_t start = valid_segments[cand.id].start;
                 
                 std::vector<uint8_t> chunk(scan_len);
                 memcpy(chunk.data(), file_data + start, scan_len);
@@ -978,6 +1044,7 @@ int OracleChildMain(int argc, char* argv[]) {
                 cand.overlay -> Reset();
                 cm.restoreSnapshot(pred_snapshot); // Reset Mixers to start
                 cm.byte_index = 0;
+                cm.entropies.clear();
                 
                 // RESTART Scan (0 -> 2048)
                 // Why restart? Because the Overlay preserved the Hash Table, but we reset the Mixers.
@@ -985,21 +1052,25 @@ int OracleChildMain(int argc, char* argv[]) {
                 MemoryReadStream in_chunk(chunk);
                 cm.compress(&in_chunk, &out_pred, scan_len);
 
-                double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
+                //double joint_delta = cm.getAccumulatedEntropy();// - pred_cost;
                 
-                // FIX: Normalize Alone Cost
-                size_t full_len = std::min(len, (size_t)10240);
-                double alone_rate = succ_alone_costs[cand.id] / (double)full_len;
-                double alone_cost_scaled = alone_rate * scan_len;
+                // // FIX: Normalize Alone Cost
+                // size_t full_len = std::min(len, max_segment_length);
+                // double alone_rate = succ_alone_costs[cand.id] / (double)full_len;
+                // double alone_cost_scaled = alone_rate * scan_len;
                 
-                cand.savings_rate = (alone_cost_scaled - joint_delta) / scan_len;
+                // cand.savings_rate = (alone_cost_scaled - joint_delta) / scan_len;
+
+
+                // measure how much entropy we found (smaller=good) -- we're going to keep the smallest content below
+                cand.savings_rate = cm.getAccumulatedEntropy();
             }
 
             // Prune: Sort & Keep Top 16
             //std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
             // Deterministic Sort
             std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ 
-                if (std::abs(a.savings_rate - b.savings_rate) > 1e-9) return a.savings_rate > b.savings_rate;
+                if (std::abs(a.savings_rate - b.savings_rate) > 1e-9) return a.savings_rate < b.savings_rate;
                 return a.id < b.id; 
             });
             
@@ -1009,25 +1080,29 @@ int OracleChildMain(int argc, char* argv[]) {
 
             // --- ROUND 3: FINALS (Full Run / 10KB Cap) ---
             for (const auto& cand : roster) {
-                size_t len = valid_segments[cand.id].second;
-                size_t scan_len = std::min(len, (size_t)10240); // Cap at 10KB
+                size_t len = valid_segments[cand.id].length;
+                size_t scan_len = std::min(len, max_segment_length); // Cap at 10KB
                 
                 std::vector<uint8_t> chunk(scan_len);
-                memcpy(chunk.data(), file_data + valid_segments[cand.id].first, scan_len);
-
+                memcpy(chunk.data(), file_data + valid_segments[cand.id].start, scan_len);
                 cm.SetOverlay(cand.overlay);
                 cand.overlay -> Reset();
                 cm.restoreSnapshot(pred_snapshot);
                 cm.byte_index = 0;
+                cm.entropies.clear();
                 
                 MemoryReadStream in_chunk(chunk);
                 cm.compress(&in_chunk, &out_pred, scan_len);
 
-                double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
-                double alone_cost = succ_alone_costs[cand.id];
+                // double joint_delta = cm.getAccumulatedEntropy() - pred_cost;
+                // double alone_cost = succ_alone_costs[cand.id];
                 
-                // Result: Negative Cost = Savings
-                double final_cost = joint_delta - alone_cost; 
+                // // Result: Negative Cost = Savings
+                // double final_cost = joint_delta - alone_cost; 
+                double presumed_compression_size = (scan_len ) * (1.6 /* bits per byte MCM compression */) ;
+
+                // e.g. total entropy = 100k, hot compression = 90kb = this PRED-SUCC pair cost us 10k (though the number is in bits)
+                double final_cost = cm.getAccumulatedEntropy() - valid_segments[cand.id].hot_cost;
                 succ_costs[cand.id].emplace_back(pred_id, final_cost);
                 
                 delete cand.overlay; // Done with this candidate
@@ -1856,18 +1931,49 @@ int main(int argc, char* argv[]) {
     //   std::cout << "Refinement Complete." << std::endl;
     // }
 
-    // 6. Write Output
-    std::string out_file = in_file + ".segments";
-    std::ofstream ofs(out_file);
-    if (!ofs) return 1;
-    ofs << (boundaries.size() - 1) << std::endl;
+    // ... [Previous Steps 1-5 remain exactly the same] ...
+
+    // 6. CALCULATE HOT COSTS FROM EXISTING ENTROPY DATA
+    std::cout << "Calculating Natural (Hot) Costs from .entropy vector..." << std::endl;
+
+    struct FinalSegmentInfo {
+        size_t start;
+        size_t len;
+        double hot_cost;
+    };
+    std::vector<FinalSegmentInfo> final_segments;
+
     for (size_t i = 0; i < boundaries.size() - 1; ++i) {
         size_t start = boundaries[i];
         size_t len = boundaries[i+1] - boundaries[i];
-        ofs << start << " " << len << std::endl;
+        
+        // Sum the entropy values for this specific segment's range
+        double segment_hot_sum = 0.0;
+        
+        // Safety check to stay within vector bounds
+        size_t end_idx = std::min(start + len, full_entropy.size());
+        for (size_t k = start; k < end_idx; ++k) {
+            segment_hot_sum += full_entropy[k];
+        }
+
+        final_segments.push_back({start, len, segment_hot_sum});
+    }
+
+    // 7. Write Output (Start, Length, HotCost)
+    std::string segments_out_file = in_file + ".segments";
+    std::ofstream ofs(segments_out_file);
+    if (!ofs) { std::cerr << "Error: Could not write .segments file." << std::endl; return 1; }
+
+    ofs << final_segments.size() << "\n";
+    for (const auto& seg : final_segments) {
+        // Use fixed and precision for stable parsing in the Oracle Child
+        ofs << seg.start << " " 
+            << seg.len << " " 
+            << std::fixed << std::setprecision(4) << seg.hot_cost << "\n";
     }
     ofs.close();
-    std::cout << "Wrote segments to " << out_file << std::endl;
+
+    std::cout << "Wrote " << final_segments.size() << " segments with Hot Costs to " << segments_out_file << std::endl;
     break;
   }
 
@@ -1875,23 +1981,31 @@ int main(int argc, char* argv[]) {
   case Options::kModeFingerprint: {
     printHeader();
     std::cout << "Running Hybrid Holographic Fingerprinting Mode" << std::endl;
-    // Read .segments file
+
     if (argc != 3) {
       std::cerr << "Usage: mcm -fingerprint <original_file>" << std::endl;
       return 1;
     }
+
     std::string in_file = argv[2];
     std::cout << "in_file: " << in_file << std::endl;
     std::ifstream ifs(in_file + ".segments");
     if (!ifs) {
-      std::cerr << "Error opening segments file: " << in_file << std::endl;
+      std::cerr << "Error opening segments file: " << in_file << ".segments" << std::endl;
       return 1;
     }
+
     size_t num_segments;
     ifs >> num_segments;
-    std::vector<std::pair<size_t, size_t>> segments(num_segments);
+
+    std::vector<SegmentInfo> segments(num_segments);
+
     for (size_t i = 0; i < num_segments; ++i) {
-      ifs >> segments[i].first >> segments[i].second;
+        // We must read all 3 values to keep the file pointer aligned
+        if (!(ifs >> segments[i].start >> segments[i].length >> segments[i].hot_cost)) {
+            std::cerr << "Error parsing .segments file at segment " << i << std::endl;
+            return 1;
+        }
     }
     ifs.close();
 
@@ -1911,8 +2025,8 @@ int main(int argc, char* argv[]) {
     // Filter valid segments
     std::vector<std::pair<size_t, size_t>> valid_segments;
     for (auto& seg : segments) {
-      size_t start = seg.first;
-      size_t len = seg.second;
+      size_t start = seg.start;
+      size_t len = seg.length;
       if (start >= file_data.size() || len == 0) continue;
       if (start + len > file_data.size()) {
         len = file_data.size() - start;
@@ -2137,12 +2251,13 @@ int main(int argc, char* argv[]) {
     // 1. Pre-compute Alone Costs
     std::cout << "Pre-computing Alone Costs: 0.0% (0/" << num_segments << " segments)" << std::flush;
     std::vector<double> global_alone_costs(num_segments);
+    size_t max_segment_length = 1024000;
     // Use serial for now
     for (size_t i = 0; i < num_segments; ++i) {
         // Get segment data
         size_t start = valid_segments[i].first;
         size_t len = valid_segments[i].second;
-        size_t head_len = std::min((size_t)10240, len);
+        size_t head_len = std::min(max_segment_length, len);
         std::vector<uint8_t> head_data(head_len);
         memcpy(head_data.data(), file_data.data() + start, head_len);
 
@@ -2286,7 +2401,7 @@ int main(int argc, char* argv[]) {
 
     // Launch Threads
     int num_cpus = std::thread::hardware_concurrency();
-    if (num_cpus == 0) num_cpus = 4;
+    if (num_cpus == 0) num_cpus = 1;
     std::vector<std::thread> threads;
     for (int i = 0; i < num_cpus; ++i) threads.emplace_back(worker_func);
     for (auto& t : threads) t.join();
