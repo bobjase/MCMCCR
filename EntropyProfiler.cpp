@@ -15,31 +15,38 @@ int runEntropyProfiler(const std::vector<FileInfo>& files, const FileInfo& archi
     try {
         std::cout << "Profiling Entropy in Observer Mode (CCR Aligned)" << std::endl;
 
+        if (files.empty()) {
+            std::cerr << "Error: No input files provided for entropy profiling." << std::endl;
+            return 1;
+        }
+
         // Read the input file
-        std::vector<FileInfo> files_copy = files;
         uint64_t total_size = 0;
+        std::vector<uint8_t> buffer;
+
         for (const auto& f : files) {
-            File fin;
-            if (fin.open(f.getName(), std::ios_base::in | std::ios_base::binary) != 0) {
+            File fin(f.getName(), std::ios_base::in | std::ios_base::binary);
+            if (!fin.isOpen()) {
                 std::cerr << "Error opening: " << f.getName() << " errno: " << errno << std::endl;
                 return 1;
             }
-            std::cout << "Length of " << f.getName() << ": " << fin.length() << std::endl;
-            total_size += fin.length();
-            fin.close();
+            uint64_t file_size = fin.length();
+            std::cout << "Length of " << f.getName() << ": " << file_size << std::endl;
+            total_size += file_size;
+
+            // Read the file content
+            size_t current_size = buffer.size();
+            buffer.resize(current_size + file_size);
+            size_t count = fin.read(buffer.data() + current_size, file_size);
+            if (count != file_size) {
+                std::cerr << "Error reading " << f.getName() << ": expected " << file_size << " bytes, read " << count << std::endl;
+                return 1;
+            }
+            std::cout << "Read " << count << " bytes from " << f.getName() << std::endl;
+            // fin.close(); // Not needed, destructor will handle
         }
         std::cout << "Total size " << total_size << std::endl;
-
-        // Create a buffer for the file
-        std::vector<uint8_t> buffer(total_size);
-        uint64_t pos = 0;
-        for (const auto& f : files) {
-            File fin(f.getName(), std::ios_base::in | std::ios_base::binary);
-            size_t count = fin.read(buffer.data() + pos, buffer.size() - pos);
-            std::cout << "Read " << count << " bytes from " << f.getName() << std::endl;
-            pos += count;
-        }
-        std::cout << "Read " << pos << " bytes" << std::endl;
+        std::cout << "Read " << buffer.size() << " bytes" << std::endl;
 
         // [FIX 1] INCREASE TEMPLATE SIZE & FORCE TEXT MODE
         // Changed <8, false> to <16, false> to fit 13 models.
@@ -83,7 +90,7 @@ int runEntropyProfiler(const std::vector<FileInfo>& files, const FileInfo& archi
         // Output entropies
         std::string out_file = archive_file.getName();
         if (out_file.empty()) {
-            out_file = files_copy[0].getName() + ".entropy";
+            out_file = files[0].getName() + ".entropy";
         }
         std::ofstream ofs(out_file, std::ios::binary);
         if (!ofs) {
