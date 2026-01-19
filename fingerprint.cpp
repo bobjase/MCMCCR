@@ -8,6 +8,8 @@
 #include <set>
 #include <cmath>
 #include <map>
+#include <thread>
+#include <atomic>
 #include "File.hpp"
 #include "Util.hpp"
 
@@ -282,49 +284,76 @@ void runFingerprint(const std::string& original_file, int top_k) {
     std::vector<Fingerprint> fingerprints(num_valid);
     std::cout << "Computing Hybrid Holographic Fingerprints..." << std::endl;
 
-    // #pragma omp parallel for
-    for (int i = 0; i < (int)num_valid; ++i) {
-        size_t start = valid_segments[i].first;
-        size_t len = valid_segments[i].second;
-        // Clamp len for feature extraction speed (first 16KB is usually enough for signature)
-        size_t scan_len = std::min(len, (size_t)16384);
-        std::vector<uint8_t> segment_data(file_data.begin() + start, file_data.begin() + start + scan_len);
-        fingerprints[i] = compute_fingerprint(segment_data);
-        if (i % 100 == 0) std::cout << "\rScan: " << i << "/" << num_valid << std::flush;
+    // Manual threading using std::thread
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4; // Fallback
+    std::vector<std::thread> threads;
+    std::atomic<int> progress(0);
+
+    auto worker = [&](int start, int end) {
+        for (int i = start; i < end; ++i) {
+            size_t seg_start = valid_segments[i].first;
+            size_t len = valid_segments[i].second;
+            size_t scan_len = std::min(len, (size_t)16384);
+            std::vector<uint8_t> segment_data(file_data.begin() + seg_start, file_data.begin() + seg_start + scan_len);
+            fingerprints[i] = compute_fingerprint(segment_data);
+            progress.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    int chunk_size = (num_valid + num_threads - 1) / num_threads;
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        int start = t * chunk_size;
+        int end = std::min(start + chunk_size, (int)num_valid);
+        threads.emplace_back(worker, start, end);
     }
-    std::cout << std::endl;
+
+    for (auto& th : threads) th.join();
+
+    std::cout << "Computed " << progress.load() << " fingerprints." << std::endl;
 
     // Matching Loop (Asymmetric)
     std::vector<std::vector<size_t>> candidates(num_valid);
 
-    // #pragma omp parallel for
-    for (int i = 0; i < (int)num_valid; ++i) {
-        std::vector<std::pair<float, size_t>> distances;
-        distances.reserve(num_valid);
+    std::cout << "Matching segments..." << std::endl;
+    std::atomic<int> match_progress(0);
 
-        for (size_t j = 0; j < num_valid; ++j) {
-            if (i == j) continue;
+    auto match_worker = [&](int start, int end) {
+        for (int i = start; i < end; ++i) {
+            std::vector<std::pair<float, size_t>> distances;
+            distances.reserve(num_valid - 1);
 
-            // Note: Distance(Donor=j, Recv=i)
-            // We are looking for the best PREDECESSOR (j) for current segment (i)
-            float dist = hybrid_distance(fingerprints[j], fingerprints[i]);
-            distances.emplace_back(dist, j);
+            for (size_t j = 0; j < num_valid; ++j) {
+                if (i == (int)j) continue;
+                float dist = hybrid_distance(fingerprints[j], fingerprints[i]);
+                distances.emplace_back(dist, j);
+            }
+
+            if (distances.size() > (size_t)top_k) {
+                std::partial_sort(distances.begin(), distances.begin() + top_k, distances.end());
+                distances.resize(top_k);
+            } else {
+                std::sort(distances.begin(), distances.end());
+            }
+
+            for (const auto& pair : distances) {
+                candidates[i].push_back(pair.second);
+            }
+
+            match_progress.fetch_add(1, std::memory_order_relaxed);
         }
+    };
 
-        if (distances.size() > top_k) {
-            std::partial_sort(distances.begin(), distances.begin() + top_k, distances.end());
-            distances.resize(top_k);
-        } else {
-            std::sort(distances.begin(), distances.end());
-        }
-
-        for (const auto& pair : distances) {
-            candidates[i].push_back(pair.second);
-        }
-
-        if (i % 10 == 0) std::cout << "\rMatch: " << i << "/" << num_valid << std::flush;
+    std::vector<std::thread> match_threads;
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        int start = t * chunk_size;
+        int end = std::min(start + chunk_size, (int)num_valid);
+        match_threads.emplace_back(match_worker, start, end);
     }
-    std::cout << std::endl;
+
+    for (auto& th : match_threads) th.join();
+
+    std::cout << "Matched " << match_progress.load() << " segments." << std::endl;
 
     // Output .candidates file
     std::string out_file = in_file + ".segments.candidates";
