@@ -66,7 +66,13 @@ int runOracle(const std::string& in_file) {
       std::istringstream iss_line(line);
       std::string token;
       std::getline(iss_line, token, ':');
-      size_t i = std::stoul(token);
+      size_t i;
+      try {
+          i = std::stoul(token);
+      } catch (const std::exception&) {
+          std::cerr << "Invalid pred index in candidates: " << token << std::endl;
+          continue;
+      }
       if (i >= candidates.size()) candidates.resize(i + 1);
       std::vector<size_t>& cands = candidates[i];
       while (std::getline(iss_line, token, ',')) {
@@ -77,7 +83,11 @@ int runOracle(const std::string& in_file) {
           size_t pos = token.find_first_not_of("0123456789");
           if (pos != std::string::npos) token = token.substr(0, pos);
           if (!token.empty()) {
-            cands.push_back(std::stoul(token));
+            try {
+                cands.push_back(std::stoul(token));
+            } catch (const std::exception&) {
+                std::cerr << "Invalid succ index in candidates: " << token << std::endl;
+            }
           }
         }
       }
@@ -98,7 +108,10 @@ int runOracle(const std::string& in_file) {
     seg_ifs >> num_seg;
     std::vector<SegmentInfo> segments(num_seg);
     for (size_t i = 0; i < num_seg; ++i) {
-      seg_ifs >> segments[i].start >> segments[i].length >> segments[i].hot_cost;
+      if (!(seg_ifs >> segments[i].start >> segments[i].length >> segments[i].hot_cost)) {
+        std::cerr << "Error parsing segments file at entry " << i << std::endl;
+        return 1;
+      }
     }
     seg_ifs.close();
 
@@ -114,9 +127,15 @@ int runOracle(const std::string& in_file) {
     size_t file_size = fin.tellg();
     fin.seekg(0, std::ios::beg);
     std::vector<uint8_t> file_data(file_size);
-    if (file_size > 0 && !fin.read((char*)&file_data[0], file_size)) {
-      std::cerr << "Error reading original file: " << original_file << std::endl;
-      return 1;
+    if (file_size > 0) {
+        if (!fin.read((char*)&file_data[0], file_size)) {
+            std::cerr << "Error reading original file: " << original_file << std::endl;
+            return 1;
+        }
+        if (fin.gcount() != file_size) {
+            std::cerr << "Incomplete read of original file: expected " << file_size << ", got " << fin.gcount() << std::endl;
+            return 1;
+        }
     }
     fin.close();
 
@@ -173,6 +192,11 @@ int runOracle(const std::string& in_file) {
         // Get segment data
         size_t start = valid_segments[i].start;
         size_t len = valid_segments[i].length;
+        if (start >= file_data.size() || len == 0) {
+            global_alone_costs[i] = 0.0;
+            continue;
+        }
+        len = std::min(len, file_data.size() - start);
         size_t head_len = std::min(max_segment_length, len);
         std::vector<uint8_t> head_data(head_len);
         memcpy(head_data.data(), file_data.data() + start, head_len);
@@ -276,26 +300,57 @@ int runOracle(const std::string& in_file) {
 
                 // Write to Child
                 DWORD written;
-                WriteFile(hChildInWrite, &pred_id, sizeof(size_t), &written, NULL);
+                if (!WriteFile(hChildInWrite, &pred_id, sizeof(size_t), &written, NULL) || written != sizeof(size_t)) {
+                    std::cerr << "Failed to write pred_id to child" << std::endl;
+                    break;
+                }
                 uint64_t num_succs = succs.size();
-                WriteFile(hChildInWrite, &num_succs, sizeof(uint64_t), &written, NULL);
-                if (!succs.empty()) WriteFile(hChildInWrite, succs.data(), sizeof(size_t) * succs.size(), &written, NULL);
-                if (!succ_alone_costs.empty()) WriteFile(hChildInWrite, succ_alone_costs.data(), sizeof(double) * succ_alone_costs.size(), &written, NULL);
+                if (!WriteFile(hChildInWrite, &num_succs, sizeof(uint64_t), &written, NULL) || written != sizeof(uint64_t)) {
+                    std::cerr << "Failed to write num_succs to child" << std::endl;
+                    break;
+                }
+                if (!succs.empty()) {
+                    if (!WriteFile(hChildInWrite, succs.data(), sizeof(size_t) * succs.size(), &written, NULL) || written != sizeof(size_t) * succs.size()) {
+                        std::cerr << "Failed to write succs to child" << std::endl;
+                        break;
+                    }
+                }
+                if (!succ_alone_costs.empty()) {
+                    if (!WriteFile(hChildInWrite, succ_alone_costs.data(), sizeof(double) * succ_alone_costs.size(), &written, NULL) || written != sizeof(double) * succ_alone_costs.size()) {
+                        std::cerr << "Failed to write succ_alone_costs to child" << std::endl;
+                        break;
+                    }
+                }
                 FlushFileBuffers(hChildInWrite);
 
                 // Read from Child
                 uint64_t num_results;
-                ReadFile(hChildOutRead, &num_results, sizeof(uint64_t), &written, NULL);
+                if (!ReadFile(hChildOutRead, &num_results, sizeof(uint64_t), &written, NULL) || written != sizeof(uint64_t)) {
+                    std::cerr << "Failed to read num_results from child" << std::endl;
+                    break;
+                }
                 for (uint64_t r = 0; r < num_results; ++r) {
                     size_t succ;
-                    ReadFile(hChildOutRead, &succ, sizeof(size_t), &written, NULL);
+                    if (!ReadFile(hChildOutRead, &succ, sizeof(size_t), &written, NULL) || written != sizeof(size_t)) {
+                        std::cerr << "Failed to read succ from child" << std::endl;
+                        break;
+                    }
                     uint64_t num_costs;
-                    ReadFile(hChildOutRead, &num_costs, sizeof(uint64_t), &written, NULL);
+                    if (!ReadFile(hChildOutRead, &num_costs, sizeof(uint64_t), &written, NULL) || written != sizeof(uint64_t)) {
+                        std::cerr << "Failed to read num_costs from child" << std::endl;
+                        break;
+                    }
                     for (uint64_t c = 0; c < num_costs; ++c) {
                         size_t p;
+                        if (!ReadFile(hChildOutRead, &p, sizeof(size_t), &written, NULL) || written != sizeof(size_t)) {
+                            std::cerr << "Failed to read p from child" << std::endl;
+                            break;
+                        }
                         double cost;
-                        ReadFile(hChildOutRead, &p, sizeof(size_t), &written, NULL);
-                        ReadFile(hChildOutRead, &cost, sizeof(double), &written, NULL);
+                        if (!ReadFile(hChildOutRead, &cost, sizeof(double), &written, NULL) || written != sizeof(double)) {
+                            std::cerr << "Failed to read cost from child" << std::endl;
+                            break;
+                        }
                         std::lock_guard<std::mutex> lock(results_mutex);
                         pred_costs[p].emplace_back(succ, cost);
                     }
@@ -303,7 +358,7 @@ int runOracle(const std::string& in_file) {
                 processed_in_batch++;
             }
 
-            processed_preds += processed_in_batch;
+            processed_preds.fetch_add(processed_in_batch);
             {
                 std::lock_guard<std::mutex> lock(output_mutex);
                 double percent = 100.0 * processed_preds.load() / total_preds;
