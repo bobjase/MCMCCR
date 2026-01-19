@@ -540,7 +540,9 @@ int run_oracle_multiprocess(const char* exe_path, const char* in_file, const std
             }
 
             // Set priority to IDLE
-            SetPriorityClass(pi.hProcess, IDLE_PRIORITY_CLASS);
+            if (!SetPriorityClass(pi.hProcess, IDLE_PRIORITY_CLASS)) {
+                std::cerr << "SetPriorityClass failed: " << GetLastError() << std::endl;
+            }
 
             // Close handles not needed in parent
             CloseHandle(hChildStdinRead);
@@ -1124,9 +1126,9 @@ int main(int argc, char* argv[]) {
     }
     size_t num_seg;
     seg_ifs >> num_seg;
-    std::vector<std::pair<size_t, size_t>> segments(num_seg);
+    std::vector<SegmentInfo> segments(num_seg);
     for (size_t i = 0; i < num_seg; ++i) {
-      seg_ifs >> segments[i].first >> segments[i].second;
+      seg_ifs >> segments[i].start >> segments[i].length >> segments[i].hot_cost;
     }
     seg_ifs.close();
 
@@ -1149,7 +1151,7 @@ int main(int argc, char* argv[]) {
     fin.close();
 
     // Filter valid segments as in fingerprint
-    std::vector<std::pair<size_t, size_t>> valid_segments = segments;
+    std::vector<SegmentInfo> valid_segments = segments;
 
     // Build map: pred -> list of succ
     std::map<size_t, std::vector<size_t>> pred_to_succ;
@@ -1204,8 +1206,8 @@ int main(int argc, char* argv[]) {
     // Use serial for now
     for (size_t i = 0; i < num_segments; ++i) {
         // Get segment data
-        size_t start = valid_segments[i].first;
-        size_t len = valid_segments[i].second;
+        size_t start = valid_segments[i].start;
+        size_t len = valid_segments[i].length;
         size_t head_len = std::min(max_segment_length, len);
         std::vector<uint8_t> head_data(head_len);
         memcpy(head_data.data(), file_data.data() + start, head_len);
@@ -1287,6 +1289,10 @@ int main(int argc, char* argv[]) {
             if (!CreateProcessA(NULL, const_cast<char*>(cmd.c_str()), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
                 std::cerr << "Failed to create child process" << std::endl;
                 return;
+            }
+            // Set priority to IDLE
+            if (!SetPriorityClass(pi.hProcess, IDLE_PRIORITY_CLASS)) {
+                std::cerr << "SetPriorityClass failed: " << GetLastError() << std::endl;
             }
             CloseHandle(hChildInRead);
             CloseHandle(hChildOutWrite);
