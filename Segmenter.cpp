@@ -24,32 +24,36 @@ void runSegmenter(const std::string& in_file, Options& options) {
     std::string entropy_file = in_file + ".entropy";
 
     // 1. Load Entropy
-    std::ifstream fin_ent(entropy_file, std::ios::binary | std::ios::ate);
+    std::ifstream fin_ent(entropy_file, std::ios::binary);
     if (!fin_ent) { std::cerr << "Error: Missing .entropy file." << std::endl; return; }
-    size_t ent_size = fin_ent.tellg();
-    fin_ent.seekg(0);
-    size_t num_entries = ent_size / sizeof(double);
-    std::vector<double> full_entropy(num_entries);
-    fin_ent.read((char*)full_entropy.data(), ent_size);
+    uint64_t num_bytes;
+    fin_ent.read((char*)&num_bytes, sizeof(num_bytes));
+    if (!fin_ent) { std::cerr << "Error: Failed to read entropy file header." << std::endl; return; }
+    uint64_t stock_size;
+    fin_ent.read((char*)&stock_size, sizeof(stock_size));
+    if (!fin_ent) { std::cerr << "Error: Failed to read entropy file header." << std::endl; return; }
+    std::vector<double> full_entropy(num_bytes);
+    fin_ent.read((char*)full_entropy.data(), num_bytes * sizeof(double));
+    if (!fin_ent) { std::cerr << "Error: Failed to read entropy data." << std::endl; return; }
     fin_ent.close();
 
     // 2. SPEED FIX: Downsample (Coarse-Graining)
-    // Averages every 64 bytes into 1 point. 
-    // Reduces 5,000,000 points -> 78,000 points. Runs instantly.
-    const size_t DOWNSAMPLE_RATE = 64; 
+    // Averages every X bytes into 1 point. 
+    // Reduces massive number of points -> ~500,000 points. Runs fast even on large files.
+    const size_t DOWNSAMPLE_RATE = std::max(size_t(1), size_t(std::floor(num_bytes / 500000.0)));
     std::vector<double> coarse_profile;
-    coarse_profile.reserve(num_entries / DOWNSAMPLE_RATE + 1);
+    coarse_profile.reserve(num_bytes / DOWNSAMPLE_RATE + 1);
 
-    for (size_t i = 0; i < num_entries; i += DOWNSAMPLE_RATE) {
+    for (size_t i = 0; i < full_entropy.size(); i += DOWNSAMPLE_RATE) {
         double sum = 0;
         size_t count = 0;
-        for (size_t k = 0; k < DOWNSAMPLE_RATE && (i+k) < num_entries; ++k) {
+        for (size_t k = 0; k < DOWNSAMPLE_RATE && (i+k) < full_entropy.size(); ++k) {
             sum += full_entropy[i+k];
             count++;
         }
         coarse_profile.push_back(sum / count); 
     }
-    std::cout << "Downsampled profile: " << num_entries << " -> " << coarse_profile.size() << " points." << std::endl;
+    std::cout << "Downsampled profile: " << full_entropy.size() << " -> " << coarse_profile.size() << " points." << std::endl;
 
     // 3. Run PELT on Coarse Data
     // Scale penalty for smaller dataset size
@@ -82,11 +86,11 @@ void runSegmenter(const std::string& in_file, Options& options) {
         size_t approx_loc = coarse_cut * DOWNSAMPLE_RATE;
         
         // Don't snap 0 or EOF
-        if (approx_loc == 0 || approx_loc >= num_entries) continue;
+        if (approx_loc == 0 || approx_loc >= full_entropy.size()) continue;
 
         // Define search window in full_entropy
         size_t start = (approx_loc > SNAP_RADIUS) ? approx_loc - SNAP_RADIUS : 0;
-        size_t end = std::min(num_entries, approx_loc + SNAP_RADIUS);
+        size_t end = std::min(full_entropy.size(), approx_loc + SNAP_RADIUS);
 
         // Find the "Surprisal Cliff" (Local Max Entropy)
         // The semantic boundary is usually where the model is MOST confused.
