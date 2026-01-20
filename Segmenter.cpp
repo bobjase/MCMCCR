@@ -31,8 +31,8 @@ void runSegmenter(const std::string& in_file, Options& options) {
         initial_segments = readSegments(segments_file);
         std::cout << "Loaded " << initial_segments.size() << " initial segments from " << segments_file << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "Error reading initial segments: " << e.what() << std::endl;
-        return;
+        std::cout << "No initial segments found, generating from scratch." << std::endl;
+        // initial_segments remains empty
     }
 
     // 1. Load Entropy
@@ -237,6 +237,20 @@ void runSegmenter(const std::string& in_file, Options& options) {
         s.lengthBytes = len;
         s.entropyBits = segment_hot_sum;
         s.entropyBitsPerByte = segment_hot_sum / len;
+        // Compute entropyBytes256: sum of first min(256, len) bytes
+        double entropy_256 = 0.0;
+        size_t limit_256 = std::min(size_t(256), len);
+        for (size_t k = start; k < start + limit_256; ++k) {
+            if (k < full_entropy.size()) entropy_256 += full_entropy[k];
+        }
+        s.entropyBytes256 = entropy_256;
+        // Compute entropyBytes2048: sum of first min(2048, len) bytes
+        double entropy_2048 = 0.0;
+        size_t limit_2048 = std::min(size_t(2048), len);
+        for (size_t k = start; k < start + limit_2048; ++k) {
+            if (k < full_entropy.size()) entropy_2048 += full_entropy[k];
+        }
+        s.entropyBytes2048 = entropy_2048;
         // Compute entropySpike: max entropy in segment
         double max_ent = 0.0;
         for (size_t k = start; k < end_idx; ++k) {

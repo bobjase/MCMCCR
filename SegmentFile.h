@@ -15,6 +15,8 @@ struct Segment {
     std::string fingerprint = "";
     double aloneEntropyBits = 0.0;
     double aloneEntropyBitsPerByte = 0.0;
+    double entropyBytes256 = 0.0;  // Hot cost at 256 bytes
+    double entropyBytes2048 = 0.0; // Hot cost at 2048 bytes
     size_t reorderedIndex = static_cast<size_t>(-1);  // -1 means unset
     double predictedReorderedEntropyBits = 0.0;
     double calculatedReorderedEntropyBit = 0.0;  // Note: singular "Bit" as per your spec
@@ -32,6 +34,8 @@ struct Segment {
         fingerprint = "";
         aloneEntropyBits = 0.0;
         aloneEntropyBitsPerByte = 0.0;
+        entropyBytes256 = 0.0;
+        entropyBytes2048 = 0.0;
         reorderedIndex = static_cast<size_t>(-1);
         predictedReorderedEntropyBits = 0.0;
         calculatedReorderedEntropyBit = 0.0;

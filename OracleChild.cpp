@@ -104,7 +104,7 @@ int OracleChildMain(int argc, char* argv[]) {
         for (size_t i = 0; i < num_segments; ++i) {
             valid_segments[i].start = segments[i].startByte;
             valid_segments[i].length = segments[i].lengthBytes;
-            valid_segments[i].hot_cost = segments[i].aloneEntropyBits; // Use alone costs as hot_cost
+            valid_segments[i].hot_cost = segments[i].entropyBits; // Use entropy bits as hot_cost
         }
         debugLog("converted segments to SegmentInfo");
 
@@ -259,9 +259,6 @@ int OracleChildMain(int argc, char* argv[]) {
             memcpy(data_pred.data(), file_data + start_pred, len_pred);
             debugLog("Got pred data");
 
-            // Compute fingerprint for pred
-            Fingerprint fp_pred = compute_fingerprint(data_pred);
-
             // --- FIX 1: RUN PREDECESSOR ---
             // We must populate the compressor state with the Predecessor's context
             
@@ -351,7 +348,7 @@ int OracleChildMain(int argc, char* argv[]) {
 
                 // measure how much entropy we found (smaller=good) -- we're going to keep the smallest content below
                 // simplified from above b/c this is just a tournament and we don't really know how this goes, but we DO know that context importance fades
-                double savings_rate = cm.getAccumulatedEntropy();
+                double savings_rate = cm.getAccumulatedEntropy() - segments[succ].entropyBytes256;
 
                 // 5. King of the Hill Logic
                 if (roster.size() < 4096) {
@@ -389,7 +386,7 @@ int OracleChildMain(int argc, char* argv[]) {
             //std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ return a.savings_rate > b.savings_rate; });
             // Deterministic Sort: Break ties with ID
             std::sort(roster.begin(), roster.end(), [](const auto& a, const auto& b){ 
-                if (std::abs(a.savings_rate - b.savings_rate) > 1e-9) return a.savings_rate > b.savings_rate;
+                if (std::abs(a.savings_rate - b.savings_rate) > 1e-9) return a.savings_rate < b.savings_rate;
                 return a.id < b.id; // Tie-breaker
             });
 
@@ -429,7 +426,7 @@ int OracleChildMain(int argc, char* argv[]) {
 
 
                 // measure how much entropy we found (smaller=good) -- we're going to keep the smallest content below
-                cand.savings_rate = cm.getAccumulatedEntropy();
+                cand.savings_rate = cm.getAccumulatedEntropy() - segments[cand.id].entropyBytes2048;
             }
 
             // Prune: Sort & Keep Top 16
@@ -444,10 +441,10 @@ int OracleChildMain(int argc, char* argv[]) {
             for (size_t k = cut_2; k < roster.size(); ++k) delete roster[k].overlay;
             roster.resize(cut_2);
 
-            // --- ROUND 3: FINALS (Full Run / 10KB Cap) ---
+            // --- ROUND 3: FINALS (Full Segment) ---
             for (const auto& cand : roster) {
                 size_t len = valid_segments[cand.id].length;
-                size_t scan_len = std::min(len, max_segment_length); // Cap at 10KB
+                size_t scan_len = len; // Full segment
                 
                 std::vector<uint8_t> chunk(scan_len);
                 memcpy(chunk.data(), file_data + valid_segments[cand.id].start, scan_len);

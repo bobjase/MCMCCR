@@ -308,14 +308,15 @@ void runFingerprint(const std::string& original_file, int top_k) {
     // Update segments with fingerprints
     for (size_t i = 0; i < segments.size(); ++i) {
         if (i < fingerprints.size()) {
-            std::string fp_str;
-            for (auto h : fingerprints[i].minhashes) {
-                char buf[9];
-                sprintf(buf, "%08x", h);
-                fp_str += std::string(buf) + " ";
-            }
-            if (!fp_str.empty()) fp_str.pop_back(); // remove last space
-            segments[i].fingerprint = fp_str;
+            // Removed: storing fingerprint string in CSV to reduce bloat
+            // std::string fp_str;
+            // for (auto h : fingerprints[i].minhashes) {
+            //     char buf[9];
+            //     sprintf(buf, "%08x", h);
+            //     fp_str += std::string(buf) + " ";
+            // }
+            // if (!fp_str.empty()) fp_str.pop_back(); // remove last space
+            // segments[i].fingerprint = fp_str;
             if (!segments[i].phaseCompleted.empty()) segments[i].phaseCompleted += ",";
             segments[i].phaseCompleted += "fingerprint";
         }
