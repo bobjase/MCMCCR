@@ -10,6 +10,7 @@
 #include "Util.hpp"
 #include "Archive.hpp"
 #include "ProgressMeter.hpp"
+#include "SegmentFile.h"
 
 int runEntropyProfiler(const std::vector<FileInfo>& files, const FileInfo& archive_file) {
     try {
@@ -107,6 +108,17 @@ int runEntropyProfiler(const std::vector<FileInfo>& files, const FileInfo& archi
         ofs.write(reinterpret_cast<const char*>(compressor.entropies.data()), num_bytes * sizeof(double));
         ofs.close();
         std::cout << "Wrote " << num_bytes << " entropy values and stock size " << stock_size << " to " << out_file << std::endl;
+
+        // Create initial empty segments file
+        std::vector<Segment> segments;  // Empty
+        std::string segments_file = files[0].getName() + ".segments.csv";
+        try {
+            writeSegments(segments_file, segments);
+            std::cout << "Created empty segments file " << segments_file << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error creating initial segments: " << e.what() << std::endl;
+            return 1;
+        }
     } catch (const std::exception& e) {
         std::cerr << "Exception in observer: " << e.what() << std::endl;
         return 1;

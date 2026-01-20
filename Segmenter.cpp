@@ -9,6 +9,7 @@
 #include <limits>
 #include "File.hpp"
 #include "EntropySegmenter.h"
+#include "SegmentFile.h"
 
 // Forward declare Options if needed, but since it's included via MCM.cpp linkage, perhaps not.
 // Since Options is in MCM.cpp, and we're linking, it should be fine, but to be safe, I'll assume it's available.
@@ -23,6 +24,17 @@ void runSegmenter(const std::string& in_file, Options& options) {
 
     std::string entropy_file = in_file + ".entropy";
 
+    // Load initial segments
+    std::string segments_file = in_file + ".segments.csv";
+    std::vector<Segment> initial_segments;
+    try {
+        initial_segments = readSegments(segments_file);
+        std::cout << "Loaded " << initial_segments.size() << " initial segments from " << segments_file << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error reading initial segments: " << e.what() << std::endl;
+        return;
+    }
+
     // 1. Load Entropy
     std::ifstream fin_ent(entropy_file, std::ios::binary);
     if (!fin_ent) { std::cerr << "Error: Missing .entropy file." << std::endl; return; }
@@ -36,6 +48,11 @@ void runSegmenter(const std::string& in_file, Options& options) {
     fin_ent.read((char*)full_entropy.data(), num_bytes * sizeof(double));
     if (!fin_ent) { std::cerr << "Error: Failed to read entropy data." << std::endl; return; }
     fin_ent.close();
+
+    if (!initial_segments.empty() && initial_segments[0].lengthBytes != num_bytes) {
+        std::cerr << "Initial segments do not match entropy data." << std::endl;
+        return;
+    }
 
     // 2. SPEED FIX: Downsample (Coarse-Graining)
     // Averages every X bytes into 1 point. 
@@ -198,12 +215,8 @@ void runSegmenter(const std::string& in_file, Options& options) {
     // 6. CALCULATE HOT COSTS FROM EXISTING ENTROPY DATA
     std::cout << "Calculating Natural (Hot) Costs from .entropy vector..." << std::endl;
 
-    struct FinalSegmentInfo {
-        size_t start;
-        size_t len;
-        double hot_cost;
-    };
-    std::vector<FinalSegmentInfo> final_segments;
+    std::vector<Segment> segments;
+    segments.reserve(boundaries.size() - 1);
 
     for (size_t i = 0; i < boundaries.size() - 1; ++i) {
         size_t start = boundaries[i];
@@ -218,22 +231,29 @@ void runSegmenter(const std::string& in_file, Options& options) {
             segment_hot_sum += full_entropy[k];
         }
 
-        final_segments.push_back({start, len, segment_hot_sum});
+        Segment s;
+        s.index = i;
+        s.startByte = start;
+        s.lengthBytes = len;
+        s.entropyBits = segment_hot_sum;
+        s.entropyBitsPerByte = segment_hot_sum / len;
+        // Compute entropySpike: max entropy in segment
+        double max_ent = 0.0;
+        for (size_t k = start; k < end_idx; ++k) {
+            if (full_entropy[k] > max_ent) max_ent = full_entropy[k];
+        }
+        s.entropySpike = max_ent;
+        s.phaseCompleted = "entropy";
+        segments.push_back(s);
     }
 
-    // 7. Write Output (Start, Length, HotCost)
-    std::string segments_out_file = in_file + ".segments";
-    std::ofstream ofs(segments_out_file);
-    if (!ofs) { std::cerr << "Error: Could not write .segments file." << std::endl; return; }
-
-    ofs << final_segments.size() << "\n";
-    for (const auto& seg : final_segments) {
-        // Use fixed and precision for stable parsing in the Oracle Child
-        ofs << seg.start << " " 
-            << seg.len << " " 
-            << std::fixed << std::setprecision(4) << seg.hot_cost << "\n";
+    // 7. Write Output using SegmentFile
+    std::string segments_out_file = in_file + ".segments.csv";
+    try {
+        writeSegments(segments_out_file, segments);
+        std::cout << "Wrote " << segments.size() << " segments to " << segments_out_file << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error writing segments: " << e.what() << std::endl;
+        return;
     }
-    ofs.close();
-
-    std::cout << "Wrote " << final_segments.size() << " segments with Hot Costs to " << segments_out_file << std::endl;
 }

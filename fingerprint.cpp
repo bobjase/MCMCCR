@@ -12,6 +12,7 @@
 #include <atomic>
 #include "File.hpp"
 #include "Util.hpp"
+#include "SegmentFile.h"
 
 // --- Helper: Fast Rolling Hash (Cyclic Polynomial) ---
 inline uint32_t hash_ngram(const uint8_t* data, size_t len) {
@@ -234,25 +235,17 @@ void runFingerprint(const std::string& original_file, int top_k) {
 
     std::string in_file = original_file;
     std::cout << "in_file: " << in_file << std::endl;
-    std::ifstream ifs(in_file + ".segments");
-    if (!ifs) {
-        std::cerr << "Error opening segments file: " << in_file << ".segments" << std::endl;
+
+    // Read segments from CSV
+    std::string segments_file = in_file + ".segments.csv";
+    std::vector<Segment> segments;
+    try {
+        segments = readSegments(segments_file);
+        std::cout << "Loaded " << segments.size() << " segments from " << segments_file << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error reading segments: " << e.what() << std::endl;
         return;
     }
-
-    size_t num_segments;
-    ifs >> num_segments;
-
-    std::vector<SegmentInfo> segments(num_segments);
-
-    for (size_t i = 0; i < num_segments; ++i) {
-        // We must read all 3 values to keep the file pointer aligned
-        if (!(ifs >> segments[i].start >> segments[i].length >> segments[i].hot_cost)) {
-            std::cerr << "Error parsing .segments file at segment " << i << std::endl;
-            return;
-        }
-    }
-    ifs.close();
 
     // Determine original file
     std::string original_file_path = in_file;
@@ -270,8 +263,8 @@ void runFingerprint(const std::string& original_file, int top_k) {
     // Filter valid segments
     std::vector<std::pair<size_t, size_t>> valid_segments;
     for (auto& seg : segments) {
-        size_t start = seg.start;
-        size_t len = seg.length;
+        size_t start = seg.startByte;
+        size_t len = seg.lengthBytes;
         if (start >= file_data.size() || len == 0) continue;
         if (start + len > file_data.size()) {
             len = file_data.size() - start;
@@ -311,6 +304,22 @@ void runFingerprint(const std::string& original_file, int top_k) {
     for (auto& th : threads) th.join();
 
     std::cout << "Computed " << progress.load() << " fingerprints." << std::endl;
+
+    // Update segments with fingerprints
+    for (size_t i = 0; i < segments.size(); ++i) {
+        if (i < fingerprints.size()) {
+            std::string fp_str;
+            for (auto h : fingerprints[i].minhashes) {
+                char buf[9];
+                sprintf(buf, "%08x", h);
+                fp_str += std::string(buf) + " ";
+            }
+            if (!fp_str.empty()) fp_str.pop_back(); // remove last space
+            segments[i].fingerprint = fp_str;
+            if (!segments[i].phaseCompleted.empty()) segments[i].phaseCompleted += ",";
+            segments[i].phaseCompleted += "fingerprint";
+        }
+    }
 
     // Matching Loop (Asymmetric)
     std::vector<std::vector<size_t>> candidates(num_valid);
@@ -391,4 +400,12 @@ void runFingerprint(const std::string& original_file, int top_k) {
     std::string fingerprint_file = in_file + ".segments.fingerprints";
     WriteBinary(fingerprint_file, fingerprints);
     std::cout << "Saved " << num_valid << " fingerprint structures to " << fingerprint_file << std::endl;
+
+    // Write updated segments back to CSV
+    try {
+        writeSegments(segments_file, segments);
+        std::cout << "Updated segments with fingerprints in " << segments_file << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error writing segments: " << e.what() << std::endl;
+    }
 }
