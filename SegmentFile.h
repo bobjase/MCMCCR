@@ -14,6 +14,7 @@ struct Segment {
     double entropySpike = 0.0;
     std::string fingerprint = "";
     double aloneEntropyBits = 0.0;
+    double aloneEntropyBitsPerByte = 0.0;
     size_t reorderedIndex = static_cast<size_t>(-1);  // -1 means unset
     double predictedReorderedEntropyBits = 0.0;
     double calculatedReorderedEntropyBit = 0.0;  // Note: singular "Bit" as per your spec
@@ -30,6 +31,7 @@ struct Segment {
         entropySpike = 0.0;
         fingerprint = "";
         aloneEntropyBits = 0.0;
+        aloneEntropyBitsPerByte = 0.0;
         reorderedIndex = static_cast<size_t>(-1);
         predictedReorderedEntropyBits = 0.0;
         calculatedReorderedEntropyBit = 0.0;

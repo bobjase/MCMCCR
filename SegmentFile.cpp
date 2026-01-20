@@ -69,6 +69,11 @@ std::vector<Segment> readSegments(const std::string& filename) {
             // Check header
             std::vector<std::string> expected_new = {
                 "index", "startByte", "lengthBytes", "entropyBits", "entropyBitsPerByte", "entropySpike",
+                "fingerprint", "aloneEntropyBits", "aloneEntropyBitsPerByte", "reorderedIndex", "predictedReorderedEntropyBits",
+                "calculatedReorderedEntropyBit", "phaseCompleted"
+            };
+            std::vector<std::string> expected_inter = {
+                "index", "startByte", "lengthBytes", "entropyBits", "entropyBitsPerByte", "entropySpike",
                 "fingerprint", "aloneEntropyBits", "reorderedIndex", "predictedReorderedEntropyBits",
                 "calculatedReorderedEntropyBit", "phaseCompleted"
             };
@@ -77,22 +82,16 @@ std::vector<Segment> readSegments(const std::string& filename) {
                 "fingerprint", "aloneEntropyBits", "reorderedIndex", "predictedReorderedEntropyBits",
                 "calculatedReorderedEntropyBit", "phaseCompleted"
             };
-            bool isNewFormat = (fields.size() == expected_new.size());
-            bool isOldFormat = (fields.size() == expected_old.size());
-            if (!isNewFormat && !isOldFormat) {
-                throw std::runtime_error("Invalid CSV header in " + filename + ": expected 11 or 12 fields, got " + std::to_string(fields.size()));
+            bool isNew = (fields.size() == expected_new.size());
+            bool isInter = (fields.size() == expected_inter.size());
+            bool isOld = (fields.size() == expected_old.size());
+            if (!isNew && !isInter && !isOld) {
+                throw std::runtime_error("Invalid CSV header in " + filename + ": expected 11, 12, or 13 fields, got " + std::to_string(fields.size()));
             }
-            if (isNewFormat) {
-                for (size_t i = 0; i < expected_new.size(); ++i) {
-                    if (fields[i] != expected_new[i]) {
-                        throw std::runtime_error("Header mismatch in " + filename + ": expected " + expected_new[i] + ", got " + fields[i]);
-                    }
-                }
-            } else { // old format
-                for (size_t i = 0; i < expected_old.size(); ++i) {
-                    if (fields[i] != expected_old[i]) {
-                        throw std::runtime_error("Header mismatch in " + filename + ": expected " + expected_old[i] + ", got " + fields[i]);
-                    }
+            const std::vector<std::string>& expected = isNew ? expected_new : (isInter ? expected_inter : expected_old);
+            for (size_t i = 0; i < expected.size(); ++i) {
+                if (fields[i] != expected[i]) {
+                    throw std::runtime_error("Header mismatch in " + filename + ": expected " + expected[i] + ", got " + fields[i]);
                 }
             }
             isHeader = false;
@@ -100,9 +99,11 @@ std::vector<Segment> readSegments(const std::string& filename) {
         }
 
         // Parse data row
-        bool isNewFormat = (fields.size() == 12);
-        if (fields.size() != 11 && fields.size() != 12) {
-            throw std::runtime_error("Invalid row in " + filename + ": expected 11 or 12 fields, got " + std::to_string(fields.size()));
+        bool isNew = (fields.size() == 13);
+        bool isInter = (fields.size() == 12);
+        bool isOld = (fields.size() == 11);
+        if (!isNew && !isInter && !isOld) {
+            throw std::runtime_error("Invalid row in " + filename + ": expected 11, 12, or 13 fields, got " + std::to_string(fields.size()));
         }
 
         Segment seg;
@@ -111,20 +112,32 @@ std::vector<Segment> readSegments(const std::string& filename) {
             seg.startByte = std::stoull(fields[1]);
             seg.lengthBytes = std::stoull(fields[2]);
             seg.entropyBits = std::stod(fields[3]);
-            if (isNewFormat) {
+            if (isNew) {
                 seg.entropyBitsPerByte = std::stod(fields[4]);
                 seg.entropySpike = std::stod(fields[5]);
                 seg.fingerprint = fields[6];
                 seg.aloneEntropyBits = std::stod(fields[7]);
+                seg.aloneEntropyBitsPerByte = std::stod(fields[8]);
+                if (fields[9] != "" && fields[9] != "-1") seg.reorderedIndex = std::stoull(fields[9]);
+                seg.predictedReorderedEntropyBits = std::stod(fields[10]);
+                seg.calculatedReorderedEntropyBit = std::stod(fields[11]);
+                seg.phaseCompleted = fields[12];
+            } else if (isInter) {  // 12 fields, has entropyBitsPerByte but not alone
+                seg.entropyBitsPerByte = std::stod(fields[4]);
+                seg.entropySpike = std::stod(fields[5]);
+                seg.fingerprint = fields[6];
+                seg.aloneEntropyBits = std::stod(fields[7]);
+                seg.aloneEntropyBitsPerByte = 0.0;  // default
                 if (fields[8] != "" && fields[8] != "-1") seg.reorderedIndex = std::stoull(fields[8]);
                 seg.predictedReorderedEntropyBits = std::stod(fields[9]);
                 seg.calculatedReorderedEntropyBit = std::stod(fields[10]);
                 seg.phaseCompleted = fields[11];
-            } else {
-                seg.entropyBitsPerByte = seg.entropyBits / seg.lengthBytes; // compute for old format
+            } else {  // old format 11
+                seg.entropyBitsPerByte = seg.entropyBits / seg.lengthBytes; // compute
                 seg.entropySpike = std::stod(fields[4]);
                 seg.fingerprint = fields[5];
                 seg.aloneEntropyBits = std::stod(fields[6]);
+                seg.aloneEntropyBitsPerByte = 0.0; // default
                 if (fields[7] != "" && fields[7] != "-1") seg.reorderedIndex = std::stoull(fields[7]);
                 seg.predictedReorderedEntropyBits = std::stod(fields[8]);
                 seg.calculatedReorderedEntropyBit = std::stod(fields[9]);
@@ -147,7 +160,7 @@ void writeSegments(const std::string& filename, const std::vector<Segment>& segm
     }
 
     // Write header
-    file << "index,startByte,lengthBytes,entropyBits,entropyBitsPerByte,entropySpike,fingerprint,aloneEntropyBits,reorderedIndex,predictedReorderedEntropyBits,calculatedReorderedEntropyBit,phaseCompleted\n";
+    file << "index,startByte,lengthBytes,entropyBits,entropyBitsPerByte,entropySpike,fingerprint,aloneEntropyBits,aloneEntropyBitsPerByte,reorderedIndex,predictedReorderedEntropyBits,calculatedReorderedEntropyBit,phaseCompleted\n";
 
     // Write data
     for (const auto& seg : segments) {
@@ -158,7 +171,8 @@ void writeSegments(const std::string& filename, const std::vector<Segment>& segm
              << seg.entropyBitsPerByte << ","
              << seg.entropySpike << ","
              << escapeCSV(seg.fingerprint) << ","
-             << seg.aloneEntropyBits << ",";
+             << seg.aloneEntropyBits << ","
+             << seg.aloneEntropyBitsPerByte << ",";
         if (seg.reorderedIndex == static_cast<size_t>(-1)) {
             file << ",";
         } else {

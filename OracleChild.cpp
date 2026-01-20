@@ -40,6 +40,7 @@
 #include "TurboCM.hpp"
 #include "X86Binary.hpp"
 #include "fingerprint.h"
+#include "SegmentFile.h"
 
 struct SegmentInfo {
     size_t start;
@@ -87,58 +88,25 @@ int OracleChildMain(int argc, char* argv[]) {
         std::string original_file = argv[2];
         std::string segments_file = argv[3];
 
-        // Memory map segments file
-        HANDLE hSegFile = CreateFileA(segments_file.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hSegFile == INVALID_HANDLE_VALUE) {
-            debugError("CreateFile failed for segments file: " + segments_file);
+        // Load segments from CSV
+        std::vector<Segment> segments;
+        try {
+            segments = readSegments(segments_file);
+        } catch (const std::exception& e) {
+            debugError("Error reading segments from " + segments_file + ": " + e.what());
             return 1;
         }
-        LARGE_INTEGER segFileSize;
-        if (!GetFileSizeEx(hSegFile, &segFileSize)) {
-            debugError("GetFileSizeEx failed for segments file");
-            CloseHandle(hSegFile);
-            return 1;
-        }
-        HANDLE hSegMapping = CreateFileMapping(hSegFile, NULL, PAGE_READONLY, 0, 0, NULL);
-        if (hSegMapping == NULL) {
-            debugError("CreateFileMapping failed for segments");
-            CloseHandle(hSegFile);
-            return 1;
-        }
-        LPVOID pSegView = MapViewOfFile(hSegMapping, FILE_MAP_READ, 0, 0, 0);
-        if (pSegView == NULL) {
-            debugError("MapViewOfFile failed for segments");
-            CloseHandle(hSegMapping);
-            CloseHandle(hSegFile);
-            return 1;
-        }
-        
-        
-        std::string seg_content((char*)pSegView, segFileSize.QuadPart);
-        std::istringstream seg_iss(seg_content);
-        
-        uint64_t num_segments;
-        seg_iss >> num_segments;
+        uint64_t num_segments = segments.size();
         debugLog("num_segments: " + std::to_string(num_segments));
 
-        // Use our new struct here
+        // Convert to SegmentInfo for compatibility
         std::vector<SegmentInfo> valid_segments(num_segments);
-        debugLog("valid_segments resized");
-
         for (size_t i = 0; i < num_segments; ++i) {
-            // Extraction now pulls: Start, Length, and the new HotCost
-            if (!(seg_iss >> valid_segments[i].start >> valid_segments[i].length >> valid_segments[i].hot_cost)) {
-                debugError("Failed to parse segment data at index " + std::to_string(i));
-                break;
-            }
+            valid_segments[i].start = segments[i].startByte;
+            valid_segments[i].length = segments[i].lengthBytes;
+            valid_segments[i].hot_cost = segments[i].aloneEntropyBits; // Use alone costs as hot_cost
         }
-        debugLog("read valid_segments with hot_costs");
-
-        // Unmap segments
-        UnmapViewOfFile(pSegView);
-        CloseHandle(hSegMapping);
-        CloseHandle(hSegFile);
-        debugLog("segments file unmapped");
+        debugLog("converted segments to SegmentInfo");
 
         // Memory map original file
         HANDLE hFile = CreateFileA(original_file.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);

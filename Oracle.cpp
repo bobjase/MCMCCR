@@ -20,6 +20,7 @@
 #include "Util.hpp"
 #include "Archive.hpp"
 #include "ProgressMeter.hpp"
+#include "SegmentFile.h"
 
 class MemoryReadStream : public Stream {
   const std::vector<uint8_t>& data;
@@ -96,24 +97,21 @@ int runOracle(const std::string& in_file) {
     std::cout << "Read " << num_segments << " segments from candidates" << std::endl;
     if (candidates.size() > 0) std::cout << "candidates[0].size() = " << candidates[0].size() << std::endl;
 
-    // Determine segments file
-    std::string segments_file = in_file + ".segments";
+    // Read segments from CSV
+    std::string segments_file = in_file + ".segments.csv";
     std::cout << "segments_file: " << segments_file << std::endl;
-    std::ifstream seg_ifs(segments_file);
-    if (!seg_ifs) {
-      std::cerr << "Error opening segments file: " << segments_file << std::endl;
-      return 1;
-    }
-    size_t num_seg;
-    seg_ifs >> num_seg;
-    std::vector<SegmentInfo> segments(num_seg);
-    for (size_t i = 0; i < num_seg; ++i) {
-      if (!(seg_ifs >> segments[i].start >> segments[i].length >> segments[i].hot_cost)) {
-        std::cerr << "Error parsing segments file at entry " << i << std::endl;
+    std::vector<Segment> segments;
+    try {
+        segments = readSegments(segments_file);
+        std::cout << "Loaded " << segments.size() << " segments from " << segments_file << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error reading segments: " << e.what() << std::endl;
         return 1;
-      }
     }
-    seg_ifs.close();
+    if (segments.size() != num_segments) {
+        std::cerr << "Mismatch: candidates have " << num_segments << " segments, CSV has " << segments.size() << std::endl;
+        return 1;
+    }
 
     // Load original file
     std::string original_file = in_file;
@@ -140,7 +138,7 @@ int runOracle(const std::string& in_file) {
     fin.close();
 
     // Filter valid segments as in fingerprint
-    std::vector<SegmentInfo> valid_segments = segments;
+    std::vector<Segment> valid_segments = segments;
 
     // Build map: pred -> list of succ
     std::map<size_t, std::vector<size_t>> pred_to_succ;
@@ -190,8 +188,8 @@ int runOracle(const std::string& in_file) {
     // Use serial for now
     for (size_t i = 0; i < num_segments; ++i) {
         // Get segment data
-        size_t start = valid_segments[i].start;
-        size_t len = valid_segments[i].length;
+        size_t start = valid_segments[i].startByte;
+        size_t len = valid_segments[i].lengthBytes;
         if (start >= file_data.size() || len == 0) {
             global_alone_costs[i] = 0.0;
             continue;
@@ -220,12 +218,26 @@ int runOracle(const std::string& in_file) {
         for (double e : cm_alone.entropies) alone_bits += e;
         global_alone_costs[i] = alone_bits;
 
+        // Update segment
+        segments[i].aloneEntropyBits = alone_bits;
+        segments[i].aloneEntropyBitsPerByte = alone_bits / segments[i].lengthBytes;
+        // Append "alone" to phaseCompleted if not present
+        if (segments[i].phaseCompleted.find("alone") == std::string::npos) {
+            if (!segments[i].phaseCompleted.empty()) segments[i].phaseCompleted += ",";
+            segments[i].phaseCompleted += "alone";
+        }
+
         // Progress
         double percent = 100.0 * (i + 1) / num_segments;
         std::cout << "\rPre-computing Alone Costs: " << std::fixed << std::setprecision(1) << percent << "% (" << (i + 1) << "/" << num_segments << " segments)" << std::flush;
     }
     std::cout << std::endl;
     std::cout << "Pre-computed alone costs for " << num_segments << " segments" << std::endl;
+
+    // Write updated segments back to CSV
+    std::string segments_csv_file = in_file + ".segments.csv";
+    writeSegments(segments_csv_file, segments);
+    std::cout << "Updated segments with alone costs in " << segments_csv_file << std::endl;
 
     // --- NEW: SAVE .ALONE FILE ---
     std::string alone_out_file = in_file + ".alone";
